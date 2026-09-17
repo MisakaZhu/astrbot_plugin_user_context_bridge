@@ -92,3 +92,10 @@ running --插件重启扫描---------------> interrupted
 - v1 支持声明：QQ OneBot v11 / aiocqhttp 适配器 + AstrBot 内置 Agent 路径，宿主 4.26.0 与 4.28.0（以真实宿主集成测试证据为准；未实测版本不宣称）。
 - 明确不支持（不自动宣称兼容）：QQ 官方适配器、Dify/Coze 等第三方会话执行器（third_party 路径）、WebChat 专用行为。
 - 插件数据位于 AstrBot 插件数据目录（`StarTools.get_data_dir`），与 Git 源码分离；日志默认不输出对话原文。
+
+## ADR-008：原生 /reset、/new 的语义与边界
+
+- 宿主原生 `/reset` 仅清空当前 UMO 的宿主会话（conversation history 置空），群聊场景下该 UMO 代表全群窗口且权限场景（unique_session / alter_cmd 配置）随版本与配置漂移。
+- **v1 决策：不注册同名 /reset、/new 命令做 epoch 联动**。理由：镜像宿主权限判定会复制随版本漂移的配置逻辑；若权限判定与宿主不一致，可能出现「宿主拒绝但共享历史被清」或反之的越权/失效场景，比不联动更糟。
+- 实际语义（README 明示）：原生 /reset、/new 只重置当前窗口的宿主会话；插件的共享历史清空使用 `/uctx reset`（本人维度、epoch 切换）。/uctx reset 的回复中同时提示两者区别。
+- 未支持项：原生 /reset 联动切换共享 epoch。若宿主后续提供稳定接口（如会话重置事件钩子），在后续版本实现。

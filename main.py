@@ -15,10 +15,12 @@ from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.provider.entities import ProviderRequest
 
 from uctx_bridge.bridge import ContextBridge
+from uctx_bridge.commands import CommandService
 from uctx_bridge.ledger import LeaseConflictError, TurnLedger
 from uctx_bridge.scope import MembershipStore, ScopeConfig, ScopeResolver
 
@@ -43,6 +45,7 @@ class UserContextBridgePlugin(Star):
             ScopeConfig.from_mapping(dict(config)), self._membership
         )
         self._bridge: ContextBridge | None = None
+        self._commands: CommandService | None = None
         self._lease_id = self._load_or_create_lease_id()
         self._heartbeat_task: asyncio.Task | None = None
         self._sharing_active = False
@@ -81,6 +84,12 @@ class UserContextBridgePlugin(Star):
                 persona_manager_getter=lambda: self.context.persona_manager,
                 logger=logger,
             )
+            self._commands = CommandService(
+                ledger=self._ledger,
+                resolver=ScopeResolver(ScopeConfig(enabled=False), self._membership),
+                membership=self._membership,
+                persona_manager_getter=lambda: self.context.persona_manager,
+            )
             return
 
         recovered = self._ledger.recover_running(own_lease_id=self._lease_id)
@@ -96,6 +105,12 @@ class UserContextBridgePlugin(Star):
             logger=logger,
         )
         self._sharing_active = True
+        self._commands = CommandService(
+            ledger=self._ledger,
+            resolver=self._resolver,
+            membership=self._membership,
+            persona_manager_getter=lambda: self.context.persona_manager,
+        )
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         if self._config.get("enabled", False):
             logger.info(
@@ -169,3 +184,51 @@ class UserContextBridgePlugin(Star):
             await self._bridge.handle_after_message_sent(event)
         except Exception:  # noqa: BLE001
             logger.warning("uctx on_after_message_sent 处理失败", exc_info=True)
+
+    # -- /uctx 命令组 ------------------------------------------------------
+    @filter.command_group("uctx")
+    def uctx_group(self):
+        pass
+
+    @uctx_group.command("status")
+    async def uctx_status(self, event: AstrMessageEvent):
+        if self._commands is not None:
+            event.set_result(
+                MessageEventResult().message(
+                    await self._commands.status(event)
+                )
+            )
+
+    @uctx_group.command("reset")
+    async def uctx_reset(self, event: AstrMessageEvent):
+        if self._commands is not None:
+            event.set_result(
+                MessageEventResult().message(
+                    await self._commands.reset(event)
+                )
+            )
+
+    @uctx_group.command("off")
+    async def uctx_off(self, event: AstrMessageEvent):
+        if self._commands is not None:
+            event.set_result(
+                MessageEventResult().message(
+                    await self._commands.off(event)
+                )
+            )
+
+    @uctx_group.command("on")
+    async def uctx_on(self, event: AstrMessageEvent):
+        if self._commands is not None:
+            event.set_result(
+                MessageEventResult().message(
+                    await self._commands.on(event)
+                )
+            )
+
+    @uctx_group.command("scope")
+    async def uctx_scope(self, event: AstrMessageEvent):
+        if self._commands is not None:
+            event.set_result(
+                MessageEventResult().message(self._commands.scope())
+            )
