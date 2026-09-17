@@ -1,0 +1,25 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "启用跨会话上下文共享（默认关闭；关闭时不采集、不注入任何消息）",
+    "hint": "启用前请先配置共享群范围；个人无法通过命令扩大此范围",
+    "default": false
+  },
+  "shared_groups": {
+    "type": "list",
+    "description": "参与共享的群号白名单（同一用户在这些群与私聊之间互通）",
+    "hint": "只填群号，如 123456789；范围外的群保持原生会话行为",
+    "default": []
+  },
+  "include_private": {
+    "type": "bool",
+    "description": "将该用户的私聊纳入共享范围",
+    "default": false
+  },
+  "max_history_turns": {
+    "type": "int",
+    "description": "每次注入的最大历史轮数（长上下文裁剪，0 表示不限制）",
+    "hint": "从最近保留；过大可能超出模型上下文窗口",
+    "default": 40
+  }
+}
