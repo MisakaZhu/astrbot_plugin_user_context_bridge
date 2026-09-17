@@ -1,0 +1,2 @@
+# 运行依赖：仅使用 AstrBot 自带与 Python 标准库（sqlite3/json/asyncio）。
+# 本插件不引入第三方运行时依赖。
