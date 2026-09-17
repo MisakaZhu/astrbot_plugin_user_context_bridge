@@ -59,7 +59,6 @@ from .ledger import (
 from .scope import ScopeResolver
 
 _AGENT_USER_ABORTED_EXTRA = "agent_user_aborted"
-_HOST_ERR_TEXT_PREFIX = "LLM 响应错误"
 DEFAULT_FAIL_WATCHDOG_SECONDS = 180.0
 
 
@@ -173,6 +172,18 @@ class ContextBridge:
             except Exception:
                 pass
 
+    @staticmethod
+    def _stop_signalled(event: AstrMessageEvent) -> bool:
+        """宿主全部停止信号的并集（S2）：与 run_agent 的 _should_stop_agent
+        同源（is_stopped / agent_stop_requested），另含事后旗标
+        agent_user_aborted 兜底。"""
+
+        return (
+            event.is_stopped()
+            or event.get_extra("agent_stop_requested") is True
+            or event.get_extra(_AGENT_USER_ABORTED_EXTRA) is True
+        )
+
     async def _acquire_identity_lock(self, identity_key: str) -> asyncio.Lock:
         async with self._locks_guard:
             lock = self._identity_locks.get(identity_key)
@@ -240,8 +251,12 @@ class ContextBridge:
                 user_message=user_message,
             )
             if turn.status != STATUS_RUNNING:
-                # 重复投递且原轮已终态：不重复接管，保持宿主原生行为
+                # S1：重复投递且原轮已终态——必须先释放刚获取的身份锁，
+                # 并终止事件传播（宿主钩子协议：is_stopped 后 internal 阶段
+                # 直接返回），防止宿主对重复消息再次执行模型造成二次回复。
                 self.stats.skipped += 1
+                event.stop_event()
+                _release()
                 return False
 
             begin_dialogs = await self._persona_begin_dialogs(event, req)
@@ -342,9 +357,12 @@ class ContextBridge:
 
         if role == "err":
             status = STATUS_FAILED
-        elif event.is_stopped():
-            # 用户停止是中止的决定性信号：覆盖 4.28 marker 与 4.26
-            # 「aborted 回调保留完整/空文本」两种形态（R2）
+        elif self._stop_signalled(event):
+            # 用户停止是中止的决定性信号（R2/S2）：is_stopped 覆盖
+            # event.stop_event 路径（reset/stop_all）；agent_stop_requested
+            # 覆盖真实 /stop（ActiveEventRegistry.request_agent_stop_all
+            # 不置 is_stopped）；agent_user_aborted 兜底。三种形态均覆盖
+            # 4.28 marker 与 4.26「回调保留完整/空文本」两版差异。
             status = STATUS_ABORTED
         elif not text and not has_tool_calls:
             status = STATUS_FAILED
@@ -359,27 +377,23 @@ class ContextBridge:
 
     # -- 写侧：辅助轨 -------------------------------------------------------
     async def handle_decorating_result(self, event: AstrMessageEvent) -> None:
-        """辅助轨：模型 err 加速检测（不做常规提交）。
+        """辅助轨（S4 后收缩）：停止旗标兜底，不做常规提交。
 
         宿主在 run_agent 中间 yield 时也会执行装饰阶段（工具轮的中间
-        输出），因此这里只在「尚未见过完成钩子 + 事件结果为宿主错误文案」
-        （模型 err 终局，不会再有 on_agent_done）时立即 failed；其余情形
-        由 on_agent_done 或 fail-watchdog 收尾。
+        输出）。此前曾以「事件结果文本以宿主错误文案开头」加速判失败——
+        但模型生成的正文可以任意开头（如诊断日志解释），自然语言前缀
+        不是程序终态信号，已移除。模型 err（不触发完成钩子）统一由
+        fail-watchdog 受控收尾；此处仅当停止旗标已置（真实 /stop 等路径
+        可能不触发其他钩子）时终态化为 aborted。
         """
 
         event_key = self.event_key_for(event)
         pending = self._pending.get(event_key)
         if pending is None or pending.committed or pending.done_seen:
             return
-        result = event.get_result()
-        text = ""
-        if result is not None:
-            try:
-                text = (result.get_plain_text() or "").strip()
-            except Exception:  # noqa: BLE001
-                text = ""
-        if text.startswith(_HOST_ERR_TEXT_PREFIX):
-            self._finalize(pending, STATUS_FAILED, [], None)
+        if self._stop_signalled(event):
+            reply = getattr(pending.agent_done_response, "completion_text", "") or None
+            self._finalize(pending, STATUS_ABORTED, [], reply)
 
     async def handle_after_message_sent(self, event: AstrMessageEvent) -> None:
         """发送标记 + 停止旗标兜底（aborted 无输出路径可能缺其他钩子）。"""
@@ -392,12 +406,20 @@ class ContextBridge:
         pending = self._pending.get(event_key)
         if pending is None or pending.committed:
             return
-        if event.is_stopped() or event.get_extra(_AGENT_USER_ABORTED_EXTRA) is True:
+        if self._stop_signalled(event):
             reply = getattr(pending.agent_done_response, "completion_text", "") or None
             self._finalize(pending, STATUS_ABORTED, [], reply)
 
     async def _fail_watchdog(self, pending: PendingTurn) -> None:
-        """受控失败兜底：超时仍 running（模型 err / 挂起 / 钩子缺失）→ failed。"""
+        """受控失败兜底（S3）：超时仍 running → 先停旧执行再收尾。
+
+        以宿主 /stop 同款信号（agent_stop_requested）标记本轮事件——
+        run_agent 的 stop watcher 检测后 request_stop，Runner 中止，
+        迟到输出被切断（不向用户发送、不写回）。只作用于本轮事件，
+        不影响同 UMO 其他用户的活跃轮次。之后才落账 failed 并释放
+        身份锁；旧 Runner 的后续 on_agent_done 因 pending 已终态被幂等
+        吸收，不会翻转状态。
+        """
 
         try:
             await asyncio.sleep(self._fail_watchdog_seconds)
@@ -405,8 +427,12 @@ class ContextBridge:
             return
         if pending.committed:
             return
+        try:
+            pending.event.set_extra("agent_stop_requested", True)
+        except Exception:  # noqa: BLE001
+            pass
         self.stats.watchdog_failures += 1
-        self._warn("uctx 轮次超时未终态化，按受控失败收尾")
+        self._warn("uctx 轮次超时未终态化，已请求停止旧执行并按受控失败收尾")
         self._finalize(pending, STATUS_FAILED, [], None)
 
     # -- 轨迹提取（R4） -----------------------------------------------------

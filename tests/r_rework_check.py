@@ -220,18 +220,20 @@ async def r2_lifecycle() -> None:
                 f"status={last['status']} pending={res_abort['pending']}",
             )
 
-            # R2-c 模型错误（默认错误文案）：decorating 快速 failed
+            # R2-c 模型错误（v3/S4 语义：err 不再按正文前缀判定，
+            # 由 fail-watchdog 受控收尾——见 s_rework_check.S4 对照）
             p_err = FakeProvider()
             p_err.error_script = [RuntimeError("服务不可用")]
             ev_err = FakeEvent(
                 sender_id="10001", group_id="700000001", message_str="会失败"
             )
             res_err = await drive_pipeline(bridge, ev_err, p_err, prompt="会失败")
+            await asyncio.sleep(0.6)  # > fail_watchdog_seconds=0.4
             last = rows(ledger, identity_of("10001"))[-1]
             check(
-                "R2.err-fast-failed",
-                last["status"] == "failed" and res_err["pending"] == 0,
-                f"status={last['status']} pending={res_err['pending']}",
+                "R2.err-watchdog-failed",
+                last["status"] == "failed" and bridge.pending_count == 0,
+                f"status={last['status']} pending={bridge.pending_count}",
             )
             check(
                 "R2.err-no-fake-success",
@@ -731,6 +733,7 @@ async def r7_native_commands() -> None:
                 conversation_manager=SimpleNamespace(
                     get_curr_conversation_id=AsyncMock(return_value="cid-x"),
                 ),
+                get_using_provider_async=AsyncMock(return_value=object()),
             )
 
             # 对话轮产生共享历史

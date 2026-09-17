@@ -136,3 +136,12 @@ on_decorating_result 不能作为整轮提交点）**：
   清空共享历史）。`/new` 无宿主权限门槛，范围内即联动。
 - 联动动作：切换该身份 epoch（原生 reset/new 语义 = 开新上下文，同步对共享历史
   生效）+ 提示「仅影响本人」。未共享用户：不动作不加提示，宿主原行为。
+
+## ADR-011：二次验收 S1~S6 修复（终态机 v3）
+
+- **S1 重复投递**：已终态事件的重复接管在返回前必须释放刚获取的身份锁，并对事件调用宿主公开的 `event.stop_event()` 终止传播——宿主钩子协议在 `is_stopped` 后由 internal 阶段直接返回，防止对重复消息二次执行模型。
+- **S2 真实 /stop**：宿主 `/stop`（ActiveEventRegistry.request_agent_stop_all）只置 `agent_stop_requested` extra、不置 `is_stopped`；停止判定取宿主 `_should_stop_agent` 同源并集（is_stopped / agent_stop_requested / agent_user_aborted）。
+- **S3 watchdog 受控失败覆盖执行**：watchdog 触发时先对轮次事件设置 `agent_stop_requested`（宿主 /stop 同款信号），run_agent 的 stop watcher 请求停止——4.28 形态为模型调用被取消/aborted 收尾；4.26 形态为 step 后置检查使迟到的 resp 被 run_agent 停止分支吞掉（不发送、不产出）。两种形态下旧轮均不再影响用户与存储，之后才落账 failed 并释放身份锁。仅作用于本轮事件，不波及同 UMO 其他用户的活跃轮次。
+- **S4 正文前缀非程序终态**：删除「事件结果文本以宿主错误文案开头即判失败」的启发式——模型可以生成任意开头的正文。模型 err（不触发完成钩子）统一由 fail-watchdog 受控收尾；装饰钩子仅保留停止旗标兜底。
+- **S5 原生 reset 镜像补全**：`_host_reset_would_run` 补齐宿主拒绝分支——第三方执行器（4.26/4.28 字段位置差异兼容）与可用模型提供方检查；宿主拒绝（无 provider 等）时不得清空共享历史。
+- **S6 真实 PluginManager 生命周期（A17 本地完成）**：tests/s6_plugin_lifecycle_worker.py 以子进程隔离实例（ASTRBOT_ROOT 临时根、data/plugins 安装、data/config 预建——4.26 的 AstrBotConfig 不自动建目录）驱动真实 PluginManager.load/reload/uninstall_plugin 与 turn_off/turn_on：加载绑定 12 个 handler、默认关闭不采集、启用配置重载生效、真实钩子下群A→群B 接续、活动轮挂起时卸载将 pending 终态化 interrupted 且注册表与插件目录清理。

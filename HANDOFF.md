@@ -1,50 +1,48 @@
 # HANDOFF（交接说明）
 
-面向 Codex 独立复验（MIS-144）与用户实机验证（MIS-145）。对应最终提交见 docs/STATUS.md；证据均对应该提交。
+面向 Codex 复验（MIS-144）与用户实机验证（MIS-145）。对应最终提交见 docs/STATUS.md；证据均对应该提交。
 
-## 交付摘要（R1~R7 返工后）
+## 交付摘要（S1~S6 二次返工后，0.3.0）
 
-- 版本 0.2.0（返工候选），main 分支，无远端、未 push。
-- 基线 8477eba 独立验收 R1~R7 全部返工完成（见 docs/STATUS.md 返工节与 ADR-003 v2/004 v2/009/010）。
-- 测试：8 套 × 4.26.0/4.28.0 各 **181 项断言全部 PASS**（含新增 tests/harness.py 真实调度链与 tests/r_rework_check.py 返工回归 37 项/版）。
-- 可安装包：`release/astrbot_plugin_user_context_bridge-<final-sha>.zip`（白名单 12 文件）；SHA-256 见交付报告与同目录 .sha256 文件。
+- 版本 0.3.0（二次返工候选），main 分支，无远端、未 push。
+- 基线链：8477eba（一轮）→ d8a7147（R1~R7）→ 本次（S1~S6，ADR-011）。
+- 测试：9 套 × 4.26.0/4.28.0 各 **221 项断言全部 PASS**（从日志加总：P0=17 P1=35 P2=27 P3=19 P4=22 P5=16 P6=8 R=37 S=40）；新增 tests/s_rework_check.py（40 项/版，含真实 PluginManager 生命周期子进程 S6）。
+- 可安装包：`release/astrbot_plugin_user_context_bridge-<final-sha>.zip`（12 文件白名单）；SHA-256 见交付报告与同目录 .sha256 文件。
 
-## 返工要点（对应独立验收报告）
+## 二次返工要点（对应二次验收报告 S1~S6）
 
-| 项 | 修复 | 证据 |
-| --- | --- | --- |
-| R1 | main.py 包内相对导入；A17 按宿主 data.plugins.<name>.main 真实路径导入 | p6: A17.module-importable；r: import_plugin_module |
-| R2 | 终态机 v2：on_agent_done 主提交（is_stopped 判 aborted）；decorating 仅 err 文本加速；after_sent 兜底；fail-watchdog；真实调度链 harness | r: R2.*（11 项：工具轮/取消/err 快速/err watchdog/空回复/卸载） |
-| R3 | 身份锁持有至轮次终态化 | r: R3.second-waits-for-first / second-sees-first-question-and-answer / different-identity-parallel |
-| R4 | prompt 前缀匹配本轮边界；临时内容不入库；completed 保底配对 | r: R4.pair-complete / transient-excluded / next-request-contains-pair |
-| R5 | 命令身份接入 conversation.persona_id（含 getter 未调用缺陷修复） | r: R5.command-identity-matches / reset-clears-selected-persona / off-stops-selected-persona |
-| R6 | 租约运行时 ID + owner_token 归属校验；真实双子进程排他 | r: R6.*（6 项，含 multiprocess-exclusive / no-cross-release） |
-| R7 | 原生 /reset、/new 联动 epoch（ADR-010；权限镜像 + 未共享原行为） | r: R7.*（5 项）；ACCEPTANCE A11 更新 |
+| 项 | 根因 | 修复 | 证据 |
+| --- | --- | --- | --- |
+| S1 重复投递锁泄漏 | 已终态事件重复接管直接 return，锁未释放且宿主可能二次执行 | 释放刚获取的身份锁 + `event.stop_event()` 终止传播 | s: S1.*（重复不重接、传播终止、锁已释放、后继轮实际完成且含前轮问答） |
+| S2 真实 /stop 记 completed | /stop 只置 agent_stop_requested，不置 is_stopped | 停止判定取 `_should_stop_agent` 同源并集（三信号） | s: S2.*（真实 ConversationCommands.stop + 活动注册表：aborted 终态、历史/输出干净、锁释放） |
+| S3 watchdog 不停旧执行 | 只改账本放锁，旧 Runner 迟到输出仍发送 | watchdog 先设 agent_stop_requested（宿主 /stop 同款信号）再收尾；两版形态（取消/吞输出）均无迟到输出 | s: S3.*（信号、旧执行停止、无迟到输出、failed 落账、后继干净且完成） |
+| S4 正文前缀误判失败 | 模型可生成「LLM 响应错误」开头的正常正文 | 删除文本前缀启发式；err 统一 watchdog 收尾 | s: S4.*（诊断文本工具轮 completed + 真实/自定义 err 均受控 failed） |
+| S5 宿主拒绝仍清空 | 镜像漏 provider 与第三方执行器检查 | 补全宿主拒绝分支（字段两版兼容） | s: S5.*（真实 reset：无 provider 拒绝不清空、成功联动、权限、停用） |
+| S6 A17 本地缺口 | 无真实 PluginManager 生命周期证据 | 子进程隔离实例：安装→load→默认关闭→配置 reload→真实钩子接续→挂起轮卸载→清理 | s: S6.<venv/venv426>.*（各 5 项，两版通过） |
 
 ## 复现
 
 ```bash
-for t in p0_lifecycle_check p1_identity_scope_check p2_ledger_check          p3_bridge_flow_check p4_concurrency_check p5_commands_check          p6_packaging_check r_rework_check; do
+for t in p0_lifecycle_check p1_identity_scope_check p2_ledger_check          p3_bridge_flow_check p4_concurrency_check p5_commands_check          p6_packaging_check r_rework_check s_rework_check; do
   PYTHONPATH=. <venv>/Scripts/python.exe tests/$t.py
 done
-# 期望：每套 FAIL=0；两版宿主各 181 项断言通过
+# 期望：每套 FAIL=0；两版宿主各 221 项断言通过（s_rework 含子进程 S6，
+# 需能创建临时目录；4.26 首载需 data/config 预建——worker 已内置）
 ```
 
 ## 复验建议（Codex，MIS-144）
 
-1. 复跑 8 套测试（两版宿主）核对 181×2。
+1. 复跑 9 套测试（两版宿主）核对 221×2（从日志逐项加总）。
 2. 重点核查：
-   - R2 终态机：tests/harness.py 的调度链（PipelineScheduler + ResultDecorateStage + 逐 yield 下游）与真实宿主顺序的一致性；
-   - R3 锁释放路径（on_agent_done/watchdog/terminate 三处）与死锁面；
-   - R6 owner_token 边界（伪造 token 心跳/释放被拒、多进程互斥）；
-   - R7 权限镜像与宿主 builtin 逻辑（conversation.py）的一致性。
+   - S2/S3 的停止信号协议与宿主 `_should_stop_agent`/`request_agent_stop_all` 的一致性及两版形态差异（4.28 取消 vs 4.26 吞输出）；
+   - S1 的全部退出路径（重复/登记失败/取消/卸载）无无主锁——bridge 中锁释放在 `_release` 闭包唯一出口；
+   - S5 镜像与宿主 builtin reset 逐分支对齐（conversation.py 两版）；
+   - S6 worker 的隔离性（ASTRBOT_ROOT 临时根、子进程退出即销毁、无全局污染）。
 3. 交付包：ZIP 清单与 SHA-256。
 
 ## 实机演练清单（用户，MIS-145，脱敏）
 
-同 0.1.0 版（HANDOFF 历史），新增两条：
-9. 群聊 admin `/reset` → 提示同步清空共享历史；非 admin `/reset` → 仅宿主原提示；`/new` 同理联动；未共享成员 `/reset` 无插件提示。
-10. 同数据目录误开第二个 AstrBot 实例 → 第二实例插件禁用并告警（共享不生效）；关闭后约 300 秒内重启需等旧租约过期。
+同前版（HANDOFF 历史）+：真实 `/stop` 中止长回复后跨窗口继续；宿主无可用模型时 `/reset`（应只见宿主拒绝提示，共享历史不清空）。
 
 ## 待用户决定
 
@@ -55,6 +53,6 @@ done
 
 - v1 不自动迁移既有 QQ 历史。
 - 同库双实例：第二实例禁用；崩溃后重启需等旧租约心跳过期（默认 300s，有意保守）。
-- fail-watchdog 默认 180s：无钩子的模型 err 轮最迟此时落 failed（不影响读取）。
-- 语音/引用端到端、GUI 级停用/卸载、独立实例 GUI 安装、原生联动实机确认：待 MIS-145。
-- 其他插件若直接改写 req.contexts（而非 system_prompt/extra parts），与本插件的上下文替换语义存在覆盖竞争（ADR-002 声明）。
+- fail-watchdog 默认 180s：无钩子的模型 err 轮最迟此时落 failed（不影响读取；S3 修复后旧执行被停止信号切断）。
+- 原生命令联动：命令改名/过滤组合（alter_cmd 别名机制作用于插件命令的最终行为）以源码核对 + 组件级真实 reset 验证覆盖，实机确认列入 MIS-145。
+- 语音/引用端到端、GUI 级停用/卸载、真实 QQ 演练：待 MIS-145。

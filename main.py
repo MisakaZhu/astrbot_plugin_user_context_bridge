@@ -32,7 +32,7 @@ _HEARTBEAT_INTERVAL_SECONDS = 60.0
     "astrbot_plugin_user_context_bridge",
     "Ewnscat-ya",
     "同一用户跨会话上下文共享（群聊/私聊连续真实对话历史）",
-    "0.2.0",
+    "0.3.0",
 )
 class UserContextBridgePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -264,10 +264,19 @@ class UserContextBridgePlugin(Star):
         except Exception:  # noqa: BLE001 - 联动失败不影响宿主命令
             logger.warning("uctx 原生命令联动失败", exc_info=True)
 
-    async def _host_reset_would_run(self, event: AstrMessageEvent) -> bool:
-        """镜像宿主 builtin /reset 的执行条件（两版逻辑一致）。
+    # 宿主第三方会话执行器键（两版一致；这些路径 v1 不支持，不联动）
+    _THIRD_PARTY_RUNNERS = frozenset(
+        {"dify", "coze", "dashscope", "deerflow"}
+    )
 
-        返回 False 表示宿主将拒绝执行（权限不足 / 无会话），此时不联动。
+    async def _host_reset_would_run(self, event: AstrMessageEvent) -> bool:
+        """镜像宿主 builtin /reset 的完整执行条件（S5 补全）。
+
+        逐项对应宿主 ConversationCommands.reset 的拒绝分支（两版逻辑一致，
+        字段名差异已兼容）：权限（scene + alter_cmd + role）、第三方执行器
+        （v1 不支持，宿主走远端清空分支，不联动）、可用模型提供方
+        （宿主在无 provider 时拒绝并提示，不得清空共享历史）、当前会话
+        存在。任一不满足即返回 False（不联动）。
         """
 
         cfg = self.context.get_config(umo=event.unified_msg_origin)
@@ -287,6 +296,27 @@ class UserContextBridgePlugin(Star):
             )
         )
         if required_perm == "admin" and event.role != "admin":
+            return False
+        # 宿主下一步检查 runner 类型：第三方执行器走远端清空分支（v1 不支持）
+        agent_cfg = cfg.get("agent_runner", {})
+        runner_type = agent_cfg.get("runner_type") if isinstance(
+            agent_cfg, dict
+        ) else None
+        if runner_type is None:
+            # 4.26 字段位置不同
+            runner_type = (
+                cfg.get("provider_settings", {}).get("agent_runner_type")
+            )
+        if runner_type in self._THIRD_PARTY_RUNNERS:
+            return False
+        # 宿主随后要求可用模型提供方（无 provider 时拒绝重置）
+        try:
+            provider = await self.context.get_using_provider_async(
+                event.unified_msg_origin
+            )
+        except Exception:  # noqa: BLE001 - 接口异常按宿主拒绝处理
+            provider = None
+        if provider is None:
             return False
         cid = await self.context.conversation_manager.get_curr_conversation_id(
             event.unified_msg_origin

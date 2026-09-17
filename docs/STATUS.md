@@ -2,7 +2,7 @@
 
 维护规则：每阶段记录当前提交、实际改动、验证命令与结果、失败项、下一步。证据必须对应提交。
 
-## 当前阶段：R1~R7 独立验收返工（基线 8477eba）→ 返工候选完成，待 Codex 复验
+## 当前阶段：S1~S6 二次返工（基线 d8a7147）→ 0.3.0 候选完成，待 Codex 复验
 
 ### P0 / MIS-136 已完成（In Review）
 
@@ -87,3 +87,18 @@ ADR-004 v2 / ADR-009 / ADR-010）：
 
 测试统计（返工后）：8 套 × 4.26.0/4.28.0 各 **181 项断言全部 PASS**
 （P0=17 P1=35 P2=27 P3=19 P4=22 P5=16 P6=8 R=37）。
+
+
+## 二次验收返工（2026-09-17，Codex 二次验收报告 06）
+
+基线 d8a7147 二次验收 S1~S6 返工完成（ADR-011）：
+
+- **S1**：重复投递分支释放身份锁 + `event.stop_event()` 终止传播（宿主 internal 阶段在 is_stopped 后直接返回，防二次执行模型）；回归验证后继新窗口轮实际完成且含前轮问答。
+- **S2**：停止判定取宿主 `_should_stop_agent` 同源并集（is_stopped / agent_stop_requested / agent_user_aborted）；真实 ConversationCommands.stop + active_event_registry 验证：终态 aborted、历史与输出干净、锁释放。
+- **S3**：watchdog 先设 `agent_stop_requested`（宿主 /stop 同款信号）再落账释放——4.28 模型被取消/aborted 收尾、4.26 迟到 resp 被停止分支吞掉；两版均无迟到输出、后继轮干净。
+- **S4**：删除「LLM 响应错误」正文前缀判失败（模型可生成任意开头正文）；err 统一 watchdog 收尾；诊断文本/真实 err/自定义文案三对照。
+- **S5**：`_host_reset_would_run` 补 provider 与第三方执行器检查（4.26/4.28 字段兼容）；真实 reset 拒绝（无 provider）→ 不清空不发提示；成功 → 联动；权限/停用维持。
+- **S6**：tests/s6_plugin_lifecycle_worker.py——真实 PluginManager 隔离子进程实例完整生命周期（load/默认关闭/配置 reload/真实钩子接续/挂起轮卸载/清理），两版通过。
+
+测试统计（从日志加总）：9 套 × 4.26.0/4.28.0 各 **221 项断言全部 PASS**
+（P0=17 P1=35 P2=27 P3=19 P4=22 P5=16 P6=8 R=37 S=40）。上轮 151 汇总误差已按更正口径（143）处理，不再沿用。
