@@ -1,10 +1,22 @@
-# 验收矩阵映射（A01-A18，二次返工后 v3）
+# 验收矩阵映射（A01-A18，三次返工后 v4）
 
-对应 0.3.0 二次返工候选（S1~S6 返工后）。每行给出：场景 → 落点断言（最终模型请求 /
-实际持久化 / 回复目标）→ 测试文件与断言名 → 状态。R 系列映射来自 Codex 独立验收报告。
+对应 0.4.0 三次返工候选（T1~T6 返工后，提交 5f662d0）。每行给出：场景 → 落点断言
+（最终模型请求 / 实际持久化 / 回复目标）→ 测试文件与断言名 → 状态。R/S/T 系列映射
+来自 Codex 独立验收报告 04/06/08。
 
-测试运行（两版宿主各跑一遍，合成数据，假模型/假传输；r_rework_check 使用真实
-PipelineScheduler + ResultDecorateStage 调度链）：
+测试运行（两版宿主各跑一遍，合成数据，假模型/假传输；r/s/t_rework_check 使用真实
+PipelineScheduler + ResultDecorateStage 调度链；t1_persona_worker 用真实
+PersonaManager/ConversationManager/宿主新会话路径；t5_native_worker 用真实
+Context/WakingCheckStage/StarRequestSubStage/builtin 命令实例；s6 worker 用真实
+PluginManager 生命周期）：
+
+```bash
+for t in p0_lifecycle_check p1_identity_scope_check p2_ledger_check          p3_bridge_flow_check p4_concurrency_check p5_commands_check          p6_packaging_check r_rework_check s_rework_check t_rework_check; do
+  PYTHONPATH=. <venv>/Scripts/python.exe tests/$t.py
+done
+# 统计（日志逐项加总）：4.26.0 / 4.28.0 各 258 项断言全部 PASS
+# （17+36+27+19+22+16+8+38+40+35）
+```
 
 ```bash
 for t in p0_lifecycle_check p1_identity_scope_check p2_ledger_check \
@@ -19,23 +31,23 @@ done
 | A01 | 同一人：群 A → 群 B | B 的**最终模型请求**（provider.call_log contexts）含 A 的已完成问答、顺序正确、各出现一次；账本 completed 计数 | p3: A01.turn2-request-contains-turn1 / turn2-order / turn2-no-duplicate / ledger-completed-count；p2: A07.* | PASS（双版本） |
 | A02 | 群 → 私聊 → 另一群 | 三跳+回程的模型请求上下文连续；**回复目标**仍为当前窗口 UMO | p3: A02.private-continues-group / round-trip-back-to-A / reply-target-unchanged | PASS（双版本） |
 | A03 | 同一群中的两个人 | 另一用户的模型请求与账本均不含本人历史；各自独立身份账本 | p1: A03.same-group-two-users-isolated；p3: A03.other-user-isolated / other-user-own-ledger | PASS（双版本） |
-| A04 | 不同机器人/平台实例/人格 | 同 QQ 号在 self_id/platform_id/persona_scope 任一维度变化时身份键不同 | p1: A04.same-qq-different-{bot,persona,platform}-isolated | PASS（双版本） |
+| A04 | 不同机器人/平台实例/人格 | 同 QQ 号在 self_id/platform_id/persona_scope 任一维度变化时身份键不同；**真实 4.26 默认人格隔离（T1）**：不同默认人格/显式会话人格/解析失败受控不折叠、开场白同源 | p1: A04.*；t: T1.<venv/venv426>.distinct-persona-keys / b-excludes-a-history / b-keeps-own-begin-dialogs / explicit-conversation-persona / resolution-failure-controlled（真实 PersonaManager+ConversationManager+`_get_session_conv` 新会话路径，双版各 5 项） | PASS（双版本） |
 | A05 | 未启用来源、关闭共享、退出 | 判定层不采集；范围外轮次宿主原生写回；命令 off/on 生效且作用于正确身份（R5）且个人不能扩大范围 | p1: A05.*；p3: OOS.*；p5: A05.cmd-* / personal-on-cannot-expand；r: R5.off-stops-selected-persona | PASS（双版本） |
 | A06 | 非隔离群 UMO、同名用户、普通闲聊 | 归属按真实 sender（昵称无关）；未唤醒/机器人自言/管理命令/空 sender 排除 | p1: A06.*（nickname-irrelevant / group-umo-attributed-by-sender / bot-self / command / not-wake / empty-sender） | PASS（双版本） |
-| A07 | 重复事件、重试、重复完成通知 | event_key 唯一约束：一轮一记录，终态不翻转；闭环层每轮一对 user/assistant；**重复投递释放锁并终止事件传播（S1），后继轮实际完成** | p2: A07.*；p3: A01.turn2-no-duplicate；s: S1.*（6 项，含 lock-released-after-duplicate / next-request-completes / next-sees-first） | PASS（双版本） |
+| A07 | 重复事件、重试、重复完成通知 | event_key 唯一约束：一轮一记录，终态不翻转；闭环层每轮一对 user/assistant；重复投递释放锁并终止事件传播（S1）；**锁后取消窗口收尾（T2）：取消轮 0 模型 0 输出、interrupted、锁释放、后继轮真实完成** | p2: A07.*；p3: A01.turn2-no-duplicate；s: S1.*（6 项）；t: T2.cancel-no-model / no-output / stops-event / turn-finalized / lock-released / next-request-completes / pre-registration-cancel-clean（7 项） | PASS（双版本） |
 | A08 | 跨窗口同时发消息 | 同身份锁覆盖至终态（R3）：后继轮等待前轮完成且请求含前轮问答（屏障验证）；不同身份并行（计时）；全部落账无覆盖 | r: R3.second-waits-for-first / second-sees-first-question-and-answer / different-identity-parallel；p4: A08.*（22 项栈） | PASS（双版本） |
 | A09 | 多连接并发与同库双实例 | 4 连接并发 24 轮无丢失无覆盖；双实例防护（R6）：运行时租约身份 + owner_token 归属校验（伪造 token 的跨实例释放被拒）+ 真实双子进程第二实例被拒 | p2: A09.*；r: R6.runtime-ids-distinct / no-cross-release / lease-still-active / owner-release-ok / multiprocess-exclusive | PASS（双版本） |
-| A10 | 模型报错、超时、取消、发送失败 | 真实调度链：工具中间输出不提前提交、err 由 watchdog 受控失败（S4：正文前缀不再判定终态；诊断文本/真实 err/自定义文案对照）、**真实 /stop 终态 aborted（S2：ConversationCommands.stop + 活动注册表）**、**watchdog 停止旧执行无迟到输出（S3：两版形态屏障验证）**、空回复 failed、发送状态可区分、卸载 interrupted | s: S2.*（5 项）/ S3.*（7 项）/ S4.*（5 项）；r: R2.*；p4: A10.*；p2: A10.failed-aborted-not-in-history | PASS（双版本） |
-| A11 | reset/new 期间慢请求（含原生命令联动） | 存储层 epoch 防复活 + bridge 慢请求吸收 + 命令 reset 仅本人；原生 /reset、/new 联动（S5 补全）：**宿主实际成功才联动**——真实 ConversationCommands.reset 拒绝（无 provider）时不清空不发提示、成功时联动清空+提示、权限镜像、停用不联动 | s: S5.*（5 项，真实宿主 reset）；p2: A11.*；p4: A11.*；r: R7.* | PASS（双版本；实机补充） |
+| A10 | 模型报错、超时、取消、发送失败 | 真实调度链：工具中间输出不提前提交、err 由 watchdog 受控失败（S4）、真实 /stop 终态 aborted（S2）、watchdog 停止旧执行无迟到输出（S3）、空回复 failed、发送状态可区分、卸载 interrupted；**缓冲正文抑制（T4）：buffer=True 超时后无新增正文/无缓冲迟到输出** | s: S2.* / S3.* / S4.*；t: T4.no-new-output-after-timeout / no-buffered-late-output / failed-finalized（真实 run_agent + 公开 buffer 参数）+ T2.*（取消窗口 7 项）；r: R2.*；p4: A10.*；p2: A10.failed-aborted-not-in-history | PASS（双版本） |
+| A11 | reset/new 期间慢请求（含原生命令联动） | 存储层 epoch 防复活 + bridge 慢请求吸收 + 命令 reset 仅本人；原生命令**后置成功关联（T5/T6 重构）**：宿主 builtin 实际执行成功（activated_handlers 结构化证据 + 宿主固定成功文案）才联动清空——真实 Context 命令分发矩阵：默认成功联动、无 provider/内置禁用（reset+new）/改名旧名/自定义过滤拒绝不清空、改名新名成功联动、4.26 真实 Context（无 async provider 接口）兼容 | s: S5.*（真实宿主 reset 拒绝/成功/权限/停用）；t: T5.<venv/venv426>.real-context-reset-syncs / no-provider-no-clear + T6.<venv/venv426>.disabled-no-clear / disabled-new-no-clear / renamed-old-name-no-clear / renamed-new-name-syncs / filter-denied-no-clear（真实 Context/WakingCheckStage/StarRequestSubStage，双版各 6+2 项）；p2: A11.*；p4: A11.*；r: R7.* | PASS（双版本；实机补充） |
 | A12 | 重启、重载、异常中断恢复 | 已提交历史保留；遗留 running → interrupted 不入历史；恢复幂等 | p2: A12.*；p4: A12.*（4 项） | PASS（双版本） |
 | A13 | 长上下文裁剪 | max_turns 尾部保留最近 N 轮（不破坏轮次完整性） | p2: A13.trim-keeps-recent / full-untrimmed | PASS（双版本） |
 | A14 | 图像/语音/引用与工具结果 | base64/本地路径不入库不入请求（[图片]/[音频] 占位）；真实两步工具轮的调用/结果配对入库且下一轮可续（R2/R4）；临时 extra 内容不入库（R4） | p2: A18.tool-structure-kept；p3: A14.*；r: R2.tool-trajectory-pairs / R4.transient-excluded / R4.next-request-contains-pair | PASS（双版本；语音/引用为宿主装配路径的间接验证，实机补充） |
 | A15 | 多插件共存 | 其他插件 system_prompt 动态注入在接管后保留；人格/系统提示进入最终模型请求；开场白单次注入；宿主 mark_as_temp 临时注入不永久污染共享历史 | p5: A15.other-plugin-prompt-kept；p3: A15.*；r: R4.transient-excluded | PASS（双版本） |
-| A16 | 停用/卸载与重新启用 | 停用后不采集不注入、原生行为恢复；重启用后停用期间消息不回灌；卸载/重载未决轮次 interrupted（真实调度链验证） | p5: A16.*；r: R2.terminate-interrupted | PASS（双版本；GUI 级停用/卸载待实机） |
-| A17 | 插件打包安装 | **S6：真实 PluginManager 隔离实例生命周期（本地完成）**——安装→load（绑定 12 handler）→默认关闭不采集→写启用配置 reload→真实钩子群A→群B 接续→挂起轮 uninstall 终态 interrupted→注册表与目录清理；两版宿主子进程通过（4.26 需预建 data/config，已适配） | s: S6.<版>.load / default-off / reload-enabled / shared-turn / uninstall（2×5 项）；p6: A17.module-importable / metadata-valid / config-schema-valid / zip-manifest | PASS（双版本） |
+| A16 | 停用/卸载与重新启用 | 停用后不采集不注入、原生行为恢复；重启用后停用期间消息不回灌；卸载/重载未决轮次 interrupted；**关闭协议（T3）：真实 turn_off/turn_on/reload/uninstall 下活动轮无迟到正文、排队轮干净让出且事件终止、恢复正常无回灌** | p5: A16.*；r: R2.terminate-interrupted；s6 worker: turn_off_activated_false / active_stop_requested / active_stopped / active_no_late_output / queued_task_returned / queued_no_output / queued_stopped / rows_after_turn_off / turn_on_activated / recovery_turn_completed / recovery_no_backfill / uninstall_no_late_output / uninstall_interrupted_pending / uninstall_removed_from_registry / uninstall_dir_removed（真实 PluginManager，含挂起 A + 排队 B） | PASS（双版本；GUI 级停用/卸载待实机） |
+| A17 | 插件打包安装 | **真实 PluginManager 隔离实例生命周期（S6+T3 本地完成）**——安装→load（绑定 12 handler）→默认关闭不采集→写启用配置 reload→真实钩子群A→群B 接续→**真实 turn_off（挂起 A+排队 B 关闭协议）→turn_on 恢复→uninstall**→注册表与目录清理；两版宿主子进程通过（4.26 需预建 data/config，已适配） | s: S6.<venv/venv426>.load / default-off / reload-enabled / shared-turn / uninstall（2×5 项）+ s6 worker T3 新增观测（before_shutdown_pending/waiters、turn_off/on、挂起+排队）；p6: A17.module-importable / metadata-valid / config-schema-valid / zip-manifest | PASS（双版本） |
 | A18 | 发布准备与隐私 | Git 跟踪清单无 db/log/zip/venv/缓存/真实配置；ZIP 同样干净 | p6: A18.git-manifest-clean / zip-manifest-clean | PASS（双版本） |
 
-## 未覆盖 / 待实机项
+## 未覆盖 / 待实机项（v4 口径）
 
 - **A14 语音、引用消息**：宿主装配路径（Record/Reply → 附件占位）由 P0 源码核对与请求装配共用路径间接覆盖；真实 QQ 语音/引用端到端待 MIS-145 实机验证。
 - **A11 原生联动的实机确认**：与宿主 builtin /reset 在真实命令分发中的共存顺序（多 handler 依次执行）已在组件级用真实 ConversationCommands.reset 验证拒绝/成功/权限分支；实机演练确认最终用户体验与命令改名/过滤组合。
