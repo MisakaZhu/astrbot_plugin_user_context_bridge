@@ -91,6 +91,7 @@ async def drive_pipeline(
         req.extra_user_content_parts = list(extra_parts)
     if func_tool is not None:
         req.func_tool = func_tool
+    trace: list[dict] = []
     hook_stopped = await call_event_hook(event, EventType.OnLLMRequestEvent, req)
     if hook_stopped or event.is_stopped():
         # 宿主 internal.py 语义：钩子终止事件后不再执行模型
@@ -114,8 +115,6 @@ async def drive_pipeline(
     if abort_before_run:
         event._force_stopped = True
         runner.request_stop()
-
-    trace: list[dict] = []
 
     class AgentStage:
         async def process(self, event_inner):

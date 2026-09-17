@@ -246,6 +246,9 @@ class ContextBridge:
 
         # T1：与宿主同参解析（含 provider_settings）；失败为受控跳过，
         # 不得折叠成默认共享身份把不同人格的对话合并。
+        # U1：初始解析等待期间的取消——尚未取得任何锁/轮次资源，只需
+        # 终止事件传播（宿主 call_event_hook 吞掉取消继续流程，is_stopped
+        # 阻止其后的模型执行与发送）后交还取消语义；不触碰他人锁。
         try:
             persona_scope = await resolve_persona_scope(
                 self._get_persona_manager(),
@@ -257,6 +260,9 @@ class ContextBridge:
             self.stats.skipped += 1
             self._warn(f"uctx 人格解析失败，本轮不接管：{exc}")
             return False
+        except asyncio.CancelledError:
+            event.stop_event()
+            raise
         decision = self._scope.evaluate(event, persona_scope)
         if not decision.in_scope or decision.identity is None:
             self.stats.skipped += 1
@@ -265,21 +271,32 @@ class ContextBridge:
 
         event_key = self.event_key_for(event)
         lock = await self._acquire_identity_lock(identity.key)
-        await lock.acquire()
-        # T3：排队期间插件已进入关闭——干净让出（不碰已关账本），并终止
-        # 事件传播（宿主 internal 在 is_stopped 后直接返回，不执行模型）。
-        if self._closing:
-            self.stats.skipped += 1
-            event.stop_event()
-            lock.release()
-            return False
-        released = False
+        # U1：锁的等待/获取与全部后续可等待点纳入同一取消保护——
+        # ``lock_acquired`` 标志界定资源归属：等待中取消（未取得）不
+        # 释放他人锁；取得后任何 await 取消走统一收尾（轮次 interrupted
+        # + 释放锁 + 终止事件传播），不遗留无主锁。
+        lock_acquired = False
 
         def _release() -> None:
-            nonlocal released
-            if not released:
-                released = True
+            nonlocal lock_acquired
+            if lock_acquired:
+                lock_acquired = False
                 self._release_identity_lock(identity.key)
+
+        try:
+            await lock.acquire()
+            lock_acquired = True
+            # T3：排队期间插件已进入关闭——干净让出（不碰已关账本），
+            # 并终止事件传播（宿主 internal 在 is_stopped 后直接返回）。
+            if self._closing:
+                self.stats.skipped += 1
+                event.stop_event()
+                _release()
+                return False
+        except asyncio.CancelledError:
+            # 等待锁时被取消：未取得所有权，不释放（锁仍属持有人）
+            event.stop_event()
+            raise
 
         try:
             history = self._ledger.load_history(

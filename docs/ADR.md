@@ -154,3 +154,10 @@ on_decorating_result 不能作为整轮提交点）**：
 - **T4 缓冲正文抑制**：停止信号升级为全套（`agent_stop_requested` + `stop_event`）——宿主 scheduler 在 yield 暂停点检测 is_stopped 后不再执行后续阶段（respond），run_agent aborted 分支交出的缓冲旧正文（buffer_intermediate_messages=True）到不了下游；另在 decorating 钩子对本轮已 failed/interrupted 的残留 result `clear_result()` 双保险。
 - **T5 版本兼容**：provider 检查按真实 Context 实例的接口存在性选择（`get_using_provider_async` 或同步 `get_using_provider`），4.26 真实 Context 无 async 接口（探针证实）走同步。
 - **T6 原生命令成功关联（ADR-010 v2）**：删除同名单 `/reset`、`/new` 处理器（与宿主实际执行脱节：禁用误清/旧名误清/新名漏清）。改为 **decorating 后置事实关联**：宿主 builtin `reset`/`new_conv` 处理器在本事件 `activated_handlers` 中（WakingCheckStage 结构化激活证据，天然涵盖权限/禁用/改名/自定义过滤）**且** 事件结果为宿主 builtin 固定成功文案（"✅ Conversation reset successfully"/"✅ Switched to new conversation"，程序生成字面量、两版一致、非模型正文）时，经轻量防御（provider+会话存在）后切换发送者共享身份 epoch。时机在 StarRequestSubStage 的 yield 窗口（result 仍存在、respond 未执行），即真实管线中插件 on_decorating_result 钩子的触发点。
+
+## ADR-013：四次验收 U1~U4 修复
+
+- **U1 全等待点取消语义**：`handle_llm_request` 的三个可等待点全部纳入取消保护——① 初始人格解析（`except asyncio.CancelledError` → `event.stop_event()` + re-raise；未取得任何资源不触碰锁）；② 锁等待/获取（`lock.acquire()` 置于 try 内，`lock_acquired` 标志界定归属：等待中取消不释放他人锁，取得后取消走统一收尾）；③ 后续可等待点（原有 T2 路径）。宿主 `call_event_hook` 以 `except BaseException` 吞掉取消——插件在取消分支设置 `stop_event()` 后事件在宿主管线的下一个 yield 检查点被截断（不执行模型、不发送），再交还取消语义。
+- **U2 new/reset 分命令成功语义**：宿主 `/new` 不要求 provider 即可成功创建会话；防御复核按命令区分——reset 保留 provider+会话复核（成功必有 provider），new 只复核会话存在。恢复 provider 后下一轮经 epoch 机制不读回已清旧历史。
+- **U3 结构化成功事实（ADR-010 v3）**：成功判定改为宿主 builtin 在本地会话 reset 清空/new_conversation 创建成功的**末尾设置的结构化标记** `event.extra["_clean_group_context_session"]=True`（两版 builtin conversation.py 字面量一致；权限拒绝/无 provider/第三方执行器分支均不设置；消费者为宿主 group_chat_context 清理）。布尔 extra 不受其他插件的文本装饰改写（此前依赖成功文案 startswith，前置装饰钩子加前缀即漏清）。保留 activated_handlers 结构化激活证据作为第一证据。
+- **U4 测试有效性**：harness 的 `trace` 初始化提前至 hook 调用前（原 stopped 分支 UnboundLocalError 被吞）；取消场景的 `gather(return_exceptions=True)` 结果纳入断言（非 CancelledError 且非受控 stopped-dict 的异常暴露为失败）；T2 登记前取消断言收紧（停止/0 模型/0 输出/无锁泄漏）；S6 worker 的 T3 生命周期关键字段（活动轮停止/无迟到、排队干净让出、恢复正常、无回灌、卸载清理）进入父测试 4 组断言，故障注入验证全部按预期失败。

@@ -764,12 +764,17 @@ async def r7_native_commands() -> None:
             )
 
             async def _native_like(
-                ev, *, activated_builtin, success_text
+                ev, *, activated_builtin, success_text, clean_marked=None
             ):
+                # U3 语义：成功证据 = activated_handlers + 结构化标记
+                # _clean_group_context_session（success_text 仅作对照输出，
+                # 不再参与判定）
                 activated = [_plugin_handler("uctx_status")]
                 if activated_builtin:
                     activated.append(_builtin_handler("reset"))
                 ev.set_extra("activated_handlers", activated)
+                if clean_marked:
+                    ev.set_extra("_clean_group_context_session", True)
                 if success_text is not None:
                     from astrbot.core.message.message_event_result import (
                         MessageEventResult,
@@ -794,6 +799,7 @@ async def r7_native_commands() -> None:
                 ev_denied,
                 activated_builtin=True,
                 success_text="Reset command requires admin permission.",
+                clean_marked=False,
             )
             check(
                 "R7.permission-mirrored-no-bump",
@@ -808,7 +814,7 @@ async def r7_native_commands() -> None:
             ev_disabled.role = "admin"
             await _native_like(
                 ev_disabled, activated_builtin=False, success_text=None
-            )
+            )  # 禁用：activated 无 builtin → 不联动
             check(
                 "R7.builtin-disabled-no-clear",
                 len(ledger.load_history(identity_of("10001"))) == 2,
@@ -824,6 +830,7 @@ async def r7_native_commands() -> None:
                 ev_admin,
                 activated_builtin=True,
                 success_text="✅ Conversation reset successfully.",
+                clean_marked=True,
             )
             check(
                 "R7.admin-reset-bumps-epoch",
@@ -859,6 +866,7 @@ async def r7_native_commands() -> None:
             ev_new.set_result(
                 MessageEventResult().message("✅ Switched to new conversation: abcd。")
             )
+            ev_new.set_extra("_clean_group_context_session", True)
             with patch.object(
                 plugin_main, "sp", SimpleNamespace(get_async=AsyncMock(return_value={}))
             ):
@@ -883,6 +891,7 @@ async def r7_native_commands() -> None:
                 ev_out,
                 activated_builtin=True,
                 success_text="✅ Conversation reset successfully.",
+                clean_marked=True,
             )
             check(
                 "R7.out-of-scope-untouched",

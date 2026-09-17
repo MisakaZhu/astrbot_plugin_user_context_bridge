@@ -2,7 +2,7 @@
 
 维护规则：每阶段记录当前提交、实际改动、验证命令与结果、失败项、下一步。证据必须对应提交。
 
-## 当前阶段：T1~T6 三次返工（基线 169a88a）→ 0.4.0 候选完成，待 Codex 复验
+## 当前阶段：U1~U4 四次返工（基线 0a915d3）→ 0.5.0 候选完成，待 Codex 复验
 
 ### P0 / MIS-136 已完成（In Review）
 
@@ -117,3 +117,17 @@ ADR-004 v2 / ADR-009 / ADR-010）：
 
 测试统计（日志加总）：10 套 × 4.26.0/4.28.0 各 **258 项断言全部 PASS**
 （P0=17 P1=36 P2=27 P3=19 P4=22 P5=16 P6=8 R=38 S=40 T=35）。
+
+
+## 四次验收返工（2026-09-18，Codex 四次验收报告 10）
+
+基线 0a915d3 四次验收 U1~U4 返工完成（ADR-013）：
+
+- **U1**：`handle_llm_request` 三个可等待点全部纳入取消保护——初始人格解析取消（停止传播+re-raise，不触碰锁）；锁等待/获取（`lock_acquired` 标志界定归属）；后续点（T2 原路径）。宿主吞取消后事件在下一个 yield 检查点截断（0 模型 0 输出）。验证（t: U1.* 15 项，双版）：初始解析取消（stopped/0 模型/0 输出/无轮次/无锁泄漏）；等锁取消（B stopped/0 模型/0 输出，A 不受影响并正常完成，锁随后释放，后继请求完成）。
+- **U2**：new/reset 分命令防御——new 只复核会话存在（宿主不要求 provider），无 provider 的 new 成功也联动（t5 worker `new-without-provider` 双版 2→0）；恢复后不回灌（`recovery_no_backfill_after_new`）。
+- **U3**：结构化标记 `_clean_group_context_session`（宿主 builtin 本地成功末尾设置的布尔 extra，两版一致，权限拒绝/provider 缺失/第三方分支不设置）替代成功文案 startswith——前置文本装饰（`[NOTICE] ` 前缀）不再影响判定（t5 worker `reset-prefix-decorator` 双版联动 2→0）。
+- **U4**：harness trace 初始化修复；取消场景 gather 结果纳入断言；T2 登记前取消收紧为完整断言；S6 worker 的 T3 生命周期关键字段进入父测试 4 组断言（`turn-off-stops-active`/`queued-clean-yield`/`recovery-no-backfill`/`uninstall` 增强），故障注入验证 10 个字段全 false 时 4 组全部按预期 FAIL。
+
+测试统计（日志加总）：10 套 × 4.26.0/4.28.0 各 **290 项断言全部 PASS**
+（P0=17 P1=36 P2=27 P3=19 P4=22 P5=16 P6=8 R=38 S=46 T=61）。
+ACCEPTANCE 校准：handler 数 10、T2 8 项、T5/T6 每版 7 项（矩阵另行对齐）。

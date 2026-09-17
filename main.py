@@ -32,7 +32,7 @@ _HEARTBEAT_INTERVAL_SECONDS = 60.0
     "astrbot_plugin_user_context_bridge",
     "Ewnscat-ya",
     "同一用户跨会话上下文共享（群聊/私聊连续真实对话历史）",
-    "0.4.0",
+    "0.5.0",
 )
 class UserContextBridgePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -245,53 +245,58 @@ class UserContextBridgePlugin(Star):
                 MessageEventResult().message(self._commands.scope())
             )
 
-    # -- 原生 /reset、/new 成功关联（T6，ADR-012） --------------------------
-    # 不再注册同名单命令处理器（三次验收 T6 证实其与宿主实际执行脱节：
-    # 内置命令禁用后仍误清、改名后旧名误清/新名漏清、自定义过滤拒绝误清）。
-    # 改为后置事实关联：宿主 builtin reset/new_conv 处理器在本事件的
-    # activated_handlers 中（WakingCheckStage 的结构化激活证据，已含权限/
-    # 禁用/改名/自定义过滤的过滤结果）**且** 事件结果为宿主 builtin 的
-    # 固定成功文案（程序生成字面量，两版一致，非模型正文）时，才切换
-    # 发送者共享身份的 epoch。宿主拒绝/异常/被过滤 → 无成功文案 → 不联动。
+    # -- 原生 /reset、/new 成功关联（U2/U3，ADR-013） -----------------------
+    # 不注册同名单命令处理器（T6 证实与宿主执行脱节）。后置事实关联：
+    # ① activated_handlers 含宿主 builtin reset/new_conv（WakingCheckStage
+    #   结构化激活证据，天然涵盖权限/禁用/改名/自定义过滤）；
+    # ② 事件 extra ``_clean_group_context_session`` 为真——宿主 builtin 在
+    #   **本地会话 reset 清空成功 / new_conversation 创建成功**的末尾设置
+    #   的结构化标记（两版字面量一致；权限拒绝/无 provider/第三方执行器
+    #   分支均不设置；消费者为宿主 group_chat_context 清理）。该标记是
+    #   布尔 extra，不受其他插件的文本装饰改写（U3：此前依赖成功文案
+    #   startswith，前置装饰钩子加前缀即漏清）。
+    # 满足双证据即联动，防御按命令真实语义区分（U2）：reset 成功必有
+    # provider，保留 provider+会话复核；new 不要求 provider，只复核会话。
     _BUILTIN_COMMANDS_MODULE_PREFIX = "astrbot.builtin_stars.builtin_commands"
-    _NATIVE_RESET_SUCCESS_PREFIX = "✅ Conversation reset successfully"
-    _NATIVE_NEW_SUCCESS_PREFIX = "✅ Switched to new conversation"
+    _CLEAN_SESSION_EXTRA = "_clean_group_context_session"
 
-    def _native_reset_executed(self, event: AstrMessageEvent) -> bool:
-        """宿主 builtin reset/new_conv 实际执行成功的双证据。"""
+    def _native_reset_executed(self, event: AstrMessageEvent) -> str | None:
+        """返回本事件实际执行成功的 builtin 命令名（"reset"/"new_conv"）。"""
 
         activated = event.get_extra("activated_handlers") or []
-        builtin_activated = any(
-            str(getattr(h, "handler_module_path", "")).startswith(
-                self._BUILTIN_COMMANDS_MODULE_PREFIX
-            )
-            and getattr(h, "handler_name", "") in ("reset", "new_conv")
-            for h in activated
-        )
-        if not builtin_activated:
-            return False
-        result = event.get_result()
-        if result is None:
-            return False
-        try:
-            text = (result.get_plain_text() or "").strip()
-        except Exception:  # noqa: BLE001
-            return False
-        return text.startswith(
-            self._NATIVE_RESET_SUCCESS_PREFIX
-        ) or text.startswith(self._NATIVE_NEW_SUCCESS_PREFIX)
+        for h in activated:
+            if (
+                str(getattr(h, "handler_module_path", "")).startswith(
+                    self._BUILTIN_COMMANDS_MODULE_PREFIX
+                )
+                and getattr(h, "handler_name", "") in ("reset", "new_conv")
+                and event.get_extra(self._CLEAN_SESSION_EXTRA) is True
+            ):
+                return getattr(h, "handler_name", "")
+        return None
 
     async def _sync_native_reset_on_success(self, event: AstrMessageEvent) -> None:
         if self._commands is None or not self._sharing_active:
             return
         try:
-            if not self._native_reset_executed(event):
+            command = self._native_reset_executed(event)
+            if command is None:
                 return
-            # 防御性前置（宿主已有 activated+成功文案双证据，此处只复核
-            # provider 与当前会话存在；不得套用 reset 的权限场景——宿主
-            # /new 无权限门槛，成功文案已按命令区分）
-            if not await self._host_command_defense(event):
-                return
+            # 防御性复核（U2 按命令语义）：reset 成功必有 provider；
+            # new 不要求 provider（宿主无此检查），只复核当前会话存在。
+            if command == "reset":
+                if not await self._host_command_defense(event):
+                    return
+            else:
+                try:
+                    cid = await (
+                        self.context.conversation_manager
+                        .get_curr_conversation_id(event.unified_msg_origin)
+                    )
+                except Exception:  # noqa: BLE001
+                    cid = None
+                if not cid:
+                    return
             identity = await self._commands._identity(event)
             if not self._commands._window_in_scope(event):
                 return

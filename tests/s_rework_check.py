@@ -513,6 +513,7 @@ async def s5_native_reset() -> None:
                 await native_commands.ConversationCommands(context).reset(command)
                 host_reply = (command.get_result().get_plain_text() or "") if command.get_result() else ""
                 _mark_activated(command)
+                # 拒绝路径（宿主未设置结构化成功标记）——直接同步
                 await plugin._sync_native_reset_on_success(command)
             check(
                 "S5.host-rejects-no-provider",
@@ -558,6 +559,9 @@ async def s5_native_reset() -> None:
                 await native_commands.ConversationCommands(context2).reset(command2)
                 host_calls = conv2.update_conversation.await_count
                 _mark_activated2(command2)
+                # 真实宿主成功路径会设置 _clean_group_context_session；
+                # 此处模拟宿主成功后的结构化标记
+                command2.set_extra("_clean_group_context_session", True)
                 await plugin2._sync_native_reset_on_success(command2)
             check(
                 "S5.host-success-updates-native",
@@ -707,8 +711,34 @@ def s6_plugin_lifecycle() -> None:
                 f"out={out}",
             )
             check(
+                f"S6.{tag}.turn-off-stops-active",
+                out.get("turn_off_activated_false")
+                and out.get("active_stop_requested")
+                and out.get("active_stopped")
+                and out.get("active_task_returned") is True
+                and out.get("active_no_late_output"),
+                f"out={ {k: out.get(k) for k in ('turn_off_activated_false','active_stop_requested','active_stopped','active_task_returned','active_no_late_output')} }",
+            )
+            check(
+                f"S6.{tag}.queued-clean-yield",
+                out.get("before_shutdown_pending") == 1
+                and out.get("before_shutdown_lock_waiters") == 1
+                and out.get("queued_task_returned") is True
+                and out.get("queued_no_output")
+                and out.get("queued_stopped"),
+                f"out={ {k: out.get(k) for k in ('before_shutdown_pending','before_shutdown_lock_waiters','queued_task_returned','queued_no_output','queued_stopped')} }",
+            )
+            check(
+                f"S6.{tag}.recovery-no-backfill",
+                out.get("turn_on_activated")
+                and out.get("recovery_turn_completed")
+                and out.get("recovery_no_backfill"),
+                f"out={ {k: out.get(k) for k in ('turn_on_activated','recovery_turn_completed','recovery_no_backfill')} }",
+            )
+            check(
                 f"S6.{tag}.uninstall",
-                out.get("uninstall_interrupted_pending")
+                out.get("uninstall_no_late_output")
+                and out.get("uninstall_interrupted_pending")
                 and out.get("uninstall_removed_from_registry")
                 and out.get("uninstall_dir_removed"),
                 f"out={out}",

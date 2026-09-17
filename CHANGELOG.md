@@ -1,6 +1,25 @@
 # 更新日志
 
-## 0.4.0（三次返工候选，待 Codex 复验）
+## 0.5.0（四次返工候选，待 Codex 复验）
+
+四次验收（0a915d3）U1~U4 返工（ADR-013）：
+- U1 全等待点取消语义：初始人格解析/锁等待/锁后全部覆盖——取消后事件
+  停止传播（宿主吞取消后在下一个 yield 检查点截断）、0 模型 0 输出、
+  等待中取消不释放他人锁、A 不受 B 取消影响、后继同身份跨窗请求完成。
+- U2 new/reset 分命令成功语义：new 不要求 provider（宿主真实语义），
+  无 provider 的 new 成功也联动清空；reset 保留 provider 防御；恢复
+  provider 后不回灌。
+- U3 结构化成功事实：`_clean_group_context_session` 布尔 extra 替代
+  成功文案 startswith（前置文本装饰不再影响判定）；activated_handlers
+  结构化激活证据保留。
+- U4 测试有效性：harness trace 初始化修复（UnboundLocalError 不再被
+  吞）；gather 结果纳入断言；T2 登记前取消收紧；S6 生命周期关键字段
+  进入父测试（故障注入验证 FAIL）；断言数校准（290/版本）。
+- r7/s5 场景适配 U3 结构化标记语义；t5 worker 经真实 PipelineScheduler
+  + ResultDecorateStage + 真实 bound 处理器驱动（不再直接调 helper）。
+- 全量：10 套 × 4.26.0/4.28.0 各 290 项断言全 PASS（日志加总）。
+
+## 0.4.0（已交付三次返工候选；四次验收未通过，见 0.5.0）
 
 三次验收（169a88a）T1~T6 返工（ADR-012）：
 - T1 人格同源解析（provider_settings 参数；4.26 默认人格隔离修复；解析失败受控不折叠）；真实 PersonaManager/ConversationManager/宿主新会话路径两版验证。
