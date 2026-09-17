@@ -172,33 +172,113 @@ async def main() -> int:
         n = db.execute("SELECT COUNT(*) FROM turns WHERE status='completed'").fetchone()[0]
     out["ledger_completed"] = n
 
-    # -- 5) 活动轮挂起时卸载（terminate 释放排队/活动轮） --------------------
-    entered, release = asyncio.Event(), asyncio.Event()
+    # -- 5) T3：停用/恢复 + 挂起 A 与排队 B 的卸载协议 ----------------------
+    from astrbot.core.utils.active_event_registry import active_event_registry
+
+    entered_a, release_a = asyncio.Event(), asyncio.Event()
 
     class Hanging(FakeProvider):
         async def text_chat(self, **kwargs):
             self.call_log.append({"contexts": []})
-            entered.set()
-            await release.wait()
+            entered_a.set()
+            await release_a.wait()
             return await super().text_chat(**kwargs)
 
     ev3 = FakeEvent(sender_id="10001", group_id="700000001", message_str="挂起轮")
-    t3 = asyncio.create_task(_drive_with_real_hooks(ev3, Hanging(["LATE"]), "挂起轮"))
-    await asyncio.wait_for(entered.wait(), 3)
-
-    from astrbot.core.utils.active_event_registry import active_event_registry
-
     active_event_registry.register(ev3)
-    await pm.uninstall_plugin(PLUGIN_DIR_NAME)
-    release.set()
+    t3 = asyncio.create_task(_drive_with_real_hooks(ev3, Hanging(["LATE"]), "挂起轮"))
+    await asyncio.wait_for(entered_a.wait(), 3)
+
+    # 同身份跨窗排队 B（锁等待者）
+    ev4 = FakeEvent(sender_id="10001", group_id="700000002", message_str="排队轮")
+    provider4 = FakeProvider(["QUEUED-AFTER-SHUTDOWN"])
+    t4 = asyncio.create_task(_drive_with_real_hooks(ev4, provider4, "排队轮"))
+    await asyncio.sleep(0.1)
+    out["before_shutdown_pending"] = plugin_obj._bridge.pending_count
+    out["before_shutdown_lock_waiters"] = sum(
+        len(lock._waiters or [])
+        for lock in plugin_obj._bridge._identity_locks.values()
+    )
+
+    # 真实 turn_off（terminate → shutdown 协议）
+    await pm.turn_off_plugin(PLUGIN_DIR_NAME)
+    out["turn_off_activated_false"] = not star_map.get(
+        f"data.plugins.{PLUGIN_DIR_NAME}.main"
+    ).activated
+    out["active_stop_requested"] = ev3.get_extra("agent_stop_requested") is True
+    out["active_stopped"] = ev3.is_stopped()
+    release_a.set()
     try:
         await asyncio.wait_for(t3, 3)
-    except Exception:
+        out["active_task_returned"] = True
+    except Exception as exc:  # noqa: BLE001
+        out["active_task_returned"] = type(exc).__name__
+    out["active_no_late_output"] = not any(
+        "LATE" in (c.get_plain_text() or "") for c in ev3.sent_chains
+    )
+    try:
+        await asyncio.wait_for(t4, 3)
+        out["queued_task_returned"] = True
+    except Exception as exc:  # noqa: BLE001
+        out["queued_task_returned"] = f"{type(exc).__name__}:{exc}"
+    out["queued_no_output"] = not any(
+        (c.get_plain_text() or "").strip() for c in ev4.sent_chains
+    )
+    out["queued_stopped"] = ev4.is_stopped()
+    with sqlite3.connect(ledger._db_path) as db:
+        out["rows_after_turn_off"] = db.execute(
+            "SELECT status FROM turns ORDER BY seq"
+        ).fetchall()
+
+    # 真实 turn_on：恢复后新事件正常，历史无静默回灌
+    await pm.turn_on_plugin(PLUGIN_DIR_NAME)
+    metadata3 = star_map.get(f"data.plugins.{PLUGIN_DIR_NAME}.main")
+    out["turn_on_activated"] = bool(metadata3 and metadata3.activated)
+    ev5 = FakeEvent(sender_id="10001", group_id="700000001", message_str="恢复后轮")
+    p5 = FakeProvider(["AFTER-RECOVERY"])
+    out["recovery_turn_completed"] = await _drive_with_real_hooks(
+        ev5, p5, "恢复后轮"
+    )
+    ctx5 = (
+        json.dumps(p5.call_log[0]["contexts"], ensure_ascii=False)
+        if p5.call_log
+        else ""
+    )
+    out["recovery_no_backfill"] = (
+        "排队轮" not in ctx5 and "QUEUED-AFTER-SHUTDOWN" not in ctx5
+    )
+
+    # 真实 uninstall（活动轮再次挂起）
+    plugin_obj = metadata3.star_cls
+    ledger = plugin_obj._ledger
+    entered_c, release_c = asyncio.Event(), asyncio.Event()
+
+    class Hanging2(FakeProvider):
+        async def text_chat(self, **kwargs):
+            self.call_log.append({"contexts": []})
+            entered_c.set()
+            await release_c.wait()
+            return await super().text_chat(**kwargs)
+
+    ev6 = FakeEvent(sender_id="10001", group_id="700000001", message_str="卸载轮")
+    active_event_registry.register(ev6)
+    t6 = asyncio.create_task(
+        _drive_with_real_hooks(ev6, Hanging2(["LATE-UNINSTALL"]), "卸载轮")
+    )
+    await asyncio.wait_for(entered_c.wait(), 3)
+    await pm.uninstall_plugin(PLUGIN_DIR_NAME)
+    release_c.set()
+    try:
+        await asyncio.wait_for(t6, 3)
+    except Exception:  # noqa: BLE001
         pass
+    out["uninstall_no_late_output"] = not any(
+        "LATE-UNINSTALL" in (c.get_plain_text() or "") for c in ev6.sent_chains
+    )
     with sqlite3.connect(ledger._db_path) as db:
         hanging = db.execute(
             "SELECT status FROM turns WHERE event_key LIKE '%' || ? || '%'",
-            (ev3.message_obj.message_id,),
+            (ev6.message_obj.message_id,),
         ).fetchall()
     out["uninstall_interrupted_pending"] = bool(
         hanging and hanging[0][0] == "interrupted"
@@ -236,7 +316,10 @@ async def _drive_with_real_hooks(event, provider, prompt: str) -> bool:
     req.contexts = []
     req.system_prompt = "s6 system"
     req.conversation = FakeConversation(user_id=event.unified_msg_origin)
-    await call_event_hook(event, EventType.OnLLMRequestEvent, req)
+    stopped = await call_event_hook(event, EventType.OnLLMRequestEvent, req)
+    # 宿主 internal.py 语义：钩子返回 True（事件被停止）时不再执行模型
+    if stopped or event.is_stopped():
+        return False
 
     runner = ToolLoopAgentRunner()
     await runner.reset(

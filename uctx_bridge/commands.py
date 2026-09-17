@@ -18,7 +18,12 @@ import sqlite3
 
 from astrbot.api.event import AstrMessageEvent
 
-from .identity import SharedIdentity, build_identity, resolve_persona_scope
+from .identity import (
+    PersonaResolutionError,
+    SharedIdentity,
+    build_identity,
+    resolve_persona_scope,
+)
 from .ledger import TurnLedger
 from .scope import MembershipStore, ScopeResolver
 
@@ -48,12 +53,25 @@ class CommandService:
         membership: MembershipStore,
         persona_manager_getter,
         conversation_manager_getter=None,
+        provider_settings_getter=None,
     ) -> None:
         self._ledger = ledger
         self._resolver = resolver
         self._membership = membership
         self._get_persona_manager = persona_manager_getter
         self._get_conversation_manager = conversation_manager_getter
+        self._provider_settings_getter = provider_settings_getter
+
+    def _provider_settings(self, event: AstrMessageEvent) -> dict:
+        """T1：与对话轮同源的 provider_settings（4.26 默认人格读取依赖）。"""
+
+        if self._provider_settings_getter is None:
+            return {}
+        try:
+            result = self._provider_settings_getter(event.unified_msg_origin)
+            return result if isinstance(result, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
 
     async def _current_persona_id(self, event: AstrMessageEvent) -> str | None:
         """读取当前 UMO 会话 conversation 的 persona_id（R5）。
@@ -84,9 +102,18 @@ class CommandService:
     async def _identity(self, event: AstrMessageEvent) -> SharedIdentity:
         conversation_persona_id = await self._current_persona_id(event)
         persona_scope = await resolve_persona_scope(
-            self._get_persona_manager(), event, _FakeConv(conversation_persona_id)
+            self._get_persona_manager(),
+            event,
+            _FakeConv(conversation_persona_id),
+            provider_settings=self._provider_settings(event),
         )
         return _identity_of(event, persona_scope)
+
+    def _identity_error_text(self) -> str:
+        return (
+            "⚠️ 暂时无法确定当前生效人格，为避免把不同人格的共享历史合并，"
+            "本次操作不执行。请检查人格配置后重试。"
+        )
 
     def _turn_stats(self, identity: SharedIdentity) -> dict[str, int]:
         conn = sqlite3.connect(self._ledger._db_path)
@@ -113,7 +140,10 @@ class CommandService:
 
     # -- 子命令 -----------------------------------------------------------
     async def status(self, event: AstrMessageEvent) -> str:
-        identity = await self._identity(event)
+        try:
+            identity = await self._identity(event)
+        except PersonaResolutionError:
+            return self._identity_error_text()
         stats = self._turn_stats(identity)
         window = "群聊" if event.get_group_id() else "私聊"
         enabled = self._resolver.config.enabled
@@ -144,19 +174,25 @@ class CommandService:
         )
 
     async def reset(self, event: AstrMessageEvent) -> str:
-        identity = await self._identity(event)
+        try:
+            identity = await self._identity(event)
+        except PersonaResolutionError:
+            return self._identity_error_text()
         if not self._resolver.config.enabled:
             return "⚠️ 共享未启用，无需清空。"
         new_epoch = self._ledger.bump_epoch(identity.key)
         return (
             "🧹 已清空你的跨窗口共享历史（epoch 切换，进行中的旧请求不会回写）。\n"
             f"影响范围仅限你本人（当前纪元 {new_epoch}）；其他用户不受影响。\n"
-            "注意：原生 /reset、/new 只重置当前窗口的宿主会话，"
-            "不会清空共享历史；清空共享请使用 /uctx reset。"
+            "说明：原生 /reset、/new 在宿主执行成功时也会同步清空你的共享"
+            "历史（等效本命令）。"
         )
 
     async def off(self, event: AstrMessageEvent) -> str:
-        identity = await self._identity(event)
+        try:
+            identity = await self._identity(event)
+        except PersonaResolutionError:
+            return self._identity_error_text()
         self._membership.opt_out(identity)
         return (
             "🚪 已退出跨窗口共享：从下一轮起不再读取、不再新增你的共享历史。\n"
@@ -165,7 +201,10 @@ class CommandService:
         )
 
     async def on(self, event: AstrMessageEvent) -> str:
-        identity = await self._identity(event)
+        try:
+            identity = await self._identity(event)
+        except PersonaResolutionError:
+            return self._identity_error_text()
         if not self._resolver.config.enabled:
             return "⚠️ 共享未启用，无法加入。范围由管理员在插件配置中开启。"
         self._membership.opt_in(identity)

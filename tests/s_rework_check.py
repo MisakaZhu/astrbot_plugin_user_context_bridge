@@ -490,12 +490,30 @@ async def s5_native_reset() -> None:
             )
             prefs = SimpleNamespace(get_async=AsyncMock(return_value={}))
             before = len(ledger.load_history(identity()))
+
+            def _mark_activated(ev, builtin=True):
+                handlers = [SimpleNamespace(
+                    handler_module_path=(
+                        "data.plugins.astrbot_plugin_user_context_bridge.main"
+                    ),
+                    handler_name="uctx_status",
+                )]
+                if builtin:
+                    handlers.append(SimpleNamespace(
+                        handler_module_path=(
+                            "astrbot.builtin_stars.builtin_commands.main"
+                        ),
+                        handler_name="reset",
+                    ))
+                ev.set_extra("activated_handlers", handlers)
+
             with patch.object(module, "sp", prefs), patch.object(
                 native_commands, "sp", prefs
             ):
                 await native_commands.ConversationCommands(context).reset(command)
                 host_reply = (command.get_result().get_plain_text() or "") if command.get_result() else ""
-                await plugin.native_reset_sync(command)
+                _mark_activated(command)
+                await plugin._sync_native_reset_on_success(command)
             check(
                 "S5.host-rejects-no-provider",
                 conv.update_conversation.await_count == 0
@@ -518,12 +536,29 @@ async def s5_native_reset() -> None:
                 sender_id="10001", group_id="700000001", role="admin",
                 message_str="/reset",
             )
+            def _mark_activated2(ev, builtin=True):
+                handlers = [SimpleNamespace(
+                    handler_module_path=(
+                        "data.plugins.astrbot_plugin_user_context_bridge.main"
+                    ),
+                    handler_name="uctx_status",
+                )]
+                if builtin:
+                    handlers.append(SimpleNamespace(
+                        handler_module_path=(
+                            "astrbot.builtin_stars.builtin_commands.main"
+                        ),
+                        handler_name="reset",
+                    ))
+                ev.set_extra("activated_handlers", handlers)
+
             with patch.object(module, "sp", prefs), patch.object(
                 native_commands, "sp", prefs
             ):
                 await native_commands.ConversationCommands(context2).reset(command2)
                 host_calls = conv2.update_conversation.await_count
-                await plugin2.native_reset_sync(command2)
+                _mark_activated2(command2)
+                await plugin2._sync_native_reset_on_success(command2)
             check(
                 "S5.host-success-updates-native",
                 host_calls >= 1,
@@ -550,11 +585,23 @@ async def s5_native_reset() -> None:
                 sender_id="10001", group_id="700000001", role="member",
                 message_str="/reset",
             )
+            def _mark_activated3(ev, builtin=True):
+                handlers = []
+                if builtin:
+                    handlers.append(SimpleNamespace(
+                        handler_module_path=(
+                            "astrbot.builtin_stars.builtin_commands.main"
+                        ),
+                        handler_name="reset",
+                    ))
+                ev.set_extra("activated_handlers", handlers)
+
             with patch.object(module, "sp", prefs), patch.object(
                 native_commands, "sp", prefs
             ):
                 await native_commands.ConversationCommands(context2).reset(command3)
-                await plugin2.native_reset_sync(command3)
+                _mark_activated3(command3)
+                await plugin2._sync_native_reset_on_success(command3)
             check(
                 "S5.permission-mirror-holds",
                 len(ledger.load_history(identity())) == 2
@@ -572,8 +619,20 @@ async def s5_native_reset() -> None:
                 sender_id="10001", group_id="700000001", role="admin",
                 message_str="/reset",
             )
+            def _mark_activated4(ev):
+                ev.set_extra(
+                    "activated_handlers",
+                    [SimpleNamespace(
+                        handler_module_path=(
+                            "astrbot.builtin_stars.builtin_commands.main"
+                        ),
+                        handler_name="reset",
+                    )],
+                )
+
             with patch.object(module, "sp", prefs):
-                await plugin3.native_reset_sync(command4)
+                _mark_activated4(command4)
+                await plugin3._sync_native_reset_on_success(command4)
             check(
                 "S5.disabled-no-sync",
                 len(ledger.load_history(identity())) == 2 and not command4.sent_chains,

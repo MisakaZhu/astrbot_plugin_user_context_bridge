@@ -44,7 +44,11 @@ from typing import Any, Callable
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.provider.entities import ProviderRequest
 
-from .identity import SharedIdentity, resolve_persona_scope
+from .identity import (
+    PersonaResolutionError,
+    SharedIdentity,
+    resolve_persona_scope,
+)
 from .ledger import (
     STATUS_ABORTED,
     STATUS_COMPLETED,
@@ -142,6 +146,7 @@ class ContextBridge:
         ledger: TurnLedger,
         scope_resolver: ScopeResolver,
         persona_manager_getter: Callable[[], Any],
+        provider_settings_getter: Callable[[str], dict] | None = None,
         max_history_turns: int | None = None,
         logger: Any = None,
         fail_watchdog_seconds: float = DEFAULT_FAIL_WATCHDOG_SECONDS,
@@ -149,13 +154,30 @@ class ContextBridge:
         self._ledger = ledger
         self._scope = scope_resolver
         self._get_persona_manager = persona_manager_getter
+        self._provider_settings_getter = provider_settings_getter
         self._max_history_turns = max_history_turns
         self._fail_watchdog_seconds = fail_watchdog_seconds
         self._log = logger
         self._pending: dict[str, PendingTurn] = {}
         self._identity_locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
+        self._closing = False
         self.stats = BridgeStats()
+
+    def _provider_settings(self, event: AstrMessageEvent) -> dict:
+        """T1：与宿主 _ensure_persona_and_skills 同源的 provider_settings。
+
+        4.26 在 conversation.persona_id 为 None 时只从该参数读取默认人格，
+        漏传会把不同人格折叠为同一身份（A04 隔离失效）。
+        """
+
+        if self._provider_settings_getter is None:
+            return {}
+        try:
+            result = self._provider_settings_getter(event.unified_msg_origin)
+            return result if isinstance(result, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
 
     # -- 内部 -------------------------------------------------------------
     def _info(self, msg: str) -> None:
@@ -217,9 +239,24 @@ class ContextBridge:
         读取到本轮完整结果（R3）。
         """
 
-        persona_scope = await resolve_persona_scope(
-            self._get_persona_manager(), event, getattr(req, "conversation", None)
-        )
+        # T3：关闭中（停用/重载/卸载）不再接管任何新请求
+        if self._closing:
+            self.stats.skipped += 1
+            return False
+
+        # T1：与宿主同参解析（含 provider_settings）；失败为受控跳过，
+        # 不得折叠成默认共享身份把不同人格的对话合并。
+        try:
+            persona_scope = await resolve_persona_scope(
+                self._get_persona_manager(),
+                event,
+                getattr(req, "conversation", None),
+                provider_settings=self._provider_settings(event),
+            )
+        except PersonaResolutionError as exc:
+            self.stats.skipped += 1
+            self._warn(f"uctx 人格解析失败，本轮不接管：{exc}")
+            return False
         decision = self._scope.evaluate(event, persona_scope)
         if not decision.in_scope or decision.identity is None:
             self.stats.skipped += 1
@@ -229,6 +266,13 @@ class ContextBridge:
         event_key = self.event_key_for(event)
         lock = await self._acquire_identity_lock(identity.key)
         await lock.acquire()
+        # T3：排队期间插件已进入关闭——干净让出（不碰已关账本），并终止
+        # 事件传播（宿主 internal 在 is_stopped 后直接返回，不执行模型）。
+        if self._closing:
+            self.stats.skipped += 1
+            event.stop_event()
+            lock.release()
+            return False
         released = False
 
         def _release() -> None:
@@ -259,10 +303,8 @@ class ContextBridge:
                 _release()
                 return False
 
-            begin_dialogs = await self._persona_begin_dialogs(event, req)
-            req.contexts = [*begin_dialogs, *history]
-            req.conversation = None
-
+            # T2：pending 与 watchdog 在任何后续可等待点（人格开场白解析）
+            # 之前登记——取消击中任意 await 时已有可收尾的轮次登记。
             pending = PendingTurn(
                 event_key=event_key,
                 identity=identity,
@@ -274,11 +316,34 @@ class ContextBridge:
             )
             pending.watchdog_task = asyncio.create_task(self._fail_watchdog(pending))
             self._pending[event_key] = pending
+
+            begin_dialogs = await self._persona_begin_dialogs(
+                event, req, persona_scope=persona_scope
+            )
+            req.contexts = [*begin_dialogs, *history]
+            req.conversation = None
+
             self.stats.captured += 1
             self._info(f"uctx 接管轮次（epoch={turn.epoch}，历史 {len(history)} 条）")
             return True
+        except asyncio.CancelledError:
+            # T2：锁后取消——轮次收尾为 interrupted、停止事件传播（宿主
+            # call_event_hook 会吞掉取消继续流程，必须以 is_stopped 阻止
+            # 其后的模型执行与发送）、释放身份锁，再交还取消语义。
+            pending = self._pending.get(event_key)
+            if pending is not None and not pending.committed:
+                self._signal_stop(pending)
+                self._finalize(pending, STATUS_INTERRUPTED, [], None)
+            else:
+                _release()
+            event.stop_event()
+            raise
         except Exception:
-            _release()
+            pending = self._pending.get(event_key)
+            if pending is not None and not pending.committed:
+                self._finalize(pending, STATUS_INTERRUPTED, [], None)
+            else:
+                _release()
             raise
 
     def _build_user_message(self, req: ProviderRequest) -> dict[str, Any]:
@@ -307,31 +372,39 @@ class ContextBridge:
         self,
         event: AstrMessageEvent,
         req: ProviderRequest,
+        *,
+        persona_scope: str | None = None,
     ) -> list[dict[str, Any]]:
-        """与宿主同参解析人格，回补开场白（每轮注入、不入库）。"""
+        """与宿主同参解析人格，回补开场白（每轮注入、不入库）。
 
+        T1：与身份解析共用同一 resolver 与 provider_settings，保证身份键
+        与开场白同源（4.26 默认人格场景此前被折叠并丢弃开场白）。
+        """
+
+        manager = self._get_persona_manager()
+        if manager is None:
+            return []
         try:
-            manager = self._get_persona_manager()
-            if manager is None:
-                return []
-            conversation_persona_id = getattr(
-                getattr(req, "conversation", None), "persona_id", None
-            )
             result = await manager.resolve_selected_persona(
                 umo=event.unified_msg_origin,
-                conversation_persona_id=conversation_persona_id,
+                conversation_persona_id=getattr(
+                    getattr(req, "conversation", None), "persona_id", None
+                ),
                 platform_name=event.get_platform_name(),
+                provider_settings=self._provider_settings(event),
             )
             persona = result[1] if result else None
-            dialogs = (persona or {}).get("_begin_dialogs_processed") or []
-            out: list[dict[str, Any]] = []
-            for d in dialogs:
-                cleaned = sanitize_message(dict(d))
-                if cleaned is not None:
-                    out.append(cleaned)
-            return out
-        except Exception:  # noqa: BLE001
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 开场白回补失败不阻塞本轮
             return []
+        dialogs = (persona or {}).get("_begin_dialogs_processed") or []
+        out: list[dict[str, Any]] = []
+        for d in dialogs:
+            cleaned = sanitize_message(dict(d))
+            if cleaned is not None:
+                out.append(cleaned)
+        return out
 
     # -- 写侧：主提交点 -----------------------------------------------------
     async def handle_agent_done(
@@ -390,10 +463,23 @@ class ContextBridge:
         event_key = self.event_key_for(event)
         pending = self._pending.get(event_key)
         if pending is None or pending.committed or pending.done_seen:
+            # T4：轮次已被 watchdog/取消/关闭收尾（failed/interrupted）而
+            # 宿主仍把本轮残留 result（如 buffer_intermediate_messages=True
+            # 时 aborted 分支交出的缓冲旧正文）送进装饰阶段——清除 result
+            # 使 respond 无内容可发；超时前已合法发送的工具状态不受影响。
+            if self._turn_terminal_failure(event_key):
+                try:
+                    event.clear_result()
+                except Exception:  # noqa: BLE001
+                    pass
             return
         if self._stop_signalled(event):
             reply = getattr(pending.agent_done_response, "completion_text", "") or None
             self._finalize(pending, STATUS_ABORTED, [], reply)
+            try:
+                event.clear_result()
+            except Exception:  # noqa: BLE001
+                pass
 
     async def handle_after_message_sent(self, event: AstrMessageEvent) -> None:
         """发送标记 + 停止旗标兜底（aborted 无输出路径可能缺其他钩子）。"""
@@ -409,6 +495,26 @@ class ContextBridge:
         if self._stop_signalled(event):
             reply = getattr(pending.agent_done_response, "completion_text", "") or None
             self._finalize(pending, STATUS_ABORTED, [], reply)
+
+    @staticmethod
+    def _signal_stop(pending: PendingTurn) -> None:
+        """对本轮事件发出宿主全套停止信号（T3/T4）。
+
+        agent_stop_requested：run_agent 的 watcher/循环检测后请求停止，
+        4.28 取消模型调用、4.26 吞掉迟到的 resp；
+        stop_event：宿主 scheduler 在 yield 暂停点检测后不再执行后续
+        阶段（respond），同时阻止 run_agent aborted 分支把缓冲的旧正文
+        交给下游发送（buffer_intermediate_messages=True 场景）。
+        """
+
+        try:
+            pending.event.set_extra("agent_stop_requested", True)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            pending.event.stop_event()
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _fail_watchdog(self, pending: PendingTurn) -> None:
         """受控失败兜底（S3）：超时仍 running → 先停旧执行再收尾。
@@ -427,12 +533,9 @@ class ContextBridge:
             return
         if pending.committed:
             return
-        try:
-            pending.event.set_extra("agent_stop_requested", True)
-        except Exception:  # noqa: BLE001
-            pass
+        self._signal_stop(pending)
         self.stats.watchdog_failures += 1
-        self._warn("uctx 轮次超时未终态化，已请求停止旧执行并按受控失败收尾")
+        self._warn("uctx 轮次超时未终态化，已停止旧执行并按受控失败收尾")
         self._finalize(pending, STATUS_FAILED, [], None)
 
     # -- 轨迹提取（R4） -----------------------------------------------------
@@ -516,14 +619,43 @@ class ContextBridge:
             self._pending.pop(pending.event_key, None)
             pending.release_lock()
 
+    def _turn_terminal_failure(self, event_key: str) -> bool:
+        """账本中该轮已 failed/interrupted（watchdog/取消/关闭收尾）。"""
+
+        try:
+            turn = self._ledger.get_turn(event_key)
+        except Exception:  # noqa: BLE001 - 账本已关闭等：按非终态处理
+            return False
+        return turn is not None and turn.status in (STATUS_FAILED, STATUS_INTERRUPTED)
+
     # -- 兜底 -------------------------------------------------------------
     def finalize_pending_as_interrupted(self) -> int:
-        """插件卸载/重载时：未决轮次 → interrupted（可恢复，不伪成功）。"""
+        """旧接口：仅终态化未决轮次（不置关闭标志）。"""
 
         count = 0
         for pending in list(self._pending.values()):
             if pending.committed:
                 continue
+            self._finalize(pending, STATUS_INTERRUPTED, [], None)
+            count += 1
+        return count
+
+    def shutdown(self) -> int:
+        """T3：停用/重载/卸载的关闭协议。
+
+        顺序：置关闭标志（新请求不再接管；排队获锁者干净让出并终止事件
+        传播）→ 对每个活动轮发全套停止信号并终态化 interrupted（释放锁，
+        唤醒排队者）→ 返回收尾数。调用方（main.terminate）此后才关闭账本。
+        旧事件不得再发出正文（缓冲场景由 stop_event + decorating 清尾
+        双重抑制），排队事件不得触碰已关账本或以异常回退成继续执行。
+        """
+
+        self._closing = True
+        count = 0
+        for pending in list(self._pending.values()):
+            if pending.committed:
+                continue
+            self._signal_stop(pending)
             self._finalize(pending, STATUS_INTERRUPTED, [], None)
             count += 1
         return count

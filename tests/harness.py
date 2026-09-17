@@ -31,7 +31,14 @@ from uctx_bridge.ledger import TurnLedger
 from uctx_bridge.scope import MembershipStore, ScopeConfig, ScopeResolver
 
 
-def make_bridge_stack(td: str, *, fail_watchdog_seconds: float = 5.0, **scope_kw):
+def make_bridge_stack(
+    td: str,
+    *,
+    fail_watchdog_seconds: float = 5.0,
+    persona_manager_getter=None,
+    provider_settings_getter=None,
+    **scope_kw,
+):
     """构造 ledger/resolver/bridge 栈（R6 后租约由 main 装配，此处不涉及）。"""
 
     ledger = TurnLedger(str(__import__("pathlib").Path(td) / "l.db"))
@@ -51,7 +58,9 @@ def make_bridge_stack(td: str, *, fail_watchdog_seconds: float = 5.0, **scope_kw
     bridge = ContextBridge(
         ledger=ledger,
         scope_resolver=resolver,
-        persona_manager_getter=lambda: FakePersonaManager(),
+        persona_manager_getter=persona_manager_getter
+        or (lambda: FakePersonaManager()),
+        provider_settings_getter=provider_settings_getter,
         logger=None,
         fail_watchdog_seconds=fail_watchdog_seconds,
     )
@@ -82,7 +91,16 @@ async def drive_pipeline(
         req.extra_user_content_parts = list(extra_parts)
     if func_tool is not None:
         req.func_tool = func_tool
-    await call_event_hook(event, EventType.OnLLMRequestEvent, req)
+    hook_stopped = await call_event_hook(event, EventType.OnLLMRequestEvent, req)
+    if hook_stopped or event.is_stopped():
+        # 宿主 internal.py 语义：钩子终止事件后不再执行模型
+        trace.append({"phase": "hook-stopped", "aborted": None})
+        return {
+            "trace": trace,
+            "pending": bridge.pending_count,
+            "model_calls": 0,
+            "sent": len(event.sent_chains),
+        }
 
     runner = ToolLoopAgentRunner()
     await runner.reset(

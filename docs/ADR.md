@@ -145,3 +145,12 @@ on_decorating_result 不能作为整轮提交点）**：
 - **S4 正文前缀非程序终态**：删除「事件结果文本以宿主错误文案开头即判失败」的启发式——模型可以生成任意开头的正文。模型 err（不触发完成钩子）统一由 fail-watchdog 受控收尾；装饰钩子仅保留停止旗标兜底。
 - **S5 原生 reset 镜像补全**：`_host_reset_would_run` 补齐宿主拒绝分支——第三方执行器（4.26/4.28 字段位置差异兼容）与可用模型提供方检查；宿主拒绝（无 provider 等）时不得清空共享历史。
 - **S6 真实 PluginManager 生命周期（A17 本地完成）**：tests/s6_plugin_lifecycle_worker.py 以子进程隔离实例（ASTRBOT_ROOT 临时根、data/plugins 安装、data/config 预建——4.26 的 AstrBotConfig 不自动建目录）驱动真实 PluginManager.load/reload/uninstall_plugin 与 turn_off/turn_on：加载绑定 12 个 handler、默认关闭不采集、启用配置重载生效、真实钩子下群A→群B 接续、活动轮挂起时卸载将 pending 终态化 interrupted 且注册表与插件目录清理。
+
+## ADR-012：三次验收 T1~T6 修复
+
+- **T1 人格同源解析**：`resolve_persona_scope` 增加 `provider_settings` 参数并与宿主 `_ensure_persona_and_skills` 同参（4.26 在 conversation.persona_id=None 时只从该参数读默认人格，漏传把不同人格折叠为同一身份）；bridge/commands 经 `provider_settings_getter`（宿主 `get_config(umo)["provider_settings"]`）注入。解析失败或结果为空抛 `PersonaResolutionError`：对话轮受控跳过（不接管、不折叠 __default__）、命令返回明确错误文案——不静默合并身份。开场白回补走同一 resolver 同一参数（身份与开场白同源）。
+- **T2 锁后取消窗口**：pending 与 watchdog 的登记提前到人格开场白解析（锁后唯一可等待点）之前；`except asyncio.CancelledError` 分支：轮次终态化 interrupted + 全套停止信号（见 T4）+ 释放身份锁 + `event.stop_event()`（宿主 call_event_hook 吞掉取消继续流程，is_stopped 阻止其后的模型执行）后 re-raise 保持取消语义。
+- **T3 关闭协议**：`shutdown()`——置 `_closing`（新请求与排队获锁者干净让出并终止事件传播，不触碰将关账本、不以异常回退成继续执行）→ 每个活动轮全套停止信号 + interrupted + 释放锁（唤醒排队者）。main.terminate 顺序：shutdown → 释放租约 → 关账本。真实 PluginManager 的 turn_off/turn_on/reload/uninstall 与「挂起活动轮 + 同身份跨窗排队轮」经子进程 worker 验证。
+- **T4 缓冲正文抑制**：停止信号升级为全套（`agent_stop_requested` + `stop_event`）——宿主 scheduler 在 yield 暂停点检测 is_stopped 后不再执行后续阶段（respond），run_agent aborted 分支交出的缓冲旧正文（buffer_intermediate_messages=True）到不了下游；另在 decorating 钩子对本轮已 failed/interrupted 的残留 result `clear_result()` 双保险。
+- **T5 版本兼容**：provider 检查按真实 Context 实例的接口存在性选择（`get_using_provider_async` 或同步 `get_using_provider`），4.26 真实 Context 无 async 接口（探针证实）走同步。
+- **T6 原生命令成功关联（ADR-010 v2）**：删除同名单 `/reset`、`/new` 处理器（与宿主实际执行脱节：禁用误清/旧名误清/新名漏清）。改为 **decorating 后置事实关联**：宿主 builtin `reset`/`new_conv` 处理器在本事件 `activated_handlers` 中（WakingCheckStage 结构化激活证据，天然涵盖权限/禁用/改名/自定义过滤）**且** 事件结果为宿主 builtin 固定成功文案（"✅ Conversation reset successfully"/"✅ Switched to new conversation"，程序生成字面量、两版一致、非模型正文）时，经轻量防御（provider+会话存在）后切换发送者共享身份 epoch。时机在 StarRequestSubStage 的 yield 窗口（result 仍存在、respond 未执行），即真实管线中插件 on_decorating_result 钩子的触发点。

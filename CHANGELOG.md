@@ -1,6 +1,18 @@
 # 更新日志
 
-## 0.3.0（二次返工候选，待 Codex 复验）
+## 0.4.0（三次返工候选，待 Codex 复验）
+
+三次验收（169a88a）T1~T6 返工（ADR-012）：
+- T1 人格同源解析（provider_settings 参数；4.26 默认人格隔离修复；解析失败受控不折叠）；真实 PersonaManager/ConversationManager/宿主新会话路径两版验证。
+- T2 锁后取消窗口：pending/watchdog 提前登记 + CancelledError 清理（interrupted + 停止传播 + 释放锁）；取消轮无模型调用无输出。
+- T3 关闭协议 shutdown()：关闭入口/排队干净让出/活动轮停止信号/terminate 顺序；真实 PluginManager turn_off/turn_on/reload/uninstall 与挂起+排队轮验证（无迟到输出、无异常回退、恢复不回灌）。
+- T4 缓冲正文抑制：全套停止信号（scheduler yield 断链）+ decorating 清尾双保险；buffer=True 场景 watchdog 后无新增正文。
+- T5 provider 检查版本兼容（4.26 真实 Context 同步接口）。
+- T6 原生命令后置成功关联：删同名单处理器；activated_handlers 结构化证据 + 宿主固定成功文案 + 轻量防御；禁用/改名/过滤/无 provider/权限矩阵经真实 Context 命令分发两版验证。
+- commands.py 过时文案修正；测试新增 t_rework_check（35 项/版）与 t1/t5 worker；p1 适配受控失败语义。
+- 全量：10 套 × 4.26.0/4.28.0 各 258 项断言全 PASS（日志加总）。
+
+## 0.3.0（已交付二次返工候选 169a88a；三次验收未通过，见 0.4.0）
 
 二次验收（d8a7147）S1~S6 返工（ADR-011）：
 - S1 重复投递释放身份锁 + stop_event 终止传播（防二次回复）。

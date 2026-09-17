@@ -83,27 +83,41 @@ def identity_from_event(
     )
 
 
+class PersonaResolutionError(Exception):
+    """人格解析失败（T1：受控失败，不得折叠成默认共享身份掩盖异常）。"""
+
+
 async def resolve_persona_scope(
     persona_manager: Any,
     event: AstrMessageEvent,
     conversation: Any,
+    provider_settings: dict | None = None,
 ) -> str:
     """与宿主 build 阶段同参调用 persona_manager，取最终生效人格 ID。
 
     与 astrbot.core.astr_main_agent._ensure_persona_and_skills 一致：
-    umo 会话覆盖 → conversation.persona_id → 全局默认。
-    两版宿主（4.26.0/4.28.0）该 API 签名一致。
+    umo 会话覆盖 → conversation.persona_id → provider_settings.default_personality
+    （4.26 在 conversation.persona_id 为 None 时**只**从该参数读取默认人格，
+    漏传会把不同人格全部折叠为 None——T1 根因）。
+    解析失败或结果为空时抛 :class:`PersonaResolutionError`，由调用方
+    决定受控行为（对话轮不接管、命令报错），不得静默合并身份。
     """
 
     conversation_persona_id = getattr(conversation, "persona_id", None)
-    persona_id: str | None = None
     try:
         result = await persona_manager.resolve_selected_persona(
             umo=event.unified_msg_origin,
             conversation_persona_id=conversation_persona_id,
             platform_name=event.get_platform_name(),
+            provider_settings=provider_settings,
         )
         persona_id = result[0] if result else None
-    except Exception:  # noqa: BLE001 - 解析失败退回默认人格，不阻塞本轮
-        persona_id = None
-    return (persona_id or "").strip() or DEFAULT_PERSONA_SCOPE
+    except Exception as exc:  # noqa: BLE001
+        raise PersonaResolutionError(f"人格解析异常：{exc}") from exc
+    persona_id = (persona_id or "").strip()
+    if not persona_id or persona_id in ("None", "[%None]"):
+        raise PersonaResolutionError(
+            "人格解析结果为空（检查 provider_settings.default_personality "
+            "与当前会话人格配置）"
+        )
+    return persona_id

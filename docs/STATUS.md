@@ -2,7 +2,7 @@
 
 维护规则：每阶段记录当前提交、实际改动、验证命令与结果、失败项、下一步。证据必须对应提交。
 
-## 当前阶段：S1~S6 二次返工（基线 d8a7147）→ 0.3.0 候选完成，待 Codex 复验
+## 当前阶段：T1~T6 三次返工（基线 169a88a）→ 0.4.0 候选完成，待 Codex 复验
 
 ### P0 / MIS-136 已完成（In Review）
 
@@ -102,3 +102,18 @@ ADR-004 v2 / ADR-009 / ADR-010）：
 
 测试统计（从日志加总）：9 套 × 4.26.0/4.28.0 各 **221 项断言全部 PASS**
 （P0=17 P1=35 P2=27 P3=19 P4=22 P5=16 P6=8 R=37 S=40）。上轮 151 汇总误差已按更正口径（143）处理，不再沿用。
+
+
+## 三次验收返工（2026-09-17，Codex 三次验收报告 08）
+
+基线 169a88a 三次验收 T1~T6 返工完成（ADR-012）：
+
+- **T1**：resolve_persona_scope 增加 provider_settings 参数（4.26 默认人格隔离修复）；bridge/commands 经 getter 注入宿主 provider_settings；解析失败抛 PersonaResolutionError（对话轮受控跳过、命令报错，不折叠 __default__）；开场白同一 resolver 同一参数。真实 PersonaManager + ConversationManager + `_get_session_conv` 新会话路径两版验证（t1_persona_worker：不同默认人格身份隔离、B 不含 A 历史、B 保留自身开场白、显式会话人格跟随、失败受控）。
+- **T2**：pending/watchdog 登记提前到锁后可等待点之前；CancelledError 分支收尾 interrupted + 停止传播 + 释放锁（t_rework T2：取消轮 0 模型调用、0 输出、事件终止、轮次 interrupted、锁释放、后继轮完成）。
+- **T3**：shutdown() 关闭协议（_closing 入口双检、活动轮全套停止信号、释放锁唤醒排队者）；main.terminate 顺序 shutdown→release→close。S6 worker 扩展：真实 turn_off/turn_on + 挂起 A + 排队 B + uninstall（活动轮无迟到输出、排队轮干净让出且事件终止、恢复后新轮正常且无回灌）。
+- **T4**：停止信号全套（agent_stop_requested + stop_event→scheduler yield 断链）+ decorating 对已终态轮 clear_result 双保险（t_rework T4：buffer=True 超时后无新增正文、无缓冲迟到输出、failed 落账）。
+- **T5**：provider 检查按真实 Context 接口存在性（t5_native_worker 用真实 Context 构造，4.26 无 async 接口实测走同步；default-reset 两版均联动清空）。
+- **T6**：删除同名单 /reset、/new 处理器；decorating 后置成功关联（activated_handlers 结构化证据 + 宿主固定成功文案 + 轻量防御）；真实 WakingCheckStage+StarRequestSubStage 命令分发矩阵两版验证（默认成功联动、无 provider/禁用/旧名/过滤拒绝不清、新名成功联动）；commands.py 文案修正与 README 一致。
+
+测试统计（日志加总）：10 套 × 4.26.0/4.28.0 各 **258 项断言全部 PASS**
+（P0=17 P1=36 P2=27 P3=19 P4=22 P5=16 P6=8 R=38 S=40 T=35）。

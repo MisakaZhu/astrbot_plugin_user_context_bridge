@@ -691,7 +691,23 @@ def r6_lease() -> None:
 # R7：原生 /reset、/new 联动（权限镜像 + 未共享原行为）
 # ---------------------------------------------------------------------------
 async def r7_native_commands() -> None:
+    """R7/T6（v2 后置成功关联）：以宿主激活证据 + 固定成功文案驱动。"""
+
     plugin_main = import_plugin_module()
+
+    def _builtin_handler(name):
+        return SimpleNamespace(
+            handler_module_path="astrbot.builtin_stars.builtin_commands.main",
+            handler_name=name,
+        )
+
+    def _plugin_handler(name):
+        return SimpleNamespace(
+            handler_module_path=(
+                "data.plugins.astrbot_plugin_user_context_bridge.main"
+            ),
+            handler_name=name,
+        )
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         bridge, resolver, membership, ledger = make_bridge_stack(td)
@@ -722,7 +738,6 @@ async def r7_native_commands() -> None:
                 conversation_manager_getter=lambda: conv_stub,
             )
 
-            # 假 context：宿主配置 + conversation_manager
             def get_config(umo=None):
                 return {
                     "platform_settings": {"unique_session": False},
@@ -748,30 +763,68 @@ async def r7_native_commands() -> None:
                 len(ledger.load_history(identity_of("10001"))) == 2,
             )
 
-            # 场景1：群聊 unique_session=false 非 admin —— 宿主会拒绝 → 不联动
-            ev_admin_required = FakeEvent(
+            async def _native_like(
+                ev, *, activated_builtin, success_text
+            ):
+                activated = [_plugin_handler("uctx_status")]
+                if activated_builtin:
+                    activated.append(_builtin_handler("reset"))
+                ev.set_extra("activated_handlers", activated)
+                if success_text is not None:
+                    from astrbot.core.message.message_event_result import (
+                        MessageEventResult,
+                    )
+
+                    ev.set_result(
+                        MessageEventResult().message(success_text)
+                    )
+                with patch.object(
+                    plugin_main,
+                    "sp",
+                    SimpleNamespace(get_async=AsyncMock(return_value={})),
+                ):
+                    await plugin._sync_native_reset_on_success(ev)
+
+            # 场景1：宿主拒绝（权限）→ 无成功文案 → 不联动
+            ev_denied = FakeEvent(
                 sender_id="10001", group_id="700000001", message_str="/reset"
             )
-            ev_admin_required.role = "member"
-            with patch.object(
-                plugin_main, "sp", SimpleNamespace(get_async=AsyncMock(return_value={}))
-            ):
-                await plugin.native_reset_sync(ev_admin_required)
+            ev_denied.role = "member"
+            await _native_like(
+                ev_denied,
+                activated_builtin=True,
+                success_text="Reset command requires admin permission.",
+            )
             check(
                 "R7.permission-mirrored-no-bump",
                 len(ledger.load_history(identity_of("10001"))) == 2,
                 "权限不足时不得清空共享历史",
             )
 
-            # 场景2：admin 执行 → 宿主会执行 → 联动 bump
+            # 场景1b：内置命令被禁用 → activated 无 builtin → 不联动
+            ev_disabled = FakeEvent(
+                sender_id="10001", group_id="700000001", message_str="/reset"
+            )
+            ev_disabled.role = "admin"
+            await _native_like(
+                ev_disabled, activated_builtin=False, success_text=None
+            )
+            check(
+                "R7.builtin-disabled-no-clear",
+                len(ledger.load_history(identity_of("10001"))) == 2,
+                "内置命令禁用时不得清空",
+            )
+
+            # 场景2：宿主成功文案 + builtin 激活 → 联动
             ev_admin = FakeEvent(
                 sender_id="10001", group_id="700000001", message_str="/reset"
             )
             ev_admin.role = "admin"
-            with patch.object(
-                plugin_main, "sp", SimpleNamespace(get_async=AsyncMock(return_value={}))
-            ):
-                await plugin.native_reset_sync(ev_admin)
+            await _native_like(
+                ev_admin,
+                activated_builtin=True,
+                success_text="✅ Conversation reset successfully.",
+            )
             check(
                 "R7.admin-reset-bumps-epoch",
                 ledger.load_history(identity_of("10001")) == [],
@@ -782,7 +835,7 @@ async def r7_native_commands() -> None:
                 "联动应向用户提示",
             )
 
-            # 场景3：/new 无权限门槛，共享用户直接联动
+            # 场景3：/new 成功文案联动
             await drive_pipeline(
                 bridge,
                 FakeEvent(sender_id="10001", group_id="700000001", message_str="再次提问"),
@@ -797,13 +850,25 @@ async def r7_native_commands() -> None:
                 sender_id="10001", group_id="700000001", message_str="/new"
             )
             ev_new.role = "member"
-            await plugin.native_new_sync(ev_new)
+            activated = [_plugin_handler("uctx_status"), _builtin_handler("new_conv")]
+            ev_new.set_extra("activated_handlers", activated)
+            from astrbot.core.message.message_event_result import (
+                MessageEventResult,
+            )
+
+            ev_new.set_result(
+                MessageEventResult().message("✅ Switched to new conversation: abcd。")
+            )
+            with patch.object(
+                plugin_main, "sp", SimpleNamespace(get_async=AsyncMock(return_value={}))
+            ):
+                await plugin._sync_native_reset_on_success(ev_new)
             check(
                 "R7.new-bumps-epoch",
                 ledger.load_history(identity_of("10001")) == [],
             )
 
-            # 场景4：范围外用户 /reset → 不联动、无提示（宿主原行为）
+            # 场景4：范围外用户 → 不联动、无提示
             await drive_pipeline(
                 bridge,
                 FakeEvent(sender_id="70007", group_id="700000999", message_str="范围外轮"),
@@ -814,10 +879,11 @@ async def r7_native_commands() -> None:
                 sender_id="70007", group_id="700000999", message_str="/reset"
             )
             ev_out.role = "admin"
-            with patch.object(
-                plugin_main, "sp", SimpleNamespace(get_async=AsyncMock(return_value={}))
-            ):
-                await plugin.native_reset_sync(ev_out)
+            await _native_like(
+                ev_out,
+                activated_builtin=True,
+                success_text="✅ Conversation reset successfully.",
+            )
             check(
                 "R7.out-of-scope-untouched",
                 not ev_out.sent_chains,

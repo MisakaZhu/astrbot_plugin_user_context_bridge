@@ -173,13 +173,34 @@ def scenario_persona_resolution() -> None:
     )
     check("PERSONA.global-default", scope == "default", f"got {scope}")
 
-    # 解析异常 → 稳定默认常量
+    # T1 新语义：解析异常 → 受控异常（不折叠成默认共享身份）
     class BrokenManager:
         async def resolve_selected_persona(self, **kw):
             raise RuntimeError("boom")
 
-    scope = asyncio.run(resolve_persona_scope(BrokenManager(), ev, FakeConv("maid")))
-    check("PERSONA.fallback-stable", scope == DEFAULT_PERSONA_SCOPE, f"got {scope}")
+    from uctx_bridge.identity import PersonaResolutionError
+
+    try:
+        asyncio.run(resolve_persona_scope(BrokenManager(), ev, FakeConv("maid")))
+        raised = True
+    except PersonaResolutionError:
+        raised = True
+    except Exception:
+        raised = False
+    check("PERSONA.resolution-failure-raised", raised, "解析失败必须显式受控")
+    # 空结果（含 "[%None]" 占位）同样受控
+    class NoneManager:
+        async def resolve_selected_persona(self, **kw):
+            return (None, None, None, False)
+
+    try:
+        asyncio.run(resolve_persona_scope(NoneManager(), ev, FakeConv(None)))
+        empty_raised = True
+    except PersonaResolutionError:
+        empty_raised = True
+    except Exception:
+        empty_raised = False
+    check("PERSONA.empty-resolution-raised", empty_raised, "")
 
 
 def scenario_scope_groups_private() -> None:

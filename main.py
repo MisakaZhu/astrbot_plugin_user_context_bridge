@@ -32,7 +32,7 @@ _HEARTBEAT_INTERVAL_SECONDS = 60.0
     "astrbot_plugin_user_context_bridge",
     "Ewnscat-ya",
     "同一用户跨会话上下文共享（群聊/私聊连续真实对话历史）",
-    "0.3.0",
+    "0.4.0",
 )
 class UserContextBridgePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -54,6 +54,16 @@ class UserContextBridgePlugin(Star):
         self._sharing_active = False
 
     # -- 生命周期 ---------------------------------------------------------
+    def _provider_settings(self, umo: str | None = None) -> dict:
+        """T1：与宿主 _ensure_persona_and_skills 同源的 provider_settings。"""
+
+        try:
+            cfg = self.context.get_config(umo=umo)
+            settings = cfg.get("provider_settings", {})
+            return settings if isinstance(settings, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
     async def initialize(self) -> None:
         await super().initialize()
         self._ledger.open()
@@ -71,6 +81,7 @@ class UserContextBridgePlugin(Star):
                     ScopeConfig(enabled=False), self._membership
                 ),
                 persona_manager_getter=lambda: self.context.persona_manager,
+                provider_settings_getter=self._provider_settings,
                 logger=logger,
             )
             self._commands = CommandService(
@@ -79,6 +90,7 @@ class UserContextBridgePlugin(Star):
                 membership=self._membership,
                 persona_manager_getter=lambda: self.context.persona_manager,
                 conversation_manager_getter=lambda: self.context.conversation_manager,
+                provider_settings_getter=self._provider_settings,
             )
             return
 
@@ -91,6 +103,7 @@ class UserContextBridgePlugin(Star):
             ledger=self._ledger,
             scope_resolver=self._resolver,
             persona_manager_getter=lambda: self.context.persona_manager,
+            provider_settings_getter=self._provider_settings,
             max_history_turns=int(self._config.get("max_history_turns", 0)) or None,
             logger=logger,
         )
@@ -101,6 +114,7 @@ class UserContextBridgePlugin(Star):
             membership=self._membership,
             persona_manager_getter=lambda: self.context.persona_manager,
             conversation_manager_getter=lambda: self.context.conversation_manager,
+            provider_settings_getter=self._provider_settings,
         )
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         if self._config.get("enabled", False):
@@ -127,9 +141,11 @@ class UserContextBridgePlugin(Star):
                 pass
             self._heartbeat_task = None
         if self._bridge is not None:
-            finalized = self._bridge.finalize_pending_as_interrupted()
+            finalized = self._bridge.shutdown()
             if finalized:
-                logger.info(f"uctx 卸载：{finalized} 个未决轮次标记为 interrupted")
+                logger.info(
+                    f"uctx 停用/卸载：{finalized} 个未决轮次已停止并标记 interrupted"
+                )
         try:
             self._ledger.release_lease(self._lease_id, self._lease_token or "")
         except Exception:  # noqa: BLE001
@@ -160,12 +176,17 @@ class UserContextBridgePlugin(Star):
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
-        if self._bridge is None:
-            return
+        if self._bridge is not None:
+            try:
+                await self._bridge.handle_decorating_result(event)
+            except Exception:  # noqa: BLE001
+                logger.error("uctx on_decorating_result 处理失败", exc_info=True)
+        # T6：宿主 builtin reset/new 实际成功后置关联（结构化激活证据 +
+        # 宿主固定成功文案；此时宿主处理器已执行完毕）
         try:
-            await self._bridge.handle_decorating_result(event)
+            await self._sync_native_reset_on_success(event)
         except Exception:  # noqa: BLE001
-            logger.error("uctx on_decorating_result 处理失败", exc_info=True)
+            logger.warning("uctx 原生命令关联检查失败", exc_info=True)
 
     @filter.after_message_sent()
     async def on_after_message_sent(self, event: AstrMessageEvent):
@@ -224,35 +245,57 @@ class UserContextBridgePlugin(Star):
                 MessageEventResult().message(self._commands.scope())
             )
 
-    # -- 原生 /reset、/new 联动（R7，ADR-008 修订） ------------------------
-    # 语义：宿主命令正常执行（本插件不拦截、不覆盖宿主回复）；当发送者的
-    # 共享身份在启用范围内时，同步切换该身份的共享历史 epoch，使
-    # 「/reset、/new 重置当前窗口」对共享历史同步生效。权限镜像宿主
-    # builtin reset 的判定（scene + alter_cmd + role + 会话存在），
-    # 宿主会拒绝的场景不联动，避免越权清空共享历史。
-    @filter.command("reset")
-    async def native_reset_sync(self, event: AstrMessageEvent):
-        await self._sync_native_reset_like(event, require_permission=True)
+    # -- 原生 /reset、/new 成功关联（T6，ADR-012） --------------------------
+    # 不再注册同名单命令处理器（三次验收 T6 证实其与宿主实际执行脱节：
+    # 内置命令禁用后仍误清、改名后旧名误清/新名漏清、自定义过滤拒绝误清）。
+    # 改为后置事实关联：宿主 builtin reset/new_conv 处理器在本事件的
+    # activated_handlers 中（WakingCheckStage 的结构化激活证据，已含权限/
+    # 禁用/改名/自定义过滤的过滤结果）**且** 事件结果为宿主 builtin 的
+    # 固定成功文案（程序生成字面量，两版一致，非模型正文）时，才切换
+    # 发送者共享身份的 epoch。宿主拒绝/异常/被过滤 → 无成功文案 → 不联动。
+    _BUILTIN_COMMANDS_MODULE_PREFIX = "astrbot.builtin_stars.builtin_commands"
+    _NATIVE_RESET_SUCCESS_PREFIX = "✅ Conversation reset successfully"
+    _NATIVE_NEW_SUCCESS_PREFIX = "✅ Switched to new conversation"
 
-    @filter.command("new")
-    async def native_new_sync(self, event: AstrMessageEvent):
-        # 宿主 /new 无权限门槛，仅要求共享身份在范围内
-        await self._sync_native_reset_like(event, require_permission=False)
+    def _native_reset_executed(self, event: AstrMessageEvent) -> bool:
+        """宿主 builtin reset/new_conv 实际执行成功的双证据。"""
 
-    async def _sync_native_reset_like(
-        self, event: AstrMessageEvent, *, require_permission: bool
-    ) -> None:
+        activated = event.get_extra("activated_handlers") or []
+        builtin_activated = any(
+            str(getattr(h, "handler_module_path", "")).startswith(
+                self._BUILTIN_COMMANDS_MODULE_PREFIX
+            )
+            and getattr(h, "handler_name", "") in ("reset", "new_conv")
+            for h in activated
+        )
+        if not builtin_activated:
+            return False
+        result = event.get_result()
+        if result is None:
+            return False
+        try:
+            text = (result.get_plain_text() or "").strip()
+        except Exception:  # noqa: BLE001
+            return False
+        return text.startswith(
+            self._NATIVE_RESET_SUCCESS_PREFIX
+        ) or text.startswith(self._NATIVE_NEW_SUCCESS_PREFIX)
+
+    async def _sync_native_reset_on_success(self, event: AstrMessageEvent) -> None:
         if self._commands is None or not self._sharing_active:
             return
         try:
+            if not self._native_reset_executed(event):
+                return
+            # 防御性前置（宿主已有 activated+成功文案双证据，此处只复核
+            # provider 与当前会话存在；不得套用 reset 的权限场景——宿主
+            # /new 无权限门槛，成功文案已按命令区分）
+            if not await self._host_command_defense(event):
+                return
             identity = await self._commands._identity(event)
-            # 仅当本人共享身份当前实际生效（窗口范围 + 未退出）时联动。
-            # 注意不能用对话轮次的 evaluate：命令消息本身被其排除。
             if not self._commands._window_in_scope(event):
                 return
             if self._membership is not None and self._membership.is_opted_out(identity):
-                return
-            if require_permission and not await self._host_reset_would_run(event):
                 return
             self._ledger.bump_epoch(identity.key)
             await event.send(
@@ -263,6 +306,28 @@ class UserContextBridgePlugin(Star):
             )
         except Exception:  # noqa: BLE001 - 联动失败不影响宿主命令
             logger.warning("uctx 原生命令联动失败", exc_info=True)
+
+    async def _host_command_defense(self, event: AstrMessageEvent) -> bool:
+        """成功关联的轻量防御：可用 provider + 当前会话存在。"""
+
+        get_async = getattr(self.context, "get_using_provider_async", None)
+        try:
+            if get_async is not None:
+                provider = await get_async(event.unified_msg_origin)
+            else:
+                get_sync = getattr(self.context, "get_using_provider", None)
+                provider = get_sync(event.unified_msg_origin) if get_sync else None
+        except Exception:  # noqa: BLE001
+            provider = None
+        if provider is None:
+            return False
+        try:
+            cid = await self.context.conversation_manager.get_curr_conversation_id(
+                event.unified_msg_origin
+            )
+        except Exception:  # noqa: BLE001
+            cid = None
+        return bool(cid)
 
     # 宿主第三方会话执行器键（两版一致；这些路径 v1 不支持，不联动）
     _THIRD_PARTY_RUNNERS = frozenset(
@@ -309,11 +374,16 @@ class UserContextBridgePlugin(Star):
             )
         if runner_type in self._THIRD_PARTY_RUNNERS:
             return False
-        # 宿主随后要求可用模型提供方（无 provider 时拒绝重置）
+        # 宿主随后要求可用模型提供方（无 provider 时拒绝重置）。
+        # T5：4.26 Context 只有同步 get_using_provider；按存在性选择接口，
+        # 不假设两版同形（探针证实 4.26 无 async 接口）。
+        get_async = getattr(self.context, "get_using_provider_async", None)
         try:
-            provider = await self.context.get_using_provider_async(
-                event.unified_msg_origin
-            )
+            if get_async is not None:
+                provider = await get_async(event.unified_msg_origin)
+            else:
+                get_sync = getattr(self.context, "get_using_provider", None)
+                provider = get_sync(event.unified_msg_origin) if get_sync else None
         except Exception:  # noqa: BLE001 - 接口异常按宿主拒绝处理
             provider = None
         if provider is None:
