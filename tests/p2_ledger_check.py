@@ -49,7 +49,7 @@ def asst_msg(text: str) -> dict:
 
 def scenario_dedup() -> None:
     """A07：一轮只写一次；重复事件/重复完成通知幂等。"""
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         led = TurnLedger(Path(td) / "l.db")
         led.open()
         t1 = led.begin_turn(
@@ -105,7 +105,7 @@ def scenario_dedup() -> None:
 
 def scenario_concurrent_multi_connection() -> None:
     """A09：多连接并发 begin/commit——顺序确定、无覆盖、唯一约束有效。"""
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         db = str(Path(td) / "l.db")
         writers = [TurnLedger(db) for _ in range(4)]
         for w in writers:
@@ -155,7 +155,7 @@ def scenario_concurrent_multi_connection() -> None:
 
 def scenario_dual_instance_guard() -> None:
     """A09：同库双实例——新鲜租约冲突，过期租约可接管。"""
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         db = str(Path(td) / "l.db")
         a = TurnLedger(db)
         a.open()
@@ -191,7 +191,7 @@ def scenario_dual_instance_guard() -> None:
 
 def scenario_epoch_and_reset() -> None:
     """A11 存储层：epoch 清空后旧轮次不可见、旧慢请求提交被拒。"""
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         led = TurnLedger(Path(td) / "l.db")
         led.open()
         led.begin_turn(
@@ -262,7 +262,7 @@ def scenario_epoch_and_reset() -> None:
 
 def scenario_restart_recovery() -> None:
     """A12：重启后已提交历史保留，遗留 running 恢复为 interrupted。"""
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         db = str(Path(td) / "l.db")
         led = TurnLedger(db)
         led.open()
@@ -310,7 +310,7 @@ def scenario_restart_recovery() -> None:
 
 def scenario_trim_and_sanitize() -> None:
     """A13 裁剪尾部保留；A18 敏感内容边界（思考/多模态降级）。"""
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         led = TurnLedger(Path(td) / "l.db")
         led.open()
         for i in range(10):
@@ -395,7 +395,7 @@ def scenario_trim_and_sanitize() -> None:
 
 def scenario_status_variants() -> None:
     """终态变体：failed / aborted 不进入共享历史。"""
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         led = TurnLedger(Path(td) / "l.db")
         led.open()
         for ek, st in (("f1", STATUS_FAILED), ("a1", STATUS_ABORTED)):
