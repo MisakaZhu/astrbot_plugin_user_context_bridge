@@ -43,3 +43,6 @@ cmd_config.json
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Mimosa 本地扫描产物
+.mimosa/
