@@ -42,7 +42,7 @@
 
 **回补人格开场白**：宿主在 build 阶段把 `begin_dialogs` 插入 `req.contexts[:0]`；插件替换 contexts 时需自行调用 `persona_manager.resolve_selected_persona(...)`（与宿主同参）取 persona 并回补 begin_dialogs，保持人格行为一致。begin_dialogs 与临时提示词不持久化进共享账本（写入时剔除），避免反复累积。
 
-## ADR-003：轮次终态机与去重
+## ADR-003：轮次终态机与去重（R2 返工后 v2）
 
 每轮在插件库建立轮次记录（turn）：`event_key` 唯一约束（事件 ID 派生），状态机：
 
@@ -54,21 +54,35 @@ running --插件重启扫描---------------> interrupted
 终态幂等：重复完成通知以 event_key 吸收，一轮只写一次
 ```
 
-**写侧三轨设计（P0 实证驱动）**：
+**写侧终态机 v2（独立验收 R2 返工：宿主在 run_agent 中间 yield 时即执行装饰阶段，
+工具轮的中间输出会触发 decorating；aborted 无输出路径不触发任何下游钩子——
+on_decorating_result 不能作为整轮提交点）**：
 
-- 轨 1（主）`OnAgentDoneEvent`：成功路径在此终态化（携带完整 `run_context.messages` 轨迹）。对回调内容做形态判定：`role=="err"` → failed；`completion_text` 为空或等于该版本 `USER_INTERRUPTION_MESSAGE` 常量 → aborted 候选。
-- 轨 2（兜底，必须）`OnDecoratingResultEvent`：on_agent_done **不覆盖**的路径——模型 err（两版均不触发完成钩子）、on_agent_done 内无法确认的 aborted（4.26 可能回调完整回复文本，且 `agent_user_aborted` 旗标在钩子后才写入）。此阶段旗标已可用：`agent_user_aborted` 为真 → aborted；事件结果为错误文案/无 on_agent_done 记录 → failed。
-- 轨 3（恢复）插件启动扫描：仍处 running 的轮次 → interrupted（不产生伪成功、不重复回复）。
+- 主提交点 `OnAgentDoneEvent`（成功 / aborted / run_agent 级异常均触发且轨迹完整）：
+  - `role == "err"` → failed；
+  - `event.is_stopped()` → aborted（用户停止是中止的决定性信号，覆盖 4.28 marker
+    与 4.26「aborted 回调保留完整/空文本」两种形态）；
+  - 文本空且无工具调用 → failed（与宿主一致：空回复不成功）；
+  - 其他 → completed。
+- 辅助轨 `OnDecoratingResultEvent`：仅做模型 err 加速检测（done_seen 为假且事件
+  结果文本为宿主错误文案「LLM 响应错误…」时立即 failed）。
+- 辅助轨 `OnAfterMessageSentEvent`：send_state 标记 + 停止旗标兜底。
+- fail-watchdog（默认 180s 可配）：登记时启动，仍 running（模型 err 不触发完成钩子/
+  模型挂起/钩子缺失）→ 受控 failed 并释放身份锁。
+- 恢复轨：插件 terminate 未决 → interrupted；重启由账本 recover_running 兜底。
 
 - 失败（err）不生成成功回复记录；重试产生新 event_key 新轮次，不重复入库。
 - aborted 保留已产出内容但带 aborted 状态，不作为完整成功轮次。
 - 轨迹提取：on_llm_request 时记录本轮 user 消息内容指纹；on_agent_done 从 `run_context.messages` 尾部定位该指纹的 user 消息，其后全部消息（工具调用/结果/最终 assistant）即本轮轨迹。指纹定位而非位置切片，规避 Runner 上下文压缩对头部的裁剪；4.28 aborted 注入的打断标记对（USER_INTERRUPTION_REQUEST 文本）不入共享账本。
 - 多模态：入库时 image_url/audio_url 的 base64/本地路径降级为文本占位（`[图片]`/`[音频]`），防库膨胀与失效临时文件引用（A14）。不保存 reasoning_content（隐藏思考）。
 
-## ADR-004：并发与顺序
+## ADR-004：并发与顺序（R3 返工后 v2）
 
 - 宿主会话锁按 UMO 串行同窗口；跨窗口同身份并发由插件层协调：
-  - 进程内：每共享身份一把 `asyncio.Lock`，仅用于"读取快照 + 登记轮次"的短临界区，不跨模型执行期持有（不阻塞不同身份，也不死等模型）；
+  - 进程内：每共享身份一把 `asyncio.Lock`，**自读取历史快照前获取，持有至本轮终态化
+    （completed / failed / aborted / interrupted）释放**（R3 返工：锁只在读侧短临界区
+    持有会导致后继轮读取不到前一未完成轮次）；fail-watchdog 保证模型挂起时受控
+    释放，不同身份锁独立不互相阻塞；
   - 跨连接/进程：SQLite `BEGIN IMMEDIATE` 事务 + WAL；写入以 `(identity, epoch, seq)` 排序，seq 在身份内自增；
   - 同库双 AstrBot 实例：插件启动时在库内登记实例租约（含 PID 与时间戳），检测到活动租约冲突时拒绝启用共享并以只读告警——明确不支持同库双实例同时写入，不假装跨进程安全。
 - 慢请求与新轮次：新轮次读取的是提交事务里的已提交轮次快照；进行中的旧轮次完成后以更大 seq 追加，不覆盖已有数据。
@@ -99,3 +113,26 @@ running --插件重启扫描---------------> interrupted
 - **v1 决策：不注册同名 /reset、/new 命令做 epoch 联动**。理由：镜像宿主权限判定会复制随版本漂移的配置逻辑；若权限判定与宿主不一致，可能出现「宿主拒绝但共享历史被清」或反之的越权/失效场景，比不联动更糟。
 - 实际语义（README 明示）：原生 /reset、/new 只重置当前窗口的宿主会话；插件的共享历史清空使用 `/uctx reset`（本人维度、epoch 切换）。/uctx reset 的回复中同时提示两者区别。
 - 未支持项：原生 /reset 联动切换共享 epoch。若宿主后续提供稳定接口（如会话重置事件钩子），在后续版本实现。
+
+## ADR-009：实例租约的运行时身份与归属校验（R6 返工）
+
+- 租约 ID 改为**每次插件加载运行时生成**（uuid），不再持久化到数据目录——两个实例
+  从同一文件读到同一 ID 会绕过冲突检查并互相覆盖。
+- `instance_leases` 增加 `owner_token`：`acquire` 返回本次调用的 token，`heartbeat/
+  release` 必须携带正确 token——活跃实例不能被另一实例心跳保活、释放或覆盖。
+- 崩溃后重启：旧租约（不同运行时 ID）在心跳新鲜窗口内仍被视为活跃，新实例禁用
+  共享并告警，直至租约过期（有意保守：无法确定旧进程已死）。热重载（同进程
+  terminate→initialize）先 release 再 acquire，不受影响。
+- 多进程排他已由真实双子进程验证（第一实例 acquire 成功、第二实例被拒）。
+
+## ADR-010：原生 /reset、/new 联动（R7 返工，取代 ADR-008 的 v1 决策）
+
+- 插件注册同名单 `/reset`、`/new` 命令 handler，与宿主 builtin 命令共存（不拦截、
+  不覆盖宿主回复，独立 send 提示）。
+- 联动条件：共享启用 + 发送者共享身份在管理员范围内且未退出（**用窗口范围判定，
+  不用对话轮次的 evaluate**——命令消息本身被其排除）。
+- `/reset` 权限镜像宿主 builtin（两版逻辑一致）：unique_session + scene +
+  alter_cmd 配置 + role 检查 + 当前会话存在；宿主会拒绝的场景不联动（避免越权
+  清空共享历史）。`/new` 无宿主权限门槛，范围内即联动。
+- 联动动作：切换该身份 epoch（原生 reset/new 语义 = 开新上下文，同步对共享历史
+  生效）+ 提示「仅影响本人」。未共享用户：不动作不加提示，宿主原行为。

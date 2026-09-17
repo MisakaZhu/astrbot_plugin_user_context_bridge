@@ -23,6 +23,13 @@ from .ledger import TurnLedger
 from .scope import MembershipStore, ScopeResolver
 
 
+class _FakeConv:
+    """仅携带 persona_id 的会话替身（供 resolve_selected_persona 同参调用）。"""
+
+    def __init__(self, persona_id: str | None) -> None:
+        self.persona_id = persona_id
+
+
 def _identity_of(event: AstrMessageEvent, persona_scope: str | None) -> SharedIdentity:
     return build_identity(
         platform_id=str(event.get_platform_id() or ""),
@@ -40,15 +47,44 @@ class CommandService:
         resolver: ScopeResolver,
         membership: MembershipStore,
         persona_manager_getter,
+        conversation_manager_getter=None,
     ) -> None:
         self._ledger = ledger
         self._resolver = resolver
         self._membership = membership
         self._get_persona_manager = persona_manager_getter
+        self._get_conversation_manager = conversation_manager_getter
+
+    async def _current_persona_id(self, event: AstrMessageEvent) -> str | None:
+        """读取当前 UMO 会话 conversation 的 persona_id（R5）。
+
+        与对话轮次一致：宿主解析身份时使用 req.conversation.persona_id，
+        即当前选中会话的 conversation；命令场景从 conversation_manager
+        读取同一对象，保证命令与对话作用于同一生效身份。
+        """
+
+        manager = (
+            self._get_conversation_manager()
+            if self._get_conversation_manager is not None
+            else None
+        )
+        if manager is None:
+            return None
+        try:
+            cid = await manager.get_curr_conversation_id(event.unified_msg_origin)
+            if not cid:
+                return None
+            conversation = await manager.get_conversation(
+                event.unified_msg_origin, cid
+            )
+            return getattr(conversation, "persona_id", None)
+        except Exception:  # noqa: BLE001 - 读取失败退回默认人格解析
+            return None
 
     async def _identity(self, event: AstrMessageEvent) -> SharedIdentity:
+        conversation_persona_id = await self._current_persona_id(event)
         persona_scope = await resolve_persona_scope(
-            self._get_persona_manager(), event, None
+            self._get_persona_manager(), event, _FakeConv(conversation_persona_id)
         )
         return _identity_of(event, persona_scope)
 

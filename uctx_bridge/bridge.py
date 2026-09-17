@@ -1,24 +1,43 @@
-"""轮次生命周期协调器（ADR-002/003）：读侧接管 + 写侧三轨。
+"""轮次生命周期协调器（ADR-002/003，返工后 v2）。
 
-读侧（on_llm_request，即宿主 OnLLMRequestEvent 钩子内调用）：
-    范围判定 → 解析人格 → 读取共享历史快照 → 登记轮次（去重）→
+读侧（on_llm_request）：
+    范围判定 → 解析人格 → **获取身份锁（覆盖整轮生命周期，R3）** →
+    读取共享历史快照 → 登记轮次（去重）→
     ``req.contexts = 人格开场白 + 共享历史`` → ``req.conversation = None``
     （短路宿主对原窗口的整段写回）。人格、系统提示、工具集、其他插件
     动态内容原样保留。
 
-写侧（三轨）：
-    轨 1 OnAgentDoneEvent：缓存终态响应与消息轨迹快照（不提交）；
-    轨 2 OnDecoratingResultEvent：**唯一提交点**——此时 agent_user_aborted
-        旗标已可用，按终态判定 commit_turn；
-    轨 3 恢复：插件 terminate 时未决轮次 → interrupted；重启由账本
-        recover_running 兜底。
+写侧终态机 v2（R2 返工：以真实宿主调度为准）：
+    主提交点 = OnAgentDoneEvent（成功 / aborted / run_agent 级异常均触发，
+    且 run_context.messages 轨迹完整）：
+        role == "err"                     -> failed
+        event.is_stopped()                -> aborted（用户停止是中止的决定性
+                                             信号，覆盖 4.26「aborted 回调保留
+                                             完整文本」与 4.28 marker 两种形态）
+        文本空且无工具调用                  -> failed（与宿主一致：空回复不成功）
+        其他                               -> completed
+    辅助轨：
+        OnDecoratingResultEvent：仅做模型 err 加速检测（done_seen 为假且
+            事件结果文本为宿主错误文案时立即 failed）——宿主在 run_agent
+            中间 yield 时也会执行装饰阶段，工具轮的中间输出不允许在此提交。
+        OnAfterMessageSentEvent：标记 send_state；若轮次仍 running 且停止
+            旗标已置 → aborted 兜底。
+        fail-watchdog（T1，默认 180s）：仍 running（模型 err 不触发完成钩子、
+            模型挂起、钩子缺失等）→ 受控 failed 并释放身份锁。
+        插件 terminate：未决轮次 → interrupted。
+    身份锁在轮次终态化（commit / watchdog / interrupted）时释放；后继同
+    身份轮次因此必然读取到前一完整（或已受控失败）的轮次。
+
+轨迹边界识别（R4 返工）：以 prompt 为本轮 user 文本前缀（宿主把
+extra_user_content_parts 追加在 prompt 之后），从消息尾部定位；临时内容
+（_no_save）在入库时剔除；定位失败时用登记的 user 消息与终态响应构造
+保底配对，保证 completed 轮次必有 assistant。
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import time
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -30,6 +49,8 @@ from .ledger import (
     STATUS_ABORTED,
     STATUS_COMPLETED,
     STATUS_FAILED,
+    STATUS_INTERRUPTED,
+    STATUS_RUNNING,
     EpochStaleError,
     TurnLedger,
     sanitize_message,
@@ -38,10 +59,12 @@ from .ledger import (
 from .scope import ScopeResolver
 
 _AGENT_USER_ABORTED_EXTRA = "agent_user_aborted"
+_HOST_ERR_TEXT_PREFIX = "LLM 响应错误"
+DEFAULT_FAIL_WATCHDOG_SECONDS = 180.0
 
 
 def _extract_text(content: Any) -> str:
-    """从 str / part 列表 / Message / dict 中提取纯文本（与测试同构）。"""
+    """从 str / part 列表 / Message / dict 中提取纯文本。"""
 
     if content is None:
         return ""
@@ -81,30 +104,34 @@ def _message_to_dict(message: Any) -> dict[str, Any] | None:
 
 @dataclass
 class PendingTurn:
-    """进程内活动轮次（读侧登记 → 写侧提交）。"""
+    """进程内活动轮次（读侧登记 → 终态化释放身份锁）。"""
 
     event_key: str
     identity: SharedIdentity
     epoch: int
     user_prompt_text: str
-    user_fingerprint: str
+    registered_user_message: dict
+    event: AstrMessageEvent
+    release_lock: Callable[[], None]
     agent_done_response: Any | None = None
     agent_done_messages: list[Any] | None = None
     done_seen: bool = False
     committed: bool = False
+    watchdog_task: asyncio.Task | None = field(default=None, repr=False)
 
     def fallback_user(self) -> dict[str, Any]:
-        return {"role": "user", "content": [{"type": "text", "text": ""}]}
+        return json.loads(json.dumps(self.registered_user_message))
 
 
-@dataclass
 class BridgeStats:
-    captured: int = 0
-    skipped: int = 0
-    committed_completed: int = 0
-    committed_failed: int = 0
-    committed_aborted: int = 0
-    epoch_stale_rejected: int = 0
+    def __init__(self) -> None:
+        self.captured = 0
+        self.skipped = 0
+        self.committed_completed = 0
+        self.committed_failed = 0
+        self.committed_aborted = 0
+        self.epoch_stale_rejected = 0
+        self.watchdog_failures = 0
 
 
 class ContextBridge:
@@ -118,11 +145,13 @@ class ContextBridge:
         persona_manager_getter: Callable[[], Any],
         max_history_turns: int | None = None,
         logger: Any = None,
+        fail_watchdog_seconds: float = DEFAULT_FAIL_WATCHDOG_SECONDS,
     ) -> None:
         self._ledger = ledger
         self._scope = scope_resolver
         self._get_persona_manager = persona_manager_getter
         self._max_history_turns = max_history_turns
+        self._fail_watchdog_seconds = fail_watchdog_seconds
         self._log = logger
         self._pending: dict[str, PendingTurn] = {}
         self._identity_locks: dict[str, asyncio.Lock] = {}
@@ -130,9 +159,6 @@ class ContextBridge:
         self.stats = BridgeStats()
 
     # -- 内部 -------------------------------------------------------------
-    def _logger(self) -> Any:
-        return self._log
-
     def _info(self, msg: str) -> None:
         if self._log is not None:
             try:
@@ -147,13 +173,18 @@ class ContextBridge:
             except Exception:
                 pass
 
-    async def _identity_lock(self, identity_key: str) -> asyncio.Lock:
+    async def _acquire_identity_lock(self, identity_key: str) -> asyncio.Lock:
         async with self._locks_guard:
             lock = self._identity_locks.get(identity_key)
             if lock is None:
                 lock = asyncio.Lock()
                 self._identity_locks[identity_key] = lock
             return lock
+
+    def _release_identity_lock(self, identity_key: str) -> None:
+        lock = self._identity_locks.get(identity_key)
+        if lock is not None and lock.locked():
+            lock.release()
 
     @staticmethod
     def event_key_for(event: AstrMessageEvent) -> str:
@@ -168,9 +199,11 @@ class ContextBridge:
         event: AstrMessageEvent,
         req: ProviderRequest,
     ) -> bool:
-        """OnLLMRequestEvent 钩子处理。返回是否接管了本轮（True=已纳入共享）。
+        """OnLLMRequestEvent 钩子处理。返回是否接管了本轮。
 
-        未纳入时对 req 不做任何修改，宿主保持原生行为。
+        未纳入时对 req 不做任何修改。接管时持有身份锁直至本轮终态化
+        （completed / failed / aborted / interrupted），保证后继同身份轮次
+        读取到本轮完整结果（R3）。
         """
 
         persona_scope = await resolve_persona_scope(
@@ -183,15 +216,17 @@ class ContextBridge:
         identity = decision.identity
 
         event_key = self.event_key_for(event)
-        prompt_text = (req.prompt or "").strip()
-        fingerprint = hashlib.sha256(
-            f"{identity.key}|{prompt_text}|{len(req.image_urls)}|{len(req.audio_urls)}".encode(
-                "utf-8"
-            )
-        ).hexdigest()
+        lock = await self._acquire_identity_lock(identity.key)
+        await lock.acquire()
+        released = False
 
-        # 读侧身份锁：快照 + 登记 原子化（同身份串行；不同身份并行）
-        async with await self._identity_lock(identity.key):
+        def _release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self._release_identity_lock(identity.key)
+
+        try:
             history = self._ledger.load_history(
                 identity.key, max_turns=self._max_history_turns
             )
@@ -204,32 +239,47 @@ class ContextBridge:
                 umo=event.unified_msg_origin,
                 user_message=user_message,
             )
+            if turn.status != STATUS_RUNNING:
+                # 重复投递且原轮已终态：不重复接管，保持宿主原生行为
+                self.stats.skipped += 1
+                return False
 
-        begin_dialogs = await self._persona_begin_dialogs(event, req)
-        req.contexts = [*begin_dialogs, *history]
-        # 短路宿主写回：宿主 _save_to_history 以 req.conversation None 直接返回
-        req.conversation = None
+            begin_dialogs = await self._persona_begin_dialogs(event, req)
+            req.contexts = [*begin_dialogs, *history]
+            req.conversation = None
 
-        self._pending[event_key] = PendingTurn(
-            event_key=event_key,
-            identity=identity,
-            epoch=turn.epoch,
-            user_prompt_text=prompt_text,
-            user_fingerprint=fingerprint,
-        )
-        self.stats.captured += 1
-        self._info(
-            f"uctx 接管轮次 {event_key}（身份已脱敏，epoch={turn.epoch}，"
-            f"历史 {len(history)} 条）"
-        )
-        return True
+            pending = PendingTurn(
+                event_key=event_key,
+                identity=identity,
+                epoch=turn.epoch,
+                user_prompt_text=(req.prompt or "").strip(),
+                registered_user_message=user_message,
+                event=event,
+                release_lock=_release,
+            )
+            pending.watchdog_task = asyncio.create_task(self._fail_watchdog(pending))
+            self._pending[event_key] = pending
+            self.stats.captured += 1
+            self._info(f"uctx 接管轮次（epoch={turn.epoch}，历史 {len(history)} 条）")
+            return True
+        except Exception:
+            _release()
+            raise
 
     def _build_user_message(self, req: ProviderRequest) -> dict[str, Any]:
-        """本轮 user 消息的入库形态：文本 + 多模态占位。"""
+        """本轮 user 消息的入库形态：文本 + 非临时附加内容 + 多模态占位。
+
+        临时内容（TextPart.mark_as_temp / _no_save）在入库时剔除，不永久
+        污染共享历史（R4）。
+        """
 
         parts: list[dict[str, Any]] = []
         if (req.prompt or "").strip():
             parts.append({"type": "text", "text": req.prompt})
+        for part in req.extra_user_content_parts or []:
+            dumped = _message_to_dict({"role": "user", "content": [part]})
+            if dumped and dumped.get("content"):
+                parts.extend(dumped["content"])
         for _ in req.image_urls or []:
             parts.append({"type": "text", "text": "[图片]"})
         for _ in req.audio_urls or []:
@@ -243,11 +293,7 @@ class ContextBridge:
         event: AstrMessageEvent,
         req: ProviderRequest,
     ) -> list[dict[str, Any]]:
-        """与宿主同参解析人格，回补开场白（保持人格行为一致）。
-
-        开场白每轮注入、不入库（宿主在 conversation.history 中重复累积的行为
-        不复制到共享账本）。
-        """
+        """与宿主同参解析人格，回补开场白（每轮注入、不入库）。"""
 
         try:
             manager = self._get_persona_manager()
@@ -256,7 +302,6 @@ class ContextBridge:
             conversation_persona_id = getattr(
                 getattr(req, "conversation", None), "persona_id", None
             )
-            # 注意：此调用发生在我们置 None 之前（handle_llm_request 顺序保证）
             result = await manager.resolve_selected_persona(
                 umo=event.unified_msg_origin,
                 conversation_persona_id=conversation_persona_id,
@@ -270,17 +315,17 @@ class ContextBridge:
                 if cleaned is not None:
                     out.append(cleaned)
             return out
-        except Exception:  # noqa: BLE001 - 开场白回补失败不阻塞本轮
+        except Exception:  # noqa: BLE001
             return []
 
-    # -- 写侧 -------------------------------------------------------------
+    # -- 写侧：主提交点 -----------------------------------------------------
     async def handle_agent_done(
         self,
         event: AstrMessageEvent,
         run_context: Any,
         llm_response: Any,
     ) -> None:
-        """轨 1：缓存轨迹快照（此时刻 aborted 旗标尚未写入，不做终态判定）。"""
+        """主提交点（R2 v2）：成功 / aborted / run_agent 级异常在此终态化。"""
 
         event_key = self.event_key_for(event)
         pending = self._pending.get(event_key)
@@ -291,49 +336,84 @@ class ContextBridge:
         pending.agent_done_messages = list(messages)
         pending.done_seen = True
 
+        role = getattr(llm_response, "role", "")
+        has_tool_calls = bool(getattr(llm_response, "tools_call_name", None))
+        text = (getattr(llm_response, "completion_text", "") or "").strip()
+
+        if role == "err":
+            status = STATUS_FAILED
+        elif event.is_stopped():
+            # 用户停止是中止的决定性信号：覆盖 4.28 marker 与 4.26
+            # 「aborted 回调保留完整/空文本」两种形态（R2）
+            status = STATUS_ABORTED
+        elif not text and not has_tool_calls:
+            status = STATUS_FAILED
+        else:
+            status = STATUS_COMPLETED
+
+        user_msg, trajectory = self._split_trajectory(pending)
+        reply_text = text or None
+        if status == STATUS_COMPLETED and not trajectory:
+            trajectory = self._fallback_assistant(llm_response)
+        self._finalize(pending, status, trajectory, reply_text)
+
+    # -- 写侧：辅助轨 -------------------------------------------------------
     async def handle_decorating_result(self, event: AstrMessageEvent) -> None:
-        """轨 2：唯一提交点。此时旗标可用，按终态判定提交账本。"""
+        """辅助轨：模型 err 加速检测（不做常规提交）。
+
+        宿主在 run_agent 中间 yield 时也会执行装饰阶段（工具轮的中间
+        输出），因此这里只在「尚未见过完成钩子 + 事件结果为宿主错误文案」
+        （模型 err 终局，不会再有 on_agent_done）时立即 failed；其余情形
+        由 on_agent_done 或 fail-watchdog 收尾。
+        """
 
         event_key = self.event_key_for(event)
         pending = self._pending.get(event_key)
+        if pending is None or pending.committed or pending.done_seen:
+            return
+        result = event.get_result()
+        text = ""
+        if result is not None:
+            try:
+                text = (result.get_plain_text() or "").strip()
+            except Exception:  # noqa: BLE001
+                text = ""
+        if text.startswith(_HOST_ERR_TEXT_PREFIX):
+            self._finalize(pending, STATUS_FAILED, [], None)
+
+    async def handle_after_message_sent(self, event: AstrMessageEvent) -> None:
+        """发送标记 + 停止旗标兜底（aborted 无输出路径可能缺其他钩子）。"""
+
+        event_key = self.event_key_for(event)
+        try:
+            self._ledger.mark_turn_sent(event_key)
+        except Exception:  # noqa: BLE001
+            self._warn("uctx 发送状态标记失败")
+        pending = self._pending.get(event_key)
         if pending is None or pending.committed:
             return
-        aborted = event.get_extra(_AGENT_USER_ABORTED_EXTRA) is True
+        if event.is_stopped() or event.get_extra(_AGENT_USER_ABORTED_EXTRA) is True:
+            reply = getattr(pending.agent_done_response, "completion_text", "") or None
+            self._finalize(pending, STATUS_ABORTED, [], reply)
 
-        trajectory: list[dict[str, Any]] = []
-        reply_text: str | None = None
-        if pending.agent_done_messages is not None:
-            user_msg, trajectory = self._split_trajectory(pending)
-            resp = pending.agent_done_response
-            resp_text = _extract_text(getattr(resp, "result_chain", None)) or (
-                getattr(resp, "completion_text", "") or ""
-            )
-            reply_text = resp_text or None
+    async def _fail_watchdog(self, pending: PendingTurn) -> None:
+        """受控失败兜底：超时仍 running（模型 err / 挂起 / 钩子缺失）→ failed。"""
 
-        if aborted:
-            status = STATUS_ABORTED
-        elif pending.done_seen and pending.agent_done_response is not None:
-            resp = pending.agent_done_response
-            role = getattr(resp, "role", "")
-            has_tool_calls = bool(getattr(resp, "tools_call_name", None))
-            text = (getattr(resp, "completion_text", "") or "").strip()
-            if role == "err":
-                status = STATUS_FAILED
-            elif not text and not has_tool_calls:
-                # 与宿主一致：空回复不产生成功记录
-                status = STATUS_FAILED
-            else:
-                status = STATUS_COMPLETED
-        else:
-            # 未经过完成钩子（模型 err / 中断等）→ 失败
-            status = STATUS_FAILED
+        try:
+            await asyncio.sleep(self._fail_watchdog_seconds)
+        except asyncio.CancelledError:
+            return
+        if pending.committed:
+            return
+        self.stats.watchdog_failures += 1
+        self._warn("uctx 轮次超时未终态化，按受控失败收尾")
+        self._finalize(pending, STATUS_FAILED, [], None)
 
-        self._commit(pending, status, trajectory, reply_text)
-
+    # -- 轨迹提取（R4） -----------------------------------------------------
     def _split_trajectory(
         self, pending: PendingTurn
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-        """从消息快照中定位本轮 user（指纹），切出 (user 消息, 其后轨迹)。"""
+        """定位本轮 user（prompt 为前缀；extra parts 追加在 prompt 之后）。"""
 
         messages = pending.agent_done_messages or []
         prompt = pending.user_prompt_text
@@ -342,33 +422,57 @@ class ContextBridge:
             m = messages[i]
             if getattr(m, "role", None) != "user":
                 continue
-            content = getattr(m, "content", None)
-            text = _extract_text(content)
-            if prompt and text == prompt:
-                idx = i
-                break
-            if not prompt:
+            text = _extract_text(getattr(m, "content", None))
+            if prompt:
+                if text.startswith(prompt):
+                    idx = i
+                    break
+            else:
                 idx = i
                 break
         if idx < 0:
-            # 指纹定位失败（极端压缩/重写）：退化为空 user、全量轨迹由调用方清理
             return None, []
         user_dict = _message_to_dict(messages[idx]) or pending.fallback_user()
         rest = [_message_to_dict(m) for m in messages[idx + 1 :]]
         return user_dict, [r for r in rest if r is not None]
 
-    def _commit(
+    @staticmethod
+    def _fallback_assistant(llm_response: Any) -> list[dict[str, Any]]:
+        """轨迹缺失时用终态响应构造保底 assistant，保证 completed 配对。"""
+
+        text = (getattr(llm_response, "completion_text", "") or "").strip()
+        tool_calls = getattr(llm_response, "tools_call_name", None)
+        if text:
+            return [{"role": "assistant", "content": [{"type": "text", "text": text}]}]
+        if tool_calls:
+            try:
+                dumped = [
+                    tc.model_dump()
+                    for tc in llm_response.to_openai_tool_calls_model()
+                ]
+                return [{"role": "assistant", "content": None, "tool_calls": dumped}]
+            except Exception:  # noqa: BLE001
+                return []
+        return []
+
+    # -- 终态化 -------------------------------------------------------------
+    def _finalize(
         self,
         pending: PendingTurn,
         status: str,
         trajectory: list[dict[str, Any]],
         reply_text: str | None,
     ) -> None:
+        if pending.committed:
+            pending.release_lock()
+            return
+        if pending.watchdog_task is not None and not pending.watchdog_task.done():
+            pending.watchdog_task.cancel()
         try:
             self._ledger.commit_turn(
                 event_key=pending.event_key,
                 status=status,
-                trajectory=trajectory,
+                trajectory=sanitize_messages(trajectory),
                 reply_text=reply_text,
             )
             pending.committed = True
@@ -379,20 +483,12 @@ class ContextBridge:
             else:
                 self.stats.committed_aborted += 1
         except EpochStaleError:
-            pending.committed = True  # 已被清空吞没，不复活
+            pending.committed = True  # 已被清空吞没，不复活旧历史
             self.stats.epoch_stale_rejected += 1
             self._info("uctx 轮次因 epoch 清空被丢弃（慢请求不复活旧历史）")
         finally:
             self._pending.pop(pending.event_key, None)
-
-    async def handle_after_message_sent(self, event: AstrMessageEvent) -> None:
-        """发送成功标记（发送失败/未确认时该钩子不触发，send_state 保持 NULL）。"""
-
-        event_key = self.event_key_for(event)
-        try:
-            self._ledger.mark_turn_sent(event_key)
-        except Exception:  # noqa: BLE001
-            self._warn("uctx 发送状态标记失败")
+            pending.release_lock()
 
     # -- 兜底 -------------------------------------------------------------
     def finalize_pending_as_interrupted(self) -> int:
@@ -402,7 +498,7 @@ class ContextBridge:
         for pending in list(self._pending.values()):
             if pending.committed:
                 continue
-            self._commit(pending, "interrupted", [], None)
+            self._finalize(pending, STATUS_INTERRUPTED, [], None)
             count += 1
         return count
 

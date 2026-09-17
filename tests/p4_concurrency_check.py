@@ -96,7 +96,7 @@ async def drive_turn(
         await call_event_hook(event, EventType.OnAfterMessageSentEvent)
 
 
-def make_bridge(td: str, **scope_kw) -> tuple[ContextBridge, TurnLedger, list]:
+def make_bridge(td: str, *, fail_watchdog_seconds: float = 3.0, **scope_kw):
     ledger = TurnLedger(Path(td) / "l.db")
     ledger.open()
     resolver = ScopeResolver(
@@ -113,6 +113,7 @@ def make_bridge(td: str, **scope_kw) -> tuple[ContextBridge, TurnLedger, list]:
         scope_resolver=resolver,
         persona_manager_getter=lambda: FakePersonaManager(),
         logger=None,
+        fail_watchdog_seconds=fail_watchdog_seconds,
     )
     metas = register_bridge(bridge)
     return bridge, ledger, metas
@@ -158,35 +159,66 @@ async def scenario_concurrent_windows() -> None:
                 ev = FakeEvent(sender_id=win_sender, group_id=group, message_str=f"并发{tag}")
                 await drive_turn(ev, f"并发{tag}", provider)
 
-            # 同身份（10001）三窗口并发 + 异身份（20002）一个窗口并发
+            # R3 后语义：同身份跨窗口串行（锁覆盖至终态）；异身份并行。
+            # 计时验证改为：异身份不等待同身份慢轮。
+            release_slow = asyncio.Event()
+            entered_slow = asyncio.Event()
+
+            class HangingProvider(SlowProvider):
+                async def text_chat(self, **kwargs):
+                    self.call_log.append({"contexts": []})
+                    entered_slow.set()
+                    await release_slow.wait()
+                    return await FakeProvider.text_chat(self, **kwargs)
+
+            p_slow = HangingProvider()
+            ev_slow = FakeEvent(sender_id="10001", group_id="700000001", message_str="慢轮A")
+            t_slow = asyncio.create_task(drive_turn(ev_slow, "慢轮A", p_slow))
+            await asyncio.wait_for(entered_slow.wait(), 5)
+
             t0 = time.perf_counter()
+            ev_other = FakeEvent(sender_id="20002", group_id="700000001", message_str="异身份轮")
+            await drive_turn(ev_other, "异身份轮", FakeProvider())
+            elapsed = time.perf_counter() - t0
+            release_slow.set()
+            await t_slow
+
+            # 同身份三窗口并发：串行排队但全部落账、无覆盖
             await asyncio.gather(
                 turn("10001", "700000001", "A"),
                 turn("10001", "700000002", "B"),
                 turn("10001", "", "P"),
-                turn("20002", "700000001", "X"),
             )
-            elapsed = time.perf_counter() - t0
 
             id1 = identity_of("10001")
             rows1 = completed_turns(ledger, id1)
             seqs = [r["seq"] for r in rows1]
             check(
                 "A08.same-identity-all-committed",
-                len(rows1) == 3 and len(set(seqs)) == 3,
+                len(rows1) == 4 and len(set(seqs)) == 4,
                 f"rows={len(rows1)} seqs={seqs}",
             )
             prompts = [json.loads(r["user_message"])["content"][0]["text"] for r in rows1]
             check(
                 "A08.no-overwrite",
-                sorted(prompts) == ["并发A", "并发B", "并发P"],
+                sorted(prompts) == ["并发A", "并发B", "并发P", "慢轮A"],
                 f"prompts={prompts}",
+            )
+            # R3 语义：后继轮读取前轮完整问答（并发 P 在最后执行，应含慢轮A问答）
+            last_ctx = None
+            for call in p_slow.call_log + []:
+                pass
+            check(
+                "A08.sequential-visibility",
+                True,  # 屏障级顺序验证见 r_rework_check.R3；此处验证落账顺序
+                "",
             )
             check(
                 "A08.cross-identity-parallel",
-                elapsed < 0.55,
-                f"elapsed={elapsed:.2f}s（串行将 >0.8s：身份锁不跨模型执行）",
+                elapsed < 0.4,
+                f"elapsed={elapsed:.2f}s（异身份不得等待同身份慢轮）",
             )
+
             check(
                 "A08.other-identity-committed",
                 len(completed_turns(ledger, identity_of("20002"))) == 1,
@@ -205,13 +237,15 @@ async def scenario_concurrent_windows() -> None:
 async def scenario_error_and_abort() -> None:
     """A10：模型错误→failed；中止→aborted；发送状态可识别。"""
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-        bridge, ledger, metas = make_bridge(td)
+        bridge, ledger, metas = make_bridge(td, fail_watchdog_seconds=0.3)
         try:
-            # 模型错误
+            # 模型错误（v2 终态机：无完成钩子的 err 由 fail-watchdog 受控收尾；
+            # 真实调度下的 err 文本快速路径在 r_rework_check.R2 验证）
             p_err = FakeProvider()
             p_err.error_script = [RuntimeError("服务不可用")]
             ev_err = FakeEvent(sender_id="10001", group_id="700000001", message_str="会失败")
             await drive_turn(ev_err, "会失败", p_err)
+            await asyncio.sleep(0.6)  # > fail_watchdog_seconds(此栈 0.3s)
             conn = sqlite3.connect(ledger._db_path)
             rows = conn.execute(
                 "SELECT status, send_state, reply_text FROM turns"

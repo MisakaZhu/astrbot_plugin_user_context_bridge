@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -84,27 +85,45 @@ def scenario_host_loaders() -> None:
 
 
 def scenario_module_import() -> None:
-    """A17：宿主 venv 内导入插件入口，装饰器注册无异常。"""
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys; sys.path.insert(0, r'%s');"
-            "import main;"
-            "from astrbot.core.star.star import star_map, star_registry;"
-            "names=[getattr(s,'name',None) for s in star_registry];"
-            "assert 'astrbot_plugin_user_context_bridge' in names, names;"
-            "print('import-ok')" % str(REPO_ROOT),
-        ],
-        capture_output=True,
-        text=True,
-        cwd=str(REPO_ROOT),
-    )
-    check(
-        "A17.module-importable",
-        result.returncode == 0 and "import-ok" in result.stdout,
-        (result.stderr or result.stdout)[-300:],
-    )
+    """A17（R1）：按宿主 data.plugins.<name>.main 真实路径导入。
+
+    从当前源码构造插件目录（与交付 ZIP 同内容），只把实例根目录加入
+    sys.path——不允许注入插件根目录掩盖包内导入问题。
+    """
+    import shutil as _shutil
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        inst = Path(td)
+        plug_dir = inst / "data" / "plugins" / "astrbot_plugin_user_context_bridge"
+        plug_dir.mkdir(parents=True)
+        for rel in ZIP_WHITELIST:
+            src = REPO_ROOT / rel
+            dst = plug_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_file():
+                _shutil.copy2(src, dst)
+            else:
+                _shutil.copytree(src, dst, dirs_exist_ok=True)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.path.insert(0, r'%s');"
+                "import importlib;"
+                "m = importlib.import_module("
+                "    'data.plugins.astrbot_plugin_user_context_bridge.main');"
+                "assert hasattr(m, 'UserContextBridgePlugin');"
+                "print('import-ok')" % str(inst),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(inst),
+        )
+        check(
+            "A17.module-importable",
+            result.returncode == 0 and "import-ok" in result.stdout,
+            (result.stderr or result.stdout)[-300:],
+        )
 
 
 def scenario_git_manifest() -> None:

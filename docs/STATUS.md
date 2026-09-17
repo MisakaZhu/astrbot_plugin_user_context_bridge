@@ -2,7 +2,7 @@
 
 维护规则：每阶段记录当前提交、实际改动、验证命令与结果、失败项、下一步。证据必须对应提交。
 
-## 当前阶段：P7 / MIS-143（交付打包）→ 本地候选完成，待 Codex 独立验收
+## 当前阶段：R1~R7 独立验收返工（基线 8477eba）→ 返工候选完成，待 Codex 复验
 
 ### P0 / MIS-136 已完成（In Review）
 
@@ -61,3 +61,29 @@ Codex 独立验收（MIS-144）；用户实机验证（MIS-145）。
 | P4 / MIS-140 | 414b7a3 | 双版本 21/21 PASS；In Review |
 | P5 / MIS-141 | a389f3a | 双版本 16/16 PASS；In Review |
 | P6 / MIS-142 | d9d55e9 | 双版本 8/8 PASS；In Review |
+
+
+## 独立验收返工（2026-09-17，Codex 验收报告 04）
+
+基线 8477eba 独立验收未通过（R1~R7）。返工内容（详见 docs/ADR.md ADR-003 v2 /
+ADR-004 v2 / ADR-009 / ADR-010）：
+
+- **R1**：main.py 改包内相对导入；p6 A17 改为宿主 `data.plugins.<name>.main`
+  真实路径导入（不允许注入插件根目录）。
+- **R2**：终态机 v2——on_agent_done 为主提交点（is_stopped 判 aborted）；decorating
+  仅做 err 文本加速；after_message_sent 兜底；fail-watchdog（180s 可配）收尾无钩子
+  路径。新增 tests/harness.py（真实 PipelineScheduler + ResultDecorateStage 逐
+  yield 下游），r_rework R2 覆盖工具中间输出/取消/err 快速/err watchdog/空回复/卸载。
+- **R3**：身份锁持有至轮次终态化；r_rework R3 屏障验证（B 等待 A 且请求含 A 问答；
+  异身份并行计时）。
+- **R4**：本轮 user 边界改 prompt 前缀匹配（extra parts 追加在 prompt 后）；临时
+  内容入库剔除；completed 保底配对；下一轮请求含完整问答回归。
+- **R5**：命令身份解析接入 conversation_manager 当前会话 persona_id（修复 getter
+  未调用 bug）；真实 PersonaManager 验证命令与对话身份一致。
+- **R6**：租约运行时 ID（删除持久化文件）+ owner_token 归属校验（heartbeat/release
+  拒绝伪造）；双子进程排他验证。
+- **R7**：原生 /reset、/new 联动实现（ADR-010）：同名单命令共存 + 权限镜像 +
+  范围内 bump epoch；未共享原行为；A11 不再以 /uctx reset 冒充全通过。
+
+测试统计（返工后）：8 套 × 4.26.0/4.28.0 各 **181 项断言全部 PASS**
+（P0=17 P1=35 P2=27 P3=19 P4=22 P5=16 P6=8 R=37）。

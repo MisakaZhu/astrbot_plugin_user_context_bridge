@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS instance_leases (
     lease_id TEXT PRIMARY KEY,
     pid INTEGER NOT NULL,
     boot_id TEXT NOT NULL,
+    owner_token TEXT NOT NULL,
     acquired_at REAL NOT NULL,
     heartbeat_at REAL NOT NULL
 );
@@ -528,16 +529,21 @@ class TurnLedger:
         lease_id: str,
         *,
         pid: int | None = None,
-    ) -> None:
-        """登记本实例写租约。
+        owner_token: str | None = None,
+    ) -> str:
+        """登记本实例写租约，返回本次调用的 owner_token。
 
         存在其他**新鲜**租约（心跳在 LEASE_FRESH_SECONDS 内）时抛
         LeaseConflictError——同库双实例并发写不受支持；过期租钥被清理。
+        owner_token 用于租约归属校验：只有持有 token 的实例能对本租约
+        心跳或释放（R6：活跃实例不能被另一实例覆盖或释放）。
         """
 
         now = time.time()
         pid = pid if pid is not None else os.getpid()
         boot_id = uuid.uuid4().hex
+        if owner_token is None:
+            owner_token = uuid.uuid4().hex
         with self._lock:
             conn = self._tx()
             try:
@@ -567,11 +573,12 @@ class TurnLedger:
                     "DELETE FROM instance_leases WHERE lease_id=?", (lease_id,)
                 )
                 conn.execute(
-                    "INSERT INTO instance_leases (lease_id, pid, boot_id, acquired_at,"
-                    " heartbeat_at) VALUES (?,?,?,?,?)",
-                    (lease_id, pid, boot_id, now, now),
+                    "INSERT INTO instance_leases (lease_id, pid, boot_id, owner_token,"
+                    " acquired_at, heartbeat_at) VALUES (?,?,?,?,?,?)",
+                    (lease_id, pid, boot_id, owner_token, now, now),
                 )
                 conn.execute("COMMIT")
+                return owner_token
             except LeaseConflictError:
                 raise
             except Exception:
@@ -581,26 +588,36 @@ class TurnLedger:
                     pass
                 raise
 
-    def heartbeat_lease(self, lease_id: str) -> None:
+    def heartbeat_lease(self, lease_id: str, owner_token: str) -> None:
         with self._lock:
             conn = self._tx()
             try:
-                conn.execute(
-                    "UPDATE instance_leases SET heartbeat_at=? WHERE lease_id=?",
-                    (time.time(), lease_id),
+                cur = conn.execute(
+                    "UPDATE instance_leases SET heartbeat_at=?"
+                    " WHERE lease_id=? AND owner_token=?",
+                    (time.time(), lease_id, owner_token),
                 )
+                if cur.rowcount == 0:
+                    conn.execute("COMMIT")
+                    raise LedgerError("租约不存在或归属校验失败，拒绝心跳")
                 conn.execute("COMMIT")
             except Exception:
                 self._rollback(conn)
                 raise
 
-    def release_lease(self, lease_id: str) -> None:
+    def release_lease(self, lease_id: str, owner_token: str) -> None:
+        """释放本实例租约；owner_token 不匹配（他人租约）时拒绝。"""
+
         with self._lock:
             conn = self._tx()
             try:
-                conn.execute(
-                    "DELETE FROM instance_leases WHERE lease_id=?", (lease_id,)
+                cur = conn.execute(
+                    "DELETE FROM instance_leases WHERE lease_id=? AND owner_token=?",
+                    (lease_id, owner_token),
                 )
+                if cur.rowcount == 0:
+                    conn.execute("COMMIT")
+                    raise LedgerError("租约不存在或归属校验失败，拒绝释放")
                 conn.execute("COMMIT")
             except Exception:
                 self._rollback(conn)

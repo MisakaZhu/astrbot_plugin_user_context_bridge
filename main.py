@@ -14,25 +14,25 @@ import uuid
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
+from astrbot.core import sp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.provider.entities import ProviderRequest
 
-from uctx_bridge.bridge import ContextBridge
-from uctx_bridge.commands import CommandService
-from uctx_bridge.ledger import LeaseConflictError, TurnLedger
-from uctx_bridge.scope import MembershipStore, ScopeConfig, ScopeResolver
+from .uctx_bridge.bridge import ContextBridge
+from .uctx_bridge.commands import CommandService
+from .uctx_bridge.ledger import LeaseConflictError, TurnLedger
+from .uctx_bridge.scope import MembershipStore, ScopeConfig, ScopeResolver
 
 _HEARTBEAT_INTERVAL_SECONDS = 60.0
-_LEASE_ID_FILENAME = "instance_lease_id"
 
 
 @register(
     "astrbot_plugin_user_context_bridge",
     "Ewnscat-ya",
     "同一用户跨会话上下文共享（群聊/私聊连续真实对话历史）",
-    "0.1.0",
+    "0.2.0",
 )
 class UserContextBridgePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -46,30 +46,19 @@ class UserContextBridgePlugin(Star):
         )
         self._bridge: ContextBridge | None = None
         self._commands: CommandService | None = None
-        self._lease_id = self._load_or_create_lease_id()
+        # R6：实例租约 ID 为运行时唯一（每次加载生成新 ID），不再持久化到
+        # 数据目录——避免两个实例从同一文件读到同一 ID 绕过冲突检查。
+        self._lease_id = uuid.uuid4().hex
+        self._lease_token: str | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._sharing_active = False
 
     # -- 生命周期 ---------------------------------------------------------
-    def _load_or_create_lease_id(self) -> str:
-        path = self._data_dir / _LEASE_ID_FILENAME
-        try:
-            if path.exists():
-                lease_id = path.read_text(encoding="utf-8").strip()
-                if lease_id:
-                    return lease_id
-            path.parent.mkdir(parents=True, exist_ok=True)
-            lease_id = uuid.uuid4().hex
-            path.write_text(lease_id, encoding="utf-8")
-            return lease_id
-        except Exception:  # noqa: BLE001 - 文件异常时退化为进程内租约
-            return uuid.uuid4().hex
-
     async def initialize(self) -> None:
         await super().initialize()
         self._ledger.open()
         try:
-            self._ledger.acquire_lease(self._lease_id)
+            self._lease_token = self._ledger.acquire_lease(self._lease_id)
         except LeaseConflictError as exc:
             # 同库双实例防护：保持加载但禁用共享，避免并发写
             logger.warning(
@@ -89,6 +78,7 @@ class UserContextBridgePlugin(Star):
                 resolver=ScopeResolver(ScopeConfig(enabled=False), self._membership),
                 membership=self._membership,
                 persona_manager_getter=lambda: self.context.persona_manager,
+                conversation_manager_getter=lambda: self.context.conversation_manager,
             )
             return
 
@@ -110,6 +100,7 @@ class UserContextBridgePlugin(Star):
             resolver=self._resolver,
             membership=self._membership,
             persona_manager_getter=lambda: self.context.persona_manager,
+            conversation_manager_getter=lambda: self.context.conversation_manager,
         )
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         if self._config.get("enabled", False):
@@ -123,7 +114,7 @@ class UserContextBridgePlugin(Star):
         while True:
             await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
             try:
-                self._ledger.heartbeat_lease(self._lease_id)
+                self._ledger.heartbeat_lease(self._lease_id, self._lease_token)
             except Exception:  # noqa: BLE001
                 logger.warning("uctx 租约心跳失败", exc_info=True)
 
@@ -140,7 +131,7 @@ class UserContextBridgePlugin(Star):
             if finalized:
                 logger.info(f"uctx 卸载：{finalized} 个未决轮次标记为 interrupted")
         try:
-            self._ledger.release_lease(self._lease_id)
+            self._ledger.release_lease(self._lease_id, self._lease_token or "")
         except Exception:  # noqa: BLE001
             pass
         self._ledger.close()
@@ -232,3 +223,72 @@ class UserContextBridgePlugin(Star):
             event.set_result(
                 MessageEventResult().message(self._commands.scope())
             )
+
+    # -- 原生 /reset、/new 联动（R7，ADR-008 修订） ------------------------
+    # 语义：宿主命令正常执行（本插件不拦截、不覆盖宿主回复）；当发送者的
+    # 共享身份在启用范围内时，同步切换该身份的共享历史 epoch，使
+    # 「/reset、/new 重置当前窗口」对共享历史同步生效。权限镜像宿主
+    # builtin reset 的判定（scene + alter_cmd + role + 会话存在），
+    # 宿主会拒绝的场景不联动，避免越权清空共享历史。
+    @filter.command("reset")
+    async def native_reset_sync(self, event: AstrMessageEvent):
+        await self._sync_native_reset_like(event, require_permission=True)
+
+    @filter.command("new")
+    async def native_new_sync(self, event: AstrMessageEvent):
+        # 宿主 /new 无权限门槛，仅要求共享身份在范围内
+        await self._sync_native_reset_like(event, require_permission=False)
+
+    async def _sync_native_reset_like(
+        self, event: AstrMessageEvent, *, require_permission: bool
+    ) -> None:
+        if self._commands is None or not self._sharing_active:
+            return
+        try:
+            identity = await self._commands._identity(event)
+            # 仅当本人共享身份当前实际生效（窗口范围 + 未退出）时联动。
+            # 注意不能用对话轮次的 evaluate：命令消息本身被其排除。
+            if not self._commands._window_in_scope(event):
+                return
+            if self._membership is not None and self._membership.is_opted_out(identity):
+                return
+            if require_permission and not await self._host_reset_would_run(event):
+                return
+            self._ledger.bump_epoch(identity.key)
+            await event.send(
+                MessageChain().message(
+                    "🧹 已同步清空你的跨窗口共享历史（原生 reset/new 联动；"
+                    "仅影响你本人）。"
+                )
+            )
+        except Exception:  # noqa: BLE001 - 联动失败不影响宿主命令
+            logger.warning("uctx 原生命令联动失败", exc_info=True)
+
+    async def _host_reset_would_run(self, event: AstrMessageEvent) -> bool:
+        """镜像宿主 builtin /reset 的执行条件（两版逻辑一致）。
+
+        返回 False 表示宿主将拒绝执行（权限不足 / 无会话），此时不联动。
+        """
+
+        cfg = self.context.get_config(umo=event.unified_msg_origin)
+        is_unique_session = cfg["platform_settings"]["unique_session"]
+        is_group = bool(event.get_group_id())
+        if is_group:
+            scene_key = (
+                "group_unique_on" if is_unique_session else "group_unique_off"
+            )
+        else:
+            scene_key = "private"
+        default_perm = "admin" if is_group and not is_unique_session else "member"
+        alter_cmd_cfg = await sp.get_async("global", "global", "alter_cmd", {})
+        required_perm = (
+            alter_cmd_cfg.get("astrbot", {}).get("reset", {}).get(
+                scene_key, default_perm
+            )
+        )
+        if required_perm == "admin" and event.role != "admin":
+            return False
+        cid = await self.context.conversation_manager.get_curr_conversation_id(
+            event.unified_msg_origin
+        )
+        return bool(cid)
