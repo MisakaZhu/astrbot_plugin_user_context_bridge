@@ -2,7 +2,7 @@
 
 维护规则：每阶段记录当前提交、实际改动、验证命令与结果、失败项、下一步。证据必须对应提交。
 
-## 当前阶段：P1 / MIS-137（准备开始）
+## 当前阶段：P7 / MIS-143（交付打包）→ 本地候选完成，待 Codex 独立验收
 
 ### P0 / MIS-136 已完成（In Review）
 
@@ -28,19 +28,36 @@ PYTHONPATH=. <venv428>/Scripts/python.exe tests/p0_lifecycle_check.py
 PYTHONPATH=. <venv426>/Scripts/python.exe tests/p0_lifecycle_check.py
 ```
 
-### P1 待办
+### P1-P6 已完成
 
-- [ ] 身份模块（platform_id, self_id, persona_scope, sender_id；默认人格稳定常量；persona_manager 解析复用宿主同参调用）
-- [ ] 范围模块（显式启用、群号白名单+私聊开关、默认关闭；个人开关不扩大范围）
-- [ ] 归属判定（真实 sender、排除未唤醒闲聊/机器人自言/管理命令；UMO 不变）
-- [ ] A03-A06 场景测试
+- P1（MIS-137）`ffeec5d`：身份/范围/归属，35/35。
+- P2（MIS-138）`bcec73d`：SQLite 轮次账本（去重/顺序/epoch/重启恢复/双实例防护），27/27。
+- P3（MIS-139）`dd650e7`：完整闭环（读侧接管 + 写侧三轨 + 原窗口回复），19/19。
+- P4（MIS-140）`414b7a3`：跨窗口并发/异常取消/清空竞态/发送状态，21/21。
+- P5（MIS-141）`a389f3a`：/uctx 命令组、停用重载语义、插件共存（ADR-008 原生命令边界），16/16。
+- P6（MIS-142）`d9d55e9`：A01-A18 验收映射 + 打包/隐私验证，8/8。
+
+测试统计：七套 × 两版宿主（4.26.0/4.28.0）各 151 项断言全部通过。复现命令见 docs/ACCEPTANCE.md。
+
+### P7 待办
+
+- [x] README/CHANGELOG/HANDOFF/STATUS 更新
+- [x] 可安装 ZIP + SHA-256（release/ 忽略目录，不入库）
+- [x] Git 与 ZIP 清单终审
+- [ ] 最终提交与交付报告（MIS-143 In Review）
 
 ### 下一步
 
-P1（MIS-137）实现与测试；Linear 同步。
+Codex 独立验收（MIS-144）；用户实机验证（MIS-145）。
 
 ## 阶段历史
 
 | 阶段 | 提交 | 结果 |
 | --- | --- | --- |
-| P0 / MIS-136 | 1c080d1 | 双版本 17/17 PASS；MIS-136 In Review |
+| P0 / MIS-136 | 1c080d1 | 双版本 17/17 PASS；In Review |
+| P1 / MIS-137 | ffeec5d | 双版本 35/35 PASS；In Review |
+| P2 / MIS-138 | bcec73d | 双版本 27/27 PASS；In Review |
+| P3 / MIS-139 | dd650e7 | 双版本 19/19 PASS；In Review |
+| P4 / MIS-140 | 414b7a3 | 双版本 21/21 PASS；In Review |
+| P5 / MIS-141 | a389f3a | 双版本 16/16 PASS；In Review |
+| P6 / MIS-142 | d9d55e9 | 双版本 8/8 PASS；In Review |
