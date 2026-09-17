@@ -160,3 +160,12 @@ class UserContextBridgePlugin(Star):
             await self._bridge.handle_decorating_result(event)
         except Exception:  # noqa: BLE001
             logger.error("uctx on_decorating_result 处理失败", exc_info=True)
+
+    @filter.after_message_sent()
+    async def on_after_message_sent(self, event: AstrMessageEvent):
+        if self._bridge is None:
+            return
+        try:
+            await self._bridge.handle_after_message_sent(event)
+        except Exception:  # noqa: BLE001
+            logger.warning("uctx on_after_message_sent 处理失败", exc_info=True)

@@ -87,10 +87,14 @@ def register_bridge(bridge: ContextBridge) -> list[StarHandlerMetadata]:
     async def on_decorating_result(event):
         await bridge.handle_decorating_result(event)
 
+    async def on_after_message_sent(event):
+        await bridge.handle_after_message_sent(event)
+
     for evt, handler, hname in (
         (EventType.OnLLMRequestEvent, on_llm_request, "on_llm_request"),
         (EventType.OnAgentDoneEvent, on_agent_done, "on_agent_done"),
         (EventType.OnDecoratingResultEvent, on_decorating_result, "on_decorating_result"),
+        (EventType.OnAfterMessageSentEvent, on_after_message_sent, "on_after_message_sent"),
     ):
         meta = StarHandlerMetadata(
             event_type=evt,
@@ -187,7 +191,7 @@ def ctx_texts(provider: FakeProvider, call_idx: int) -> list[str]:
 
 async def scenario_cross_window() -> None:
     """A01/A02/A03(闭环)/A15/短路：群A→群B→私聊→群A，另一用户隔离。"""
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         ledger = TurnLedger(Path(td) / "l.db")
         ledger.open()
         membership = MembershipStore(Path(td) / "membership.json")
@@ -387,7 +391,7 @@ def count_completed(ledger: TurnLedger, identity_key: str) -> int:
 
 async def scenario_out_of_scope_control() -> None:
     """范围外来源：宿主原生行为（写回原窗口），bridge 不采集。"""
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         ledger = TurnLedger(Path(td) / "l.db")
         ledger.open()
         resolver = ScopeResolver(
@@ -439,7 +443,7 @@ async def scenario_out_of_scope_control() -> None:
 
 async def scenario_multimodal_and_persona() -> None:
     """A14：多模态占位；A15：system_prompt 人格保留。"""
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         ledger = TurnLedger(Path(td) / "l.db")
         ledger.open()
         resolver = ScopeResolver(

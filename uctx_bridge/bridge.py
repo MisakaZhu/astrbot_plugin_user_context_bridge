@@ -385,6 +385,15 @@ class ContextBridge:
         finally:
             self._pending.pop(pending.event_key, None)
 
+    async def handle_after_message_sent(self, event: AstrMessageEvent) -> None:
+        """发送成功标记（发送失败/未确认时该钩子不触发，send_state 保持 NULL）。"""
+
+        event_key = self.event_key_for(event)
+        try:
+            self._ledger.mark_turn_sent(event_key)
+        except Exception:  # noqa: BLE001
+            self._warn("uctx 发送状态标记失败")
+
     # -- 兜底 -------------------------------------------------------------
     def finalize_pending_as_interrupted(self) -> int:
         """插件卸载/重载时：未决轮次 → interrupted（可恢复，不伪成功）。"""

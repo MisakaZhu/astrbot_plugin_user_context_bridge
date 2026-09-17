@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS turns (
     user_message TEXT NOT NULL,
     trajectory TEXT,
     reply_text TEXT,
+    send_state TEXT,
     lease_id TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
@@ -194,6 +195,10 @@ class TurnLedger:
     def close(self) -> None:
         with self._lock:
             if self._conn is not None:
+                try:
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:  # noqa: BLE001 - 尽力释放 WAL 文件
+                    pass
                 self._conn.close()
                 self._conn = None
 
@@ -310,8 +315,8 @@ class TurnLedger:
                 conn.execute(
                     "INSERT INTO turns (identity_key, epoch, seq, event_key, status,"
                     " source_type, source_id, umo, user_message, trajectory, reply_text,"
-                    " lease_id, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,?,?)",
+                    " send_state, lease_id, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,?,?)",
                     (
                         identity_key,
                         epoch,
@@ -403,6 +408,22 @@ class TurnLedger:
                 ).fetchone()
                 conn.execute("COMMIT")
                 return self._row_to_record(updated)
+            except Exception:
+                self._rollback(conn)
+                raise
+
+    def mark_turn_sent(self, event_key: str) -> bool:
+        """发送成功标记（OnAfterMessageSentEvent）。NULL=未确认/发送失败可识别。"""
+
+        with self._lock:
+            conn = self._tx()
+            try:
+                cur = conn.execute(
+                    "UPDATE turns SET send_state='sent', updated_at=? WHERE event_key=?",
+                    (time.time(), event_key),
+                )
+                conn.execute("COMMIT")
+                return cur.rowcount > 0
             except Exception:
                 self._rollback(conn)
                 raise
