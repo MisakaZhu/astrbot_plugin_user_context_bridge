@@ -106,7 +106,7 @@ ADR-004 v2 / ADR-009 / ADR-010）：
 
 ## 三次验收返工（2026-09-17，Codex 三次验收报告 08）
 
-基线 169a88a 三次验收 T1~T6 返工完成（ADR-012）：
+基线 169a88a 三次验收 T1~T6 返工完成（ADR-012；实现提交 5f662d0，ACCEPTANCE v4 补充提交 e0c95dd）：
 
 - **T1**：resolve_persona_scope 增加 provider_settings 参数（4.26 默认人格隔离修复）；bridge/commands 经 getter 注入宿主 provider_settings；解析失败抛 PersonaResolutionError（对话轮受控跳过、命令报错，不折叠 __default__）；开场白同一 resolver 同一参数。真实 PersonaManager + ConversationManager + `_get_session_conv` 新会话路径两版验证（t1_persona_worker：不同默认人格身份隔离、B 不含 A 历史、B 保留自身开场白、显式会话人格跟随、失败受控）。
 - **T2**：pending/watchdog 登记提前到锁后可等待点之前；CancelledError 分支收尾 interrupted + 停止传播 + 释放锁（t_rework T2：取消轮 0 模型调用、0 输出、事件终止、轮次 interrupted、锁释放、后继轮完成）。
