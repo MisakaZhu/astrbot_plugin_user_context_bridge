@@ -168,3 +168,39 @@ on_decorating_result 不能作为整轮提交点）**：
 - **V2a 真实恢复链回归**：删除旧 `_recovery_check`（独立栈直接 bump_epoch 的替代验证），改为 worker 的 `new-without-provider-then-recovery` 场景——同一命令事件、同一账本，无 provider 原生 new 成功联动清空后恢复 provider，再以真实 Runner/调度链跑新轮，断言旧问答不回灌。
 - **V2b 故障注入实调父测试**：`local_evidence/fault_inject_check.py` monkeypatch `tests.s_rework_check._run_s6_worker` 返回伪造字段，在子进程中实际调用父测试 `s6_plugin_lifecycle`——正常数据 16 PASS；10 个关键字段逐个置 false 各自触发对应两版分组失败（每字段 2 FAIL）；全 false 对照 8 FAIL/8 PASS。不再复制断言表达式。
 - **V2c**：U1 排队取消断言的受控分支检查改查当前事件 `b`（原误用前一场景的 `ev`）。
+
+## ADR-015：0.7.0 跨人格共享与本地只读记录
+
+### A15-1 共享模式与身份键（模式/当前人格分离）
+
+- 新配置 `history_scope`：`persona`（默认，0.6.0 兼容）| `user`（跨人格）。非法值保守回退 `persona` 并输出可见警告，不得静默扩大共享范围。
+- **共享键**（identity.key， 分隔四段 platformselfscopesender）：
+  - persona 模式：沿用 0.6.0 原键（scope=真实人格 ID），旧库数据零迁移即可接续；
+  - user 模式：scope 段使用保留字面量 `__mode_user__`——第三段是模式标记而非人格名，与任何真实人格 ID 结构可区分；文档声明 `__mode_user__`（双下划线保留样式）为保留名，宿主自身内部人格亦不使用此名。
+- **当前人格仍走宿主真实解析**（resolve_selected_persona，含 provider_settings 同参）：persona 模式解析结果即共享 scope；user 模式解析结果只作为**源人格元数据**（turns.source_persona）与诊断显示，不进共享键。解析失败两种模式都受控跳过接管（不绕过当前人格初始化）。
+- 每轮入库记录实际人格：turns 新增列 `source_persona`（旧库迁移时从旧 identity_key 第三段还原，无法还原标 `__unknown__`，不伪造 user/伪人格名）。
+
+### A15-2 模式代次与升级迁移
+
+- meta 表新增 `schema_version`（缺失视为 1=0.6.0 结构）与每基础身份的 `mode_generation`。turns 新增列 `mode_generation`（迁移默认 0）。
+- 有效历史 = `mode_generation == 当前代次 AND status='completed'`；`mode_generation < 当前代次` 即归档（可显式查询，不回灌）。
+- 首次升级保持 persona 模式：不迁移数据语义，仅打 schema_version=2、补列默认值、按需设置 mode_generation=0——旧有效问答/epoch/退出状态不变，升级不是隐式清空。
+- **显式切换 persona↔user**：当前基础身份的 `mode_generation += 1`（一个事务内完成），旧代次记录全部变归档，新模式从空历史开始；切回再 +1，不复活旧分区。仅 reload 同配置/重启/正常人格轮换不触发。
+- 迁移安全性：修改前复制数据库到 `backups/pre-migrate-v2-<时间戳>.db`（含 WAL checkpoint）；DDL+数据变更在单个 IMMEDIATE 事务内，失败回滚并保留备份；重复执行以 schema_version 幂等跳过；损坏输入（非 SQLite/缺表）报错不写。
+
+### A15-3 退出状态继承（MembershipStore v2）
+
+membership.json 增加 `base_protected`（基础身份键 platformselfsender 列表）与 `persona_on`（persona 键列表），旧文件仅有 `optout` 时按空集合兼容读取。
+
+- persona→user：该基础身份存在任何仍生效 persona 退出 → 合并后 user 键保持退出，直到主动 on。
+- user→persona：user 退出 → 写入 base_protected（覆盖现有人格与未来新人格）；某人格 on 解除该人格保护（persona_on），不动其他人格保护。
+- 判定顺序（persona 模式）：persona 键 optout → 退出；否则 base ∈ base_protected 且 persona 键 ∉ persona_on → 退出；否则共享。
+- 模式切换不得绕过个人退出（切换前退出，切换后仍退出）。管理员范围仍是上限。
+
+### A15-4 本地只读记录入口（tools/uctx_records.py）
+
+- 独立 CLI（list / export-html / export-json），随安装 ZIP 交付；不导入 main、不注册 handler、不取写租约、不建表/迁移/恢复 running/改 epoch。
+- 只读连接：SQLite `mode=ro` URI（可读活跃 WAL，不无视它）；`schema_version` 检查与轮次读取在同一连接同一事务快照内，导出不混合两个时点。
+- 默认只出当前代次 completed；归档/failed/aborted/interrupted 需显式选择并标注状态。有界结果+显式截断标记；时间边界起点含、终点不含，时区必须显式。
+- 原文按不可信 HTML 转义，无外部资源/CDN/脚本执行聊天内容；工具调用保持配对，媒体只显示占位。JSON 顶层 schema_version/exported_at/筛选/截断/records，每轮含 record_id/身份/源人格/来源/时间/代次/状态/消息/工具配对。
+- 输出先写临时文件再原子 rename；拒绝输出路径指向源库/WAL/SHM/备份；默认导出到插件数据目录 exports/，不入 Git/ZIP。
