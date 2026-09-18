@@ -76,7 +76,8 @@ OUT: dict = {}
 
 
 async def scenario(name, *, disabled=False, renamed=False, filtered=False,
-                   cmd="reset", provider=True, prefix=False):
+                   cmd="reset", provider=True, prefix=False, follower=False,
+                   recover=False):
     state_dir = ROOT / ("s-" + name)
     state_dir.mkdir(parents=True, exist_ok=True)
     bridge, resolver, membership, ledger = make_bridge_stack(str(state_dir))
@@ -146,6 +147,49 @@ async def scenario(name, *, disabled=False, renamed=False, filtered=False,
                             f.custom_filter_list.append(
                                 SimpleNamespace(filter=lambda event, cfg: False)
                             )
+        followers = []
+        follow_obs = {}
+        follower_ready = asyncio.Event()
+        follower_release = asyncio.Event()
+        if follower:
+            from astrbot.core.star.star_handler import StarHandlerMetadata, EventType
+            from astrbot.core.star.star import StarMetadata
+            from astrbot.core.message.message_event_result import MessageEventResult
+            from tests.r_rework_check import identity_of as _ident_of
+
+            async def after_command_notice(ev):
+                follow_obs["epoch_after_native"] = ledger.current_epoch(
+                    _ident_of("10001")
+                )
+                follow_obs["history_after_native"] = len(
+                    ledger.load_history(_ident_of("10001"))
+                )
+                follower_ready.set()
+                await follower_release.wait()
+                ev.set_result(
+                    MessageEventResult().message("OBSERVER-FOLLOWUP-NOTICE")
+                )
+
+            for registered in star_handlers_registry._handlers:
+                if not hasattr(registered, "extras_configs"):
+                    registered.extras_configs = {}
+            obs_module = "uctx_t5_observer"
+            star_map[obs_module] = StarMetadata(name=obs_module, activated=True)
+            obs_meta = StarHandlerMetadata(
+                event_type=EventType.AdapterMessageEvent,
+                handler_full_name=obs_module + "_notice",
+                handler_name="notice",
+                handler_module_path=obs_module,
+                handler=after_command_notice,
+                event_filters=[],
+                extras_configs={"priority": -10},
+            )
+            obs_meta.event_filters = [CommandFilter(cmd, handler_md=obs_meta)]
+            star_handlers_registry._handlers.append(obs_meta)
+            star_handlers_registry.star_handlers_map[
+                obs_meta.handler_full_name
+            ] = obs_meta
+            followers.append(obs_meta)
         event = FakeEvent(
             sender_id="10001", group_id="700000001", role="admin",
             message_str="/" + cmd,
@@ -262,7 +306,88 @@ async def scenario(name, *, disabled=False, renamed=False, filtered=False,
             scheduler.ctx = dctx
             scheduler.stages = [starstage, decorator, Transport()]
             try:
-                await scheduler._process_stages(event)
+                if follower:
+                    # V1 反例：命令任务挂起于后置通知屏障期间，同身份
+                    # 另一群完成新问答；放行后观测 epoch/历史/提示次数。
+                    from tests.harness import drive_pipeline
+
+                    command_task = asyncio.create_task(
+                        scheduler._process_stages(event)
+                    )
+                    try:
+                        await asyncio.wait_for(follower_ready.wait(), 5)
+                        for meta in metas:
+                            meta.enabled = True
+                        follow_event = FakeEvent(
+                            sender_id="10001",
+                            group_id="700000002",
+                            message_str="AFTER-RESET-QUESTION",
+                        )
+                        follow_provider = FakeProvider(["AFTER-RESET-ANSWER"])
+                        follow_obs["command_waiting_during_new_turn"] = (
+                            not command_task.done()
+                        )
+                        follow_obs["new_turn_result"] = await asyncio.wait_for(
+                            drive_pipeline(
+                                bridge,
+                                follow_event,
+                                follow_provider,
+                                prompt=follow_event.message_str,
+                            ),
+                            5,
+                        )
+                        follow_obs["new_turn_model_calls"] = len(
+                            follow_provider.call_log
+                        )
+                        follow_obs["history_before_notice"] = len(
+                            ledger.load_history(identity.key)
+                        )
+                    finally:
+                        for meta in metas:
+                            meta.enabled = False
+                        follower_release.set()
+                    await asyncio.wait_for(command_task, 5)
+                else:
+                    await scheduler._process_stages(event)
+                    if recover:
+                        # V2a 真实恢复链：从本命令事件/账本继续，恢复
+                        # provider 后跑真实新轮——不直接 bump_epoch。
+                        from tests.harness import drive_pipeline
+
+                        prov_rec = FakeProvider(["RECOVERY-ANSWER"])
+                        provider_manager.get_using_provider_async = AsyncMock(
+                            return_value=prov_rec
+                        )
+                        provider_manager.get_using_provider = (
+                            lambda **kw: prov_rec
+                        )
+                        for meta in metas:
+                            meta.enabled = True
+                        after_ev = FakeEvent(
+                            sender_id="10001",
+                            group_id="700000002",
+                            message_str="RECOVERY-QUESTION",
+                        )
+                        await drive_pipeline(
+                            bridge, after_ev, prov_rec, prompt=after_ev.message_str
+                        )
+                        after_ctx = (
+                            json.dumps(
+                                prov_rec.call_log[0]["contexts"],
+                                ensure_ascii=False,
+                            )
+                            if prov_rec.call_log
+                            else ""
+                        )
+                        follow_obs["recovery_old_leak"] = (
+                            "SYNTHETIC-BEFORE-COMMAND" in after_ctx
+                            or "SYNTHETIC-ANSWER" in after_ctx
+                        )
+                        follow_obs["recovery_new_present"] = (
+                            "RECOVERY-QUESTION" in after_ctx
+                        )
+                        for meta in metas:
+                            meta.enabled = False
             finally:
                 for meta in added:
                     star_handlers_registry._handlers.remove(meta)
@@ -272,6 +397,12 @@ async def scenario(name, *, disabled=False, renamed=False, filtered=False,
                 smap_local.pop(module_name, None)
         OUT[name] = dict(
             builtin_activated=active,
+            follow_observations=follow_obs,
+            epoch_delta=ledger.current_epoch(identity.key) - old_epoch,
+            notify_count=sum(
+                "跨窗口共享历史" in (c.get_plain_text() or "")
+                for c in event.sent_chains
+            ),
             real_context_has_async_provider=hasattr(
                 context, "get_using_provider_async"
             ),
@@ -288,38 +419,12 @@ async def scenario(name, *, disabled=False, renamed=False, filtered=False,
             clean_marked=event.get_extra("_clean_group_context_session"),
         )
     finally:
-        bridge.shutdown()
-        cleanup(metas)
-        ledger.close()
-
-
-async def _recovery_check() -> dict:
-    """U2：new-without-provider 联动清空后，恢复 provider 的新轮不含旧历史。"""
-
-    state_dir = ROOT / "s-recovery"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    bridge, resolver, membership, ledger = make_bridge_stack(str(state_dir))
-    metas = register_bridge(bridge)
-    try:
-        from tests.r_rework_check import identity_of
-        from tests.harness import drive_pipeline
-
-        ev = FakeEvent(sender_id="10001", group_id="700000001", message_str="旧轮")
-        await drive_pipeline(bridge, ev, FakeProvider(["旧答"]), prompt="旧轮")
-        ledger.bump_epoch(identity_of("10001"))  # 模拟 new 联动清空
-        p_new = FakeProvider(["恢复后答"])
-        ev2 = FakeEvent(sender_id="10001", group_id="700000001", message_str="恢复轮")
-        await drive_pipeline(bridge, ev2, p_new, prompt="恢复轮")
-        ctx = (
-            json.dumps(p_new.call_log[0]["contexts"], ensure_ascii=False)
-            if p_new.call_log
-            else ""
-        )
-        return {
-            "old_leak": "旧轮" in ctx or "旧答" in ctx,
-            "new_turn_present": "恢复轮" in ctx,
-        }
-    finally:
+        for meta in followers:
+            star_handlers_registry._handlers.remove(meta)
+            star_handlers_registry.star_handlers_map.pop(
+                meta.handler_full_name, None
+            )
+        star_map.pop("uctx_t5_observer", None)
         bridge.shutdown()
         cleanup(metas)
         ledger.close()
@@ -336,8 +441,22 @@ async def main() -> int:
     await scenario("new-with-provider", cmd="new")
     await scenario("new-without-provider", cmd="new", provider=False)
     await scenario("reset-prefix-decorator", prefix=True)
-    # U2：恢复 provider 后下一轮不得读回已清旧共享历史（new-without 联动后）
-    OUT["recovery_no_backfill_after_new"] = await _recovery_check()
+    await scenario("reset-two-handlers", follower=True)
+    await scenario("new-two-handlers", cmd="new", follower=True)
+    # V2a 真实恢复链：无 provider 原生 new 成功联动清空后，恢复 provider
+    # 跑真实新轮——同一命令事件、同一账本，不直接 bump_epoch
+    await scenario(
+        "new-without-provider-then-recovery", cmd="new", provider=False,
+        recover=True,
+    )
+    OUT["recovery_no_backfill_after_new"] = {
+        "old_leak": OUT["new-without-provider-then-recovery"]
+        .get("follow_observations", {})
+        .get("recovery_old_leak"),
+        "new_turn_present": OUT["new-without-provider-then-recovery"]
+        .get("follow_observations", {})
+        .get("recovery_new_present"),
+    }
     print("@@RESULT@@" + json.dumps(OUT, ensure_ascii=False))
     return 0
 

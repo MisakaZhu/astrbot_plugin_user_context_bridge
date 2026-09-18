@@ -32,7 +32,7 @@ _HEARTBEAT_INTERVAL_SECONDS = 60.0
     "astrbot_plugin_user_context_bridge",
     "Ewnscat-ya",
     "同一用户跨会话上下文共享（群聊/私聊连续真实对话历史）",
-    "0.5.0",
+    "0.6.0",
 )
 class UserContextBridgePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -257,12 +257,25 @@ class UserContextBridgePlugin(Star):
     #   startswith，前置装饰钩子加前缀即漏清）。
     # 满足双证据即联动，防御按命令真实语义区分（U2）：reset 成功必有
     # provider，保留 provider+会话复核；new 不要求 provider，只复核会话。
+    # V1（一次性应用）：宿主标记在本事件内持久（after_message_sent 仍要
+    # 读），同一事件的多次装饰（同事件的多个处理器各自回复时都会进入
+    # 装饰阶段）不得重复清空——用插件私有的 applied 状态去重：判定成功
+    # 后**先原子认领**（同步设置本 extra 再做任何 await），之后同一事件
+    # 的后续装饰直接跳过；清空已提交后即使提示发送失败也不会回到可再次
+    # 清空的状态；新命令是新事件，天然不受影响。
     _BUILTIN_COMMANDS_MODULE_PREFIX = "astrbot.builtin_stars.builtin_commands"
     _CLEAN_SESSION_EXTRA = "_clean_group_context_session"
+    _NATIVE_SYNC_APPLIED_EXTRA = "_uctx_native_sync_applied"
 
     def _native_reset_executed(self, event: AstrMessageEvent) -> str | None:
-        """返回本事件实际执行成功的 builtin 命令名（"reset"/"new_conv"）。"""
+        """返回本事件实际执行成功的 builtin 命令名（"reset"/"new_conv"）。
 
+        尚未应用过联动时才返回命令名；已应用（本事件任意装饰阶段认领
+        过）返回 None——同一成功只关联一次（V1）。
+        """
+
+        if event.get_extra(self._NATIVE_SYNC_APPLIED_EXTRA) is True:
+            return None
         activated = event.get_extra("activated_handlers") or []
         for h in activated:
             if (
@@ -282,6 +295,11 @@ class UserContextBridgePlugin(Star):
             command = self._native_reset_executed(event)
             if command is None:
                 return
+            # V1：同步原子认领——在任何后续 await（防御复核/身份解析/
+            # 发送）之前标记本事件已应用，防止异步检查期间另一装饰阶段
+            # 重复认领。即使后续防御不通过或提示发送失败，本事件也不会
+            # 再次触发清空（保守方向：宁可少清，不可重复清）。
+            event.set_extra(self._NATIVE_SYNC_APPLIED_EXTRA, True)
             # 防御性复核（U2 按命令语义）：reset 成功必有 provider；
             # new 不要求 provider（宿主无此检查），只复核当前会话存在。
             if command == "reset":

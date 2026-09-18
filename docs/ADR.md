@@ -161,3 +161,10 @@ on_decorating_result 不能作为整轮提交点）**：
 - **U2 new/reset 分命令成功语义**：宿主 `/new` 不要求 provider 即可成功创建会话；防御复核按命令区分——reset 保留 provider+会话复核（成功必有 provider），new 只复核会话存在。恢复 provider 后下一轮经 epoch 机制不读回已清旧历史。
 - **U3 结构化成功事实（ADR-010 v3）**：成功判定改为宿主 builtin 在本地会话 reset 清空/new_conversation 创建成功的**末尾设置的结构化标记** `event.extra["_clean_group_context_session"]=True`（两版 builtin conversation.py 字面量一致；权限拒绝/无 provider/第三方执行器分支均不设置；消费者为宿主 group_chat_context 清理）。布尔 extra 不受其他插件的文本装饰改写（此前依赖成功文案 startswith，前置装饰钩子加前缀即漏清）。保留 activated_handlers 结构化激活证据作为第一证据。
 - **U4 测试有效性**：harness 的 `trace` 初始化提前至 hook 调用前（原 stopped 分支 UnboundLocalError 被吞）；取消场景的 `gather(return_exceptions=True)` 结果纳入断言（非 CancelledError 且非受控 stopped-dict 的异常暴露为失败）；T2 登记前取消断言收紧（停止/0 模型/0 输出/无锁泄漏）；S6 worker 的 T3 生命周期关键字段（活动轮停止/无迟到、排队干净让出、恢复正常、无回灌、卸载清理）进入父测试 4 组断言，故障注入验证全部按预期失败。
+
+## ADR-014：五次验收 V1/V2 修复
+
+- **V1 一次性成功关联（ADR-010 v4）**：宿主结构化标记 `_clean_group_context_session` 持久于本事件（宿主 after_message_sent 亦消费），同一事件的多个处理器各自回复时都会再次进入装饰阶段——"双证据"只能证明命令曾成功，不能保证只关联一次。修复：插件私有的 applied 状态（event extra `_uctx_native_sync_applied`）——判定成功后**同步原子认领**（在任何 await 之前设置），之后同一事件的后续装饰直接跳过；清空已提交后即使提示发送失败也不会回到可再次清空的状态；新命令是新事件（extras 独立），天然不受影响。不修改宿主标记本身。
+- **V2a 真实恢复链回归**：删除旧 `_recovery_check`（独立栈直接 bump_epoch 的替代验证），改为 worker 的 `new-without-provider-then-recovery` 场景——同一命令事件、同一账本，无 provider 原生 new 成功联动清空后恢复 provider，再以真实 Runner/调度链跑新轮，断言旧问答不回灌。
+- **V2b 故障注入实调父测试**：`local_evidence/fault_inject_check.py` monkeypatch `tests.s_rework_check._run_s6_worker` 返回伪造字段，在子进程中实际调用父测试 `s6_plugin_lifecycle`——正常数据 16 PASS；10 个关键字段逐个置 false 各自触发对应两版分组失败（每字段 2 FAIL）；全 false 对照 8 FAIL/8 PASS。不再复制断言表达式。
+- **V2c**：U1 排队取消断言的受控分支检查改查当前事件 `b`（原误用前一场景的 `ev`）。

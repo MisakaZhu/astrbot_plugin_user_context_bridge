@@ -648,43 +648,53 @@ async def s5_native_reset() -> None:
             ledger.close()
 
 
-def s6_plugin_lifecycle() -> None:
-    """S6：真实 PluginManager 隔离实例生命周期（子进程，双版本）。"""
+def _run_s6_worker(venv, td):
+    """运行 S6 worker 并返回解析结果（None 表示失败）。可被测试替身替换。"""
 
     import shutil
     import tempfile
 
     worker = str(Path(__file__).resolve().parent / "s6_plugin_lifecycle_worker.py")
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    r = subprocess.run(
+        [venv + r"\Scripts\python.exe", worker, td],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(Path(__file__).resolve().parent.parent),
+        timeout=180,
+    )
+    line = next(
+        (l for l in r.stdout.splitlines() if l.startswith("@@RESULT@@")),
+        None,
+    )
+    if line is None:
+        return {"__error__": (r.stderr or r.stdout)[-400:]}
+    return json.loads(line[len("@@RESULT@@") :])
+
+
+def s6_plugin_lifecycle() -> None:
+    """S6：真实 PluginManager 隔离实例生命周期（子进程，双版本）。"""
+
+    import tempfile
+
     for venv in (
         r"D:\第三方插件完善\.venv",
         r"D:\第三方插件完善\.venv426",
     ):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            env = dict(os.environ)
-            env["PYTHONDONTWRITEBYTECODE"] = "1"
-            env["PYTHONIOENCODING"] = "utf-8"
-            env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
-            r = subprocess.run(
-                [venv + r"\Scripts\python.exe", worker, td],
-                capture_output=True,
-                text=True,
-                env=env,
-                cwd=str(Path(__file__).resolve().parent.parent),
-                timeout=180,
-            )
-            line = next(
-                (l for l in r.stdout.splitlines() if l.startswith("@@RESULT@@")),
-                None,
-            )
+            out = _run_s6_worker(venv, td)
             tag = Path(venv).name
-            if line is None:
+            if "__error__" in out:
                 check(
                     f"S6.{tag}.lifecycle",
                     False,
-                    (r.stderr or r.stdout)[-400:],
+                    out["__error__"],
                 )
                 continue
-            out = json.loads(line[len("@@RESULT@@") :])
             check(
                 f"S6.{tag}.load",
                 out.get("load_ok")

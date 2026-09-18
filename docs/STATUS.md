@@ -2,7 +2,7 @@
 
 维护规则：每阶段记录当前提交、实际改动、验证命令与结果、失败项、下一步。证据必须对应提交。
 
-## 当前阶段：U1~U4 四次返工（基线 0a915d3）→ 0.5.0 候选完成，待 Codex 复验
+## 当前阶段：V1/V2 五次返工（基线 06d5598）→ 0.6.0 候选完成，待 Codex 复验
 
 ### P0 / MIS-136 已完成（In Review）
 
@@ -131,3 +131,14 @@ ADR-004 v2 / ADR-009 / ADR-010）：
 测试统计（日志加总）：10 套 × 4.26.0/4.28.0 各 **290 项断言全部 PASS**
 （P0=17 P1=36 P2=27 P3=19 P4=22 P5=16 P6=8 R=38 S=46 T=61）。
 ACCEPTANCE 校准：handler 数 10、T2 8 项、T5/T6 每版 7 项（矩阵另行对齐）。
+
+
+## 五次验收返工（2026-09-18，Codex 五次验收报告 12）
+
+基线 06d5598 五次验收 V1/V2 返工完成（ADR-014）：
+
+- **V1 一次性成功关联**：`_sync_native_reset_on_success` 判定成功后同步原子认领（event extra `_uctx_native_sync_applied`，任何 await 前设置）——同一事件的后续装饰（同事件多处理器各自回复时再次进入装饰阶段）直接跳过。失败转通过：基线复现探针（local_evidence/v1_baseline_probe.py，基线 main.py 双版）reset/new 两场景 notify=2；修复后 t5 worker follower 场景 epoch_delta=1、notify=1、新问答（屏障期间完成）在放行后保留、再下一轮可读（t: V1.* 4 项/版）。
+- **V2a 真实恢复链**：worker `new-without-provider-then-recovery`（同命令事件同账本，无 provider 原生 new 联动清空 → 恢复 provider → 真实新轮，旧问答不回灌）；删除假 `_recovery_check`。
+- **V2b 故障注入实调父测试**：fault_inject_check monkeypatch `_run_s6_worker` 在子进程实际运行 `s6_plugin_lifecycle`——正常 16 PASS、10 字段逐个 false 各触发（每字段 2 FAIL）、全 false 8 FAIL/8 PASS。
+- **V2c**：U1 排队取消断言 ev→b 笔误修正。
+- **V2d 文档口径**：T2=9（含 cancel-task-controlled）、U1=15（初始 6+排队 9）、A17 handler=10 单口径、删除"固定成功文案"过期描述（ADR-010 历史保留并标后继决策）。

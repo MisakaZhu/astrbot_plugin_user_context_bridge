@@ -256,7 +256,7 @@ async def u1_cancellation_windows() -> None:
                 "U1.queued-cancel-controlled",
                 all(
                     isinstance(o, asyncio.CancelledError)
-                    or (isinstance(o, dict) and ev.is_stopped())
+                    or (isinstance(o, dict) and b.is_stopped())
                     for o in outcomes
                 ),
                 "取消被宿主钩子吞掉后必须走受控 stopped 分支"
@@ -553,6 +553,28 @@ def t1_t5_t6_workers() -> None:
             rec.get("old_leak") is False and rec.get("new_turn_present") is True,
             f"rec={rec}",
         )
+        # V1：一次成功只应用一次（同事件多处理器多次装饰）
+        r2h = out.get("reset-two-handlers", {})
+        n2h = out.get("new-two-handlers", {})
+        for label, scenario in (("reset", r2h), ("new", n2h)):
+            fo = scenario.get("follow_observations", {})
+            check(
+                f"V1.{tag}.{label}-once-only",
+                scenario.get("epoch_delta") == 1
+                and scenario.get("notify_count") == 1
+                and fo.get("history_before_notice") == 2
+                and scenario.get("history_after") == 2
+                and (scenario.get("native_update_calls", 0)
+                     + scenario.get("native_new_calls", 0)) == 1,
+                f"epoch={scenario.get('epoch_delta')} notify={scenario.get('notify_count')} "
+                f"hist_notice={fo.get('history_before_notice')} after={scenario.get('history_after')}",
+            )
+            check(
+                f"V1.{tag}.{label}-new-turn-survives",
+                fo.get("command_waiting_during_new_turn") is True
+                and fo.get("new_turn_model_calls") == 1,
+                f"fo={ {k: v for k, v in fo.items() if k != 'new_turn_result'} }",
+            )
         # U3：结构化成功标记（_clean_group_context_session）替代文本前缀
         pfx = out.get("reset-prefix-decorator", {})
         check(
