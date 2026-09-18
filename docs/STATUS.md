@@ -4,8 +4,8 @@
 
 ## 当前：0.7.0 候选完成（N0-N4 本地开发与自测闭环，待 Codex 独立验收 MIS-170）
 
-- 分支：`feat/0.7.0-persona-records`（基于 main/859f18e）；最终 HEAD 与包哈希见 HANDOFF.md 顶部。
-- 提交链：a560856(N0 基线/ADR-015) → 4ced8a8(N1 迁移/代次/退出继承) → 75b0a26(N2 跨人格请求链/命令/生命周期) → 3d2dbd7(暂停断点文档) → b22f99f(N3 只读记录工具 + 清理 _tmp_m.json 误跟踪) → N4 回归修复与文档候选包（SHA 见 HANDOFF）。
+- 分支：`feat/0.7.0-persona-records`（基于 main/859f18e）；交付提交 `27aadae`，候选包 `astrbot_plugin_user_context_bridge-27aadae.zip`（SHA-256 `fb53a72d692b589b22b5b8402f7f07d72f5d0c485b3444b4121c957643f46497`）。
+- 提交链：a560856(N0 基线/ADR-015) → 4ced8a8(N1 迁移/代次/退出继承) → 75b0a26(N2 跨人格请求链/命令/生命周期) → 3d2dbd7(暂停断点文档) → b22f99f(N3 只读记录工具 + 清理 _tmp_m.json 误跟踪) → 27aadae(N4 回归修复/文档/候选包)。
 - 全量回归：14 套 × 4.26.0/4.28.0 各 **381 项断言全 PASS**（旧 10 套 298 + 新 4 套 83），日志 local_evidence/n4_logs/。
 - N4 修复回归：main.py 给 CommandService 传不存在的 `stats_getter` 导致真实 PluginManager 加载失败（S6 暴露，实例丢弃后租约残留）；修复后 S6 双版 46/46。
 - N3 交付 tools/uctx_records.py（list/export-json/export-html，只读快照）+ tests/n3_records_check.py 50 断言双版全过；HTML 经 Playwright 真实浏览器渲染与搜索交互验证（截图 local_evidence/n3_html/）。

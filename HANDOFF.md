@@ -8,9 +8,9 @@
 
 | 项 | 值 |
 | --- | --- |
-| 交付提交（实现+文档） | 见 `git log`（N4 提交，含 main.py 回归修复/文档/版本 0.7.0） |
-| 候选包 | `release/astrbot_plugin_user_context_bridge-<sha>.zip`（13 文件白名单，含 `tools/uctx_records.py`） |
-| 包 SHA-256 | 见 `release/<包名>.sha256` 与交付报告 |
+| 交付提交（实现+文档） | `27aadae`（N4 提交，含 main.py 回归修复/文档/版本 0.7.0） |
+| 候选包 | `release/astrbot_plugin_user_context_bridge-27aadae.zip`（13 文件白名单，含 `tools/uctx_records.py`） |
+| 包 SHA-256 | `fb53a72d692b589b22b5b8402f7f07d72f5d0c485b3444b4121c957643f46497` |
 | 旧 0.6.0 包 | `release/astrbot_plugin_user_context_bridge-ac51bde.zip`（78e64560…9af）**未触碰** |
 | 全量回归 | 14 套 × 4.26.0/4.28.0 各 **381 项断言全 PASS**（旧 10 套 298 + 新 4 套 83）；日志 `local_evidence/n4_logs/` |
 | 浏览器验证 | `local_evidence/n3_html/render-full.png` / `render-filtered.png`（Playwright/Chromium，控制台 0 错误；Codex 视觉复核待 MIS-170） |
