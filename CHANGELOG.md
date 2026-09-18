@@ -1,5 +1,39 @@
 # 更新日志
 
+## 0.7.0（跨人格共享与本地记录候选，待 Codex 独立验收）
+
+新增（ADR-015）：
+- **可选跨人格共享**：新配置 `history_scope`（`persona` 默认=0.6.0
+  行为；`user`=同一 platform+bot+QQ 用户跨人格共享，每个窗口仍使用
+  该窗口当前人格、系统规则与工具，实际人格仅作记录元数据
+  `source_persona`）。非法配置保守回退 persona 并告警，不静默扩大
+  共享范围。user 模式身份键第三段使用保留字面量 `__mode_user__`。
+- **账本 schema v1→v2 迁移**：turns 增加 `source_persona` /
+  `mode_generation` 列与 `schema_version` 表；升级（保持 persona）
+  不清空、不改语义，迁移前自动备份 `backups/pre-migrate-v2-*`，幂
+  等可重复，损坏输入报错不写（旧库 0.6.0 首次由新版插件启动自动迁
+  移）。
+- **模式代次**：显式切换 persona↔user 时该基础身份
+  `mode_generation +1`（一个事务），新模式从空历史开始，旧记录归档
+  可查不回灌；reload 同配置/重启/正常人格轮换不触发。
+- **退出状态继承**：membership v2（`base_protected`/`persona_on`），
+  persona off → user 仍退出；user 退出 → 保护该用户全部现有人格与
+  未来新人格，单人格 on 只解除该人格；管理员范围仍是上限。
+- **本地只读记录工具** `tools/uctx_records.py`（随安装包交付，纯标
+  准库）：`list` 身份分区元数据 / `export-json` 程序导出 /
+  `export-html` 自包含离线浏览页。`mode=ro` 只读 + 单读事务一致快
+  照；默认仅当前代次 completed，归档/失败/中止/中断需显式选择并标
+  注；时间起点包含、终点不含；上限截断明示；HTML 注入转义、无外部
+  资源、站内搜索；输出路径守卫（拒覆盖源库/WAL/SHM、原子写、失败无
+  半文件）；v1 旧库拒绝并提示先迁移。真实浏览器渲染与搜索交互已在
+  本地 Playwright 验证（截图留证，Codex 视觉复核待 MIS-170）。
+- `/uctx status` 显示当前共享模式；user 模式 reset/new 清空该用户
+  跨人格整份有效历史（persona 模式仅当前人格），原生命令联动语义
+  不变。
+
+测试：新增 n0/n1/n2/n3 四套（9/14/11/50 断言），与旧 10 套合计
+14 套 × 4.26.0/4.28.0 双版全过（逐项计数见 docs/ACCEPTANCE.md）。
+
 ## 0.6.0（五次返工候选，待 Codex 复验）
 
 五次验收（06d5598）V1/V2 返工（ADR-014）：

@@ -1,30 +1,55 @@
 # HANDOFF（交接说明）
 
-## ⚠️ 暂停断点（2026-09-18，0.7.0 开发中途）
+## 0.7.0 候选交付（2026-09-19，待 Codex 独立验收 MIS-170）
 
-**当前 SHA：`75b0a26`，分支 `feat/0.7.0-persona-records`（基于 main/859f18e）。用户要求重启电脑，恢复后从此处继续。**
+**分支 `feat/0.7.0-persona-records`（基于 main/859f18e）。N0-N4 本地开发与自测闭环；未 push、未发布、实机未验证。**
 
-### 已完成
+### 版本与证据对应
 
-- **N0（MIS-165）** 提交 `a560856`，In Review：基线核对、双版 venv 现场确认可用（Python 3.12.10，AstrBot 4.28.0/4.26.0）、ADR-015 落盘、`tests/n0_baseline_check.py` 9/9 双版 PASS。
-- **N1（MIS-166）** 提交 `4ced8a8`，In Review：ledger v1→v2 迁移（migrate_from_v1，备份/幂等/失败回滚）、mode_generation 代次、MembershipStore v2（base_protected/persona_on）、scope user 模式退出继承；`tests/n1_scope_migration_check.py` 13/13 双版 PASS。
-- **N2（MIS-167）** 提交 `75b0a26`，In Review：bridge source_persona、main 装配 history_scope/配置 schema、commands user 模式身份（resolver.history_scope 驱动）、`tests/n2_cross_persona_check.py` 11/11 双版 PASS。
+| 项 | 值 |
+| --- | --- |
+| 交付提交（实现+文档） | 见 `git log`（N4 提交，含 main.py 回归修复/文档/版本 0.7.0） |
+| 候选包 | `release/astrbot_plugin_user_context_bridge-<sha>.zip`（13 文件白名单，含 `tools/uctx_records.py`） |
+| 包 SHA-256 | 见 `release/<包名>.sha256` 与交付报告 |
+| 旧 0.6.0 包 | `release/astrbot_plugin_user_context_bridge-ac51bde.zip`（78e64560…9af）**未触碰** |
+| 全量回归 | 14 套 × 4.26.0/4.28.0 各 **381 项断言全 PASS**（旧 10 套 298 + 新 4 套 83）；日志 `local_evidence/n4_logs/` |
+| 浏览器验证 | `local_evidence/n3_html/render-full.png` / `render-filtered.png`（Playwright/Chromium，控制台 0 错误；Codex 视觉复核待 MIS-170） |
+| N 系列矩阵 | `docs/ACCEPTANCE.md` 0.7.0 节（N01-N23 PASS，N24 待实机） |
 
-### 未完成（N3/N4 刚开始就暂停）
+### N0-N4 摘要
 
-- **N3（MIS-168）**：`tools/uctx_records.py` 已写入第一版但被 Mimosa 拦截（SQL 拼接被标 SQL 注入）。文件在磁盘上但**未 git add**。恢复后需：改用纯参数化查询（status 列表改为固定 CASE 表达式或预构建占位符），通过 Mimosa 后测试 `list`/`export-json`/`export-html` 三条 CLI，再用两版 venv 分别生成合成数据做 HTML/JSON 验证。
-- **N4（MIS-169）**：全量回归、文档同步、0.7.0 候选 ZIP 均未开始。
+- **N0（MIS-165）`a560856`**：基线核对、ADR-015、数据契约快照。
+- **N1（MIS-166）`4ced8a8`**：账本 v1→v2 迁移（备份/幂等/失败回滚）、mode_generation 代次、MembershipStore v2、退出状态继承。
+- **N2（MIS-167）`75b0a26`**：bridge source_persona、main 装配 history_scope、commands user 模式身份、原生命令双模式清空范围。
+- **N3（MIS-168）`b22f99f`**：`tools/uctx_records.py` 只读记录工具（list/export-json/export-html；mode=ro 一致快照；筛选/归档/截断/转义/输出守卫/v1 拒绝）；`tests/n3_records_check.py` 50 断言双版全过；清理误跟踪的 `_tmp_m.json`。
+- **N4（MIS-169）本轮**：
+  - **修复真实加载回归**：main.py 传给 CommandService 不存在的 `stats_getter`（N2 引入），真实 PluginManager 加载即 TypeError、实例丢弃后租约残留（表现为 S6 load 失败 + "另一实例租约"告警）。n 系列不经 main.initialize() 未覆盖，由 N4 全量回归 S6 暴露；修复并给冲突分支补 `history_scope`。修复后 S6 双版 46/46。
+  - n0 基线反例按计划"修复后同一反例转通过"（absent → present/wired）。
+  - 文档：README（跨人格/本地工具/升级说明）、CHANGELOG 0.7.0、STATUS、ACCEPTANCE N 矩阵、COMPATIBILITY（升级/回滚：回滚须先恢复升级前备份再装旧包）、metadata 0.7.0。
+  - 打包：`local_evidence/package_070.py`（白名单 ZIP + SHA-256 + 双版导入探针 + ZIP 解包后工具独立运行验证）。
 
-### 恢复步骤
+### 复现
 
-1. `git status` 应显示 `tools/uctx_records.py` 为 untracked（或不在暂存区）。
-2. 修复 `tools/uctx_records.py` 的 SQL 注入标记（改 query_turns 中 status IN 子句为固定参数化写法，不让 Mimosa 静态分析看到拼接模式）。
-3. 运行 `PYTHONPATH=. .venv\Scripts\python.exe -X utf8 tests/n0_baseline_check.py` 和 `n1_scope_migration_check.py`、`n2_cross_persona_check.py` 确认无倒退。
-4. 完成 N3/N4，全量回归，打 ZIP 交 In Review。
+```bash
+for t in p0_lifecycle_check p1_identity_scope_check p2_ledger_check          p3_bridge_flow_check p4_concurrency_check p5_commands_check          p6_packaging_check r_rework_check s_rework_check t_rework_check          n0_baseline_check n1_scope_migration_check n2_cross_persona_check          n3_records_check; do
+  PYTHONPATH=. <venv>/Scripts/python.exe -X utf8 tests/$t.py
+done
+# 逐套 PASS 数加总 = 381/版本（17+36+27+19+22+16+8+38+46+69+9+13+11+50）
+# 打包：python local_evidence/package_070.py
+```
+
+### 边界与待办
+
+- 本轮不 push、不建 Release、不动旧包；许可由用户决定。
+- MIS-170 Codex 独立验收；MIS-145 朋友实机（含 N24 跨人格演练与本地工具实操）继续，本地全过不替代实机。
+- 迁移仅在合成库演练；真实库升级前先备份。
 
 ---
 
-以下为 0.6.0 五次返工完成时的正式交接（已被上方暂停断点取代，历史保留）。
+## 历史交接（0.6.0，已被上方取代，保留）
+
+<details>
+<summary>0.6.0 暂停断点与五次返工交接（历史）</summary>
 
 
 
@@ -75,3 +100,5 @@ done
 - v1 不自动迁移既有 QQ 历史；同库双实例第二实例禁用（崩溃重启等旧租约 300s 过期）；fail-watchdog 默认 180s。
 - 语音/引用端到端、GUI 演练、真实 QQ 演练：待 MIS-145。
 - 其他插件若直接改写 req.contexts 的覆盖竞争（ADR-002 声明）。
+
+</details>

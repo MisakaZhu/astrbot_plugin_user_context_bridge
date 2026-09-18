@@ -1,6 +1,6 @@
 name: astrbot_plugin_user_context_bridge
-version: 0.6.0
-desc: 同一用户跨会话上下文共享——同一 QQ 用户在同一机器人、同一人格及明确启用的群聊与私聊之间，共享连续真实对话历史（读取、模型请求、写回、并发与清空完整闭环）。
+version: 0.7.0
+desc: 同一用户跨会话上下文共享——同一 QQ 用户在同一机器人及明确启用的群聊与私聊之间共享连续真实对话历史；可选按人格隔离（默认）或跨人格共享（每个窗口仍用各自人格与规则）；附本地只读记录查看与 JSON/HTML 导出工具。
 author: Ewnscat-ya
 repo: null
 branch: null

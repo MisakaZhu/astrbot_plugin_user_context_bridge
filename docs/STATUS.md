@@ -2,11 +2,15 @@
 
 维护规则：每阶段记录当前提交、实际改动、验证命令与结果、失败项、下一步。证据必须对应提交。
 
-## ⚠️ 当前：0.7.0 开发中途暂停（N0/N1/N2 已完成并提交，N3 被安全拦截待修，N4 未开始）
+## 当前：0.7.0 候选完成（N0-N4 本地开发与自测闭环，待 Codex 独立验收 MIS-170）
 
-- 分支：`feat/0.7.0-persona-records`；HEAD：`75b0a26`；工作区有 untracked `tools/uctx_records.py`（被 Mimosa 拦截的 SQL 拼接问题待修）。
-- 已完成提交：a560856(N0) → 4ced8a8(N1) → 75b0a26(N2)，均 In Review。
-- 恢复步骤详见 HANDOFF.md「暂停断点」节。
+- 分支：`feat/0.7.0-persona-records`（基于 main/859f18e）；最终 HEAD 与包哈希见 HANDOFF.md 顶部。
+- 提交链：a560856(N0 基线/ADR-015) → 4ced8a8(N1 迁移/代次/退出继承) → 75b0a26(N2 跨人格请求链/命令/生命周期) → 3d2dbd7(暂停断点文档) → b22f99f(N3 只读记录工具 + 清理 _tmp_m.json 误跟踪) → N4 回归修复与文档候选包（SHA 见 HANDOFF）。
+- 全量回归：14 套 × 4.26.0/4.28.0 各 **381 项断言全 PASS**（旧 10 套 298 + 新 4 套 83），日志 local_evidence/n4_logs/。
+- N4 修复回归：main.py 给 CommandService 传不存在的 `stats_getter` 导致真实 PluginManager 加载失败（S6 暴露，实例丢弃后租约残留）；修复后 S6 双版 46/46。
+- N3 交付 tools/uctx_records.py（list/export-json/export-html，只读快照）+ tests/n3_records_check.py 50 断言双版全过；HTML 经 Playwright 真实浏览器渲染与搜索交互验证（截图 local_evidence/n3_html/）。
+- 候选包：release/ 下 13 文件白名单 ZIP（含 tools/uctx_records.py）；旧 0.6.0 包与哈希保持原样未触碰。
+- Linear：MIS-165~169 置 In Review（附证据评论）；MIS-170 待 Codex；MIS-145 实机继续。
 
 ---
 

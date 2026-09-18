@@ -54,3 +54,58 @@ done
 - **A16 GUI 级停用/卸载**（WebUI 开关、插件管理页卸载）与 **A17 独立实例 GUI 安装**：本地已验证宿主式包路径导入、元数据/配置经宿主真实校验器、包清单干净；完整 GUI 流程待 MIS-145 用户实机（独立离线实例）执行。
 - **真实 QQ 演练**（跨群/私聊接续、重启、reset、停用恢复）：按主计划单列「待用户执行」，合成测试不冒充实机通过。
 - **fail-watchdog 默认 180s**：无钩子的模型 err 轮最长 180s 后落 failed（不影响历史读取，其只认 completed）；可经构造参数调整，实机可观察是否需缩短。
+
+---
+
+# 0.7.0 验收矩阵（N01-N24，跨人格共享与本地记录候选）
+
+对应分支 `feat/0.7.0-persona-records`。测试运行（两版宿主各一遍；n 系列基于真实
+TurnLedger/真实调度链/S6 用真实 PluginManager；n3 经子进程驱动真实 CLI）：
+
+```bash
+for t in p0_lifecycle_check p1_identity_scope_check p2_ledger_check        p3_bridge_flow_check p4_concurrency_check p5_commands_check        p6_packaging_check r_rework_check s_rework_check t_rework_check        n0_baseline_check n1_scope_migration_check n2_cross_persona_check        n3_records_check; do
+  PYTHONPATH=. <venv>/Scripts/python.exe tests/$t.py
+done
+# 统计（日志逐项加总）：4.26.0 / 4.28.0 各 381 项断言全部 PASS
+# （旧 10 套 298：17+36+27+19+22+16+8+38+46+69；新 4 套 83：9+13+11+50）
+```
+
+N4 开发中发现并修复的回归：N2 在 main.py 传入 CommandService 不存在的
+`stats_getter` 参数，真实 PluginManager 加载即 TypeError（实例被丢弃且不释放
+租约，呈现为 S6 load 失败与"另一实例租约"告警链）；n 系列测试不经
+main.initialize() 未覆盖该路径，由 N4 全量回归的 S6 暴露。修复后 S6 双版
+46/46（load 绑定 10 handler、群A→群B 接续、生命周期闭环）。该缺口以"N4 必须
+全量回归全绿"流程封堵。
+
+| 编号 | 场景 | 落点证据 | 测试 / 断言 | 状态 |
+| --- | --- | --- | --- | --- |
+| N01 | 默认升级（保持 persona） | v1 旧库自动迁移，旧问答/epoch/退出不变，source_persona 自旧键还原，不重复导入 | n1: N01.migrate-runs / migrate-idempotent / backup-created / no-membership-change / source-persona-restored | PASS（双版本） |
+| N02 | 跨人格接续 | user 模式群A黑→群B白→私聊→群A，最终请求含前序完整问答各一次、无重复 | n2: N02.chain-all-present / no-duplication | PASS（双版本；真实 QQ 演练待 MIS-145/N24） |
+| N03 | persona 模式原人格隔离 | 升级后 persona 键行为不变；真实默认/显式人格隔离继承 0.6.0 证据 | n0: N0.persona-baseline-isolated；t: T1.*（真实 PersonaManager 链） | PASS（双版本） |
+| N04 | user 模式当前人格规则 | 每轮 system_prompt 为当前窗口人格；开场白单次注入；不持久化旧系统规则 | n2: N04.current-persona-rules / system-prompt-current / begin-dialog-once | PASS（双版本） |
+| N05 | 身份与路由 | 跨用户/机器人/平台隔离与回复目标继承 0.6.0（A03/A04/A02）；user 键四轮累积正确 | p1/p3: A01-A06；n2: N09.user-key-four-turns | PASS（双版本） |
+| N06 | 来源与退出 | 范围外/退出不采集；user 模式 off 作用于全部人格，on 不扩范围 | p1: A05/A06；r: R5.*；n2: N07/N06 场景（user 键 optout 阻断接管） | PASS（双版本） |
+| N07 | 退出转换 | persona off→user 仍退出；user on 解除；base_protected/persona_on 布局见 ADR-015 | n1: N07.persona-optout-inherits-to-user / user-on-unblocks | PASS（双版本） |
+| N08 | 模式往返 | 切模式代次 +1 从空历史开始；reload 同配置不清空 | n1: N08.reload-no-reset（代次归档语义）；n3: N19/16 归档读取 | PASS（双版本；完整往返实机观察待 N24） |
+| N09 | 跨人格并发 | 同基础身份跨人格互斥至终态、后轮见前轮、无锁泄漏 | n2: N09.cross-persona-mutex-serial / no-lock-leak | PASS（双版本） |
+| N10 | reset/new 双模式清空范围 | user reset 清跨人格整份（3 人格 4 轮全清），persona reset 只清当前人格；原生命令联动继承 V1/T5/T6 | n2: N10.pre-reset-two / user-reset-clears-all / persona-reset-scope；t: T5/T6/V1/U2/U3 | PASS（双版本） |
+| N11 | 切换与取消 | 活动轮+排队轮取消/关闭协议继承 0.6.0（S6/T2/T3/U1），N2 装配修复后 S6 全绿 | s: S6.*（46 项含生命周期）；t: T2/T3 | PASS（双版本） |
+| N12 | 迁移与恢复 | 损坏输入拒绝不写；迁移中途失败原库可读可重试；重复升级幂等 | n1: N12.corrupt-input-rejected / failure-atomic / N01.migrate-idempotent | PASS（双版本） |
+| N13 | 状态诊断 | /uctx status 显示模式与有效完成轮数；命令身份按 history_scope 解析（user 模式 __mode_user__） | n2: N04/N13 场景（命令接线）；p5: A05.cmd-* | PASS（双版本） |
+| N14 | 只读入口 | mode=ro、单读事务快照、无写路径/租约/handler；list 不输出正文；三条 CLI rc=0 | n3: N14.list-*（7 项）；local_evidence/n3_html/evidence.json | PASS（双版本） |
+| N15 | 过滤与隔离 | sender/platform/self/persona/时间边界（起含终不含）/状态白名单/空结果/未知身份报错 | n3: N15.*（9 项） | PASS（双版本） |
+| N16 | 归档与异常 | 默认仅当前代次 completed；--archives 标注 is_current_generation；failed/aborted/interrupted/running 显式选择 | n3: N19.archives-included / record-archived-flag / status-failed / status-running | PASS（双版本） |
+| N17 | 一致性快照 | meta+turns 同一 BEGIN 读事务；导出不写源库；ledger 事务与唯一约束继承 A09 | n3: N14/N19（快照内读取）；p2: A09.* | PASS（双版本） |
+| N18 | HTML | Playwright(Chromium) 真实浏览器渲染：中文/emoji/长文本/工具折叠/徽章；搜索交互（white→1/5、reset→1/5）；控制台 0 错误；注入转义无脚本执行、无外链 | n3: N18.*（8 项）；截图 local_evidence/n3_html/render-full.png / render-filtered.png | PASS（双版本；Codex 视觉复核待 MIS-170） |
+| N19 | JSON | 信封 schema_version/exported_at/filters/total_matched/truncated；记录字段与库逐项吻合（身份解码/源人格/代次/工具配对/send_state/时间 ISO）；截断 limit=1→total 3 返回 1 | n3: N19.*（13 项） | PASS（双版本） |
+| N20 | 文件与限额 | 拒绝覆盖源库/WAL；坏父路径 rc=2 无半文件；OSError 统一 rc=2；v1 旧库拒绝并提示迁移；截断明示 | n3: N20.*（6 项）/ N19.truncation | PASS（双版本） |
+| N21 | 数据边界 | 工具不读配置/不连网络；导出仅含 turns 已 sanitize 字段；Git/ZIP 不含 exports/备份/库（A18 继承） | n3: N14.list-no-body / N18.no-external；p6: A18.* | PASS（双版本） |
+| N22 | ZIP 独立使用 | 真实 PluginManager load/reload/turn_off/turn_on/uninstall（S6，13 文件白名单含 tools/）；安装探针解包验证工具独立可运行 | s: S6.*；p6: A17.*；local_evidence install_probe（N4） | PASS（双版本） |
+| N23 | 测试可信度 | n3 子进程真实 CLI 断言 rc/文件内容；S6 观测字段故障注入继承（U4/V2b）；gather/subprocess 异常必 FAIL 继承 | n3 全套；s: S6 故障注入；local_evidence/fault_inject_check.py | PASS（双版本） |
+| N24 | 朋友演练 | 同 QQ 黑→白→私聊双向接续与当前人格；本地查看/JSON、reset 归档、重启与 GUI | —— | **待实机（MIS-145 扩展）** |
+
+## 0.7.0 待实机 / 待复核项
+
+- N24 朋友演练（跨人格实机、本地工具实操、GUI）：待 MIS-145 扩展执行，本地结果不替代。
+- N18 视觉复核：截图与 DOM 检查为本地 Playwright 产物，Codex 视觉复核待 MIS-170。
+- 迁移实库演练：仅合成库演练；朋友环境真实库升级由用户在备份前提下执行。

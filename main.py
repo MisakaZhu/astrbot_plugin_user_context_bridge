@@ -120,6 +120,7 @@ class UserContextBridgePlugin(Star):
                 persona_manager_getter=lambda: self.context.persona_manager,
                 conversation_manager_getter=lambda: self.context.conversation_manager,
                 provider_settings_getter=self._provider_settings,
+                history_scope=self._history_scope,
             )
             return
 
@@ -159,9 +160,6 @@ class UserContextBridgePlugin(Star):
             persona_manager_getter=lambda: self.context.persona_manager,
             conversation_manager_getter=lambda: self.context.conversation_manager,
             provider_settings_getter=self._provider_settings,
-            stats_getter=(
-                (lambda: self._bridge.stats) if self._bridge is not None else None
-            ),
             history_scope=self._history_scope,
         )
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())

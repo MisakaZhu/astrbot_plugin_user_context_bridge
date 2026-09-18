@@ -82,19 +82,25 @@ async def n0_1_persona_isolation_baseline():
             ledger.close()
 
 
-def n0_2_config_absent():
-    """N0-2 反例：history_scope 配置尚未存在。"""
+def n0_2_config_wired():
+    """N0-2 反例转通过（N1/N2 实现后）：history_scope 已配置并接线。
+
+    原始"尚未存在"反例见 a560856 版本（git 历史）；按计划"修复后同一
+    反例转通过"，此处改为断言功能已存在且接线。
+    """
+
     repo = Path(__file__).resolve().parent.parent
     schema = (repo / "_conf_schema.json").read_text(encoding="utf-8")
-    check("N0.history_scope-absent", "history_scope" not in schema)
+    check("N0.history_scope-in-schema", "history_scope" in schema)
     bridge_src = (repo / "main.py").read_text(encoding="utf-8")
-    check("N0.history_scope-not-wired", "history_scope" not in bridge_src)
+    check("N0.history_scope-wired", "history_scope" in bridge_src)
 
 
-def n0_3_records_tool_absent():
-    """N0-3 反例：本地只读记录工具尚未存在。"""
+def n0_3_records_tool_present():
+    """N0-3 反例转通过（N3 实现后）：本地只读记录工具已交付。"""
+
     repo = Path(__file__).resolve().parent.parent
-    check("N0.records-tool-absent", not (repo / "tools" / "uctx_records.py").exists())
+    check("N0.records-tool-present", (repo / "tools" / "uctx_records.py").exists())
 
 
 def n0_data_contract_snapshot():
@@ -136,8 +142,8 @@ def n0_data_contract_snapshot():
 
 async def main():
     await n0_1_persona_isolation_baseline()
-    n0_2_config_absent()
-    n0_3_records_tool_absent()
+    n0_2_config_wired()
+    n0_3_records_tool_present()
     n0_data_contract_snapshot()
     print(f"\n=== N0 基线反例与契约：PASS={len(PASS)} FAIL={len(FAIL)} ===")
     if FAIL:
