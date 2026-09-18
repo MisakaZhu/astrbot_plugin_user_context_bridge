@@ -46,3 +46,6 @@ Thumbs.db
 
 # Mimosa 本地扫描产物
 .mimosa/
+
+# 测试残留（membership 临时文件）
+_tmp_*.json
