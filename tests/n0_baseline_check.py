@@ -72,7 +72,9 @@ async def n0_1_persona_isolation_baseline():
                     "SELECT DISTINCT identity_key FROM turns").fetchall()]
             scopes = {k.split("\x1f")[2] for k in keys}
             check("N0.no-user-mode-key-yet",
-                  len(keys) == 2 and "__mode_user__" not in scopes,
+                  len(keys) == 2
+                  and all("__mode_user__" not in k for k in keys)
+                  and scopes == {"black", "white"},
                   f"keys={keys} scopes={scopes}")
         finally:
             bridge.shutdown()
@@ -122,8 +124,11 @@ def n0_data_contract_snapshot():
                             "trajectory", "reply_text", "send_state", "lease_id"},
               f"cols={cols}")
         check("N0.contract-tables", {"turns", "meta", "instance_leases"} <= tables)
-        check("N0.contract-no-schema-version", "schema_version" not in tables
-              and not any(c == "mode_generation" for c in cols))
+        # 0.7.0 起 open() 自动迁移：契约改为"v1 列是当前列表的子集"
+        check("N0.contract-v1-cols-subset",
+              {"identity_key", "epoch", "seq", "event_key", "status",
+               "source_type", "source_id", "umo", "user_message",
+               "trajectory", "reply_text", "send_state"} <= set(cols))
         # 退出文件契约
         from tests.harness import make_bridge_stack  # noqa: F401
         led.close()

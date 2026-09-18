@@ -65,6 +65,12 @@ def build_identity(
     )
 
 
+MODE_USER_SCOPE = "__mode_user__"
+"""user 模式共享键的保留 scope 字面量（ADR-015）：第三段为模式标记而非
+人格名；双下划线保留样式，真实人格不应使用（若使用将在 user 模式下
+与跨人格共享键合并，属管理员配置错误，文档已声明）。"""
+
+
 def identity_from_event(
     event: AstrMessageEvent,
     persona_scope: str | None,

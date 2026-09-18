@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -41,6 +42,100 @@ _TERMINAL_STATUSES = frozenset(
 LEASE_FRESH_SECONDS = 300.0
 """其他实例租约心跳在该窗口内视为存活（双实例防护阈值）。"""
 
+SCHEMA_VERSION = 2
+"""0.7.0 结构：turns 增加 source_persona / mode_generation 列与
+schema_version 表。0.6.0 旧库（无该表）首次 open 自动迁移并先备份。"""
+
+UNKNOWN_PERSONA = "__unknown__"
+
+
+def migrate_from_v1(db_path, *, backup_dir=None):
+    """把 0.6.0（schema v1）账本迁移到 v2；已迁移返回 False（幂等）。
+
+    ADR-015 A15-2：checkpoint → 备份原库 → 单 IMMEDIATE 事务加列并写
+    schema_version → 提交；失败回滚，原库与备份保持不变。损坏输入抛
+    MigrationError 不写。迁移后从旧 identity_key 第三段还原 source_persona。
+    """
+
+    import time as _time
+
+    db = Path(str(db_path))
+    conn = sqlite3.connect(db, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "schema_version" in tables:
+            return False
+        if "turns" not in tables or "meta" not in tables:
+            raise MigrationError("输入不是 0.6.0 账本（缺 turns/meta 表）")
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)").fetchall()}
+        if "mode_generation" in cols or "source_persona" in cols:
+            raise MigrationError("turns 已含 v2 列但缺 schema_version 表，结构异常")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+        bdir = Path(backup_dir) if backup_dir else db.parent / "backups"
+        bdir.mkdir(parents=True, exist_ok=True)
+        stamp = _time.strftime("%Y%m%d-%H%M%S")
+        backup = bdir / f"pre-migrate-v2-{stamp}-{db.name}"
+        shutil.copy2(db, backup)
+        conn = sqlite3.connect(db, timeout=30.0)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "ALTER TABLE turns ADD COLUMN source_persona TEXT"
+                " NOT NULL DEFAULT '" + UNKNOWN_PERSONA + "'"
+            )
+            conn.execute(
+                "ALTER TABLE turns ADD COLUMN mode_generation INTEGER"
+                " NOT NULL DEFAULT 0"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, migrated_at REAL NOT NULL)"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (version, migrated_at)"
+                " VALUES (?, ?)",
+                (SCHEMA_VERSION, _time.time()),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        # 从旧 identity_key 第三段还原 source_persona（保守：解析不出保持占位）
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                "SELECT id, identity_key FROM turns"
+                " WHERE source_persona='" + UNKNOWN_PERSONA + "'"
+            ).fetchall()
+            for row in rows:
+                parts = row[1].split("")
+                if len(parts) == 4 and parts[2] and not parts[2].startswith("__"):
+                    conn.execute(
+                        "UPDATE turns SET source_persona=? WHERE id=?",
+                        (parts[2], row[0]),
+                    )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return True
+    except MigrationError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        raise MigrationError(f"迁移失败（原库未变更）：{exc}") from exc
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS turns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,6 +154,8 @@ CREATE TABLE IF NOT EXISTS turns (
     lease_id TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
+    source_persona TEXT NOT NULL DEFAULT '',
+    mode_generation INTEGER NOT NULL DEFAULT 0,
     UNIQUE (identity_key, epoch, seq)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_turns_event_key ON turns (event_key);
@@ -78,6 +175,10 @@ CREATE TABLE IF NOT EXISTS instance_leases (
     acquired_at REAL NOT NULL,
     heartbeat_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY,
+    migrated_at REAL NOT NULL
+);
 """
 
 
@@ -87,6 +188,10 @@ class LedgerError(Exception):
 
 class EpochStaleError(LedgerError):
     """提交时轮次所属 epoch 已不是当前 epoch（清空后的慢请求，拒绝写入）。"""
+
+
+class MigrationError(LedgerError):
+    """schema 迁移失败（输入损坏/中断），原库保持不变。"""
 
 
 class LeaseConflictError(LedgerError):
@@ -107,6 +212,8 @@ class TurnRecord:
     user_message: dict[str, Any]
     trajectory: list[dict[str, Any]]
     reply_text: str | None
+    source_persona: str = ""
+    mode_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -175,11 +282,14 @@ class TurnLedger:
         self._conn: sqlite3.Connection | None = None
 
     # -- 生命周期 ---------------------------------------------------------
-    def open(self) -> None:
+    def open(self, *, auto_migrate: bool = True) -> None:
         with self._lock:
             if self._conn is not None:
                 return
             Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+            # v1（0.6.0）旧库先迁移到 v2（幂等；已迁移/新建库跳过）
+            if auto_migrate and Path(self._db_path).exists():
+                migrate_from_v1(self._db_path)
             conn = sqlite3.connect(
                 self._db_path,
                 timeout=30.0,
@@ -191,6 +301,11 @@ class TurnLedger:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=30000")
             conn.executescript(_SCHEMA)
+            conn.execute(
+                "INSERT INTO schema_version (version, migrated_at) "
+                "SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM schema_version)",
+                (SCHEMA_VERSION, time.time()),
+            )
             self._conn = conn
 
     def close(self) -> None:
@@ -227,6 +342,52 @@ class TurnLedger:
             conn.execute("ROLLBACK")
         except sqlite3.OperationalError:
             pass
+
+    # -- 模式代次（0.7.0） -------------------------------------------------
+    @staticmethod
+    def base_key_of(identity_key: str) -> str:
+        """基础身份键（platformselfsender，剥离 scope 段）。"""
+
+        parts = identity_key.split("")
+        if len(parts) != 4:
+            return identity_key
+        return "".join((parts[0], parts[1], parts[3]))
+
+    def current_mode_generation(self, identity_key: str) -> int:
+        """读取基础身份的模式代次（缺省 0=v1 遗留代次）。"""
+
+        with self._lock:
+            base = self.base_key_of(identity_key)
+            row = self._require_conn().execute(
+                "SELECT value FROM meta WHERE name='mode_generation' AND identity_key=?",
+                (base,),
+            ).fetchone()
+            return int(row["value"]) if row else 0
+
+    def bump_mode_generation(self, identity_key: str) -> int:
+        """模式切换：基础身份代次 +1（该基础身份全部旧代次记录变归档）。"""
+
+        with self._lock:
+            conn = self._tx()
+            try:
+                base = self.base_key_of(identity_key)
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE name='mode_generation'"
+                    " AND identity_key=?",
+                    (base,),
+                ).fetchone()
+                new_gen = (int(row["value"]) + 1) if row else 1
+                conn.execute(
+                    "INSERT INTO meta (identity_key, name, value)"
+                    " VALUES (?, 'mode_generation', ?)"
+                    " ON CONFLICT(identity_key, name) DO UPDATE SET value=excluded.value",
+                    (base, str(new_gen)),
+                )
+                conn.execute("COMMIT")
+                return new_gen
+            except Exception:
+                self._rollback(conn)
+                raise
 
     # -- epoch / seq ------------------------------------------------------
     def current_epoch(self, identity_key: str) -> int:
@@ -275,6 +436,7 @@ class TurnLedger:
         umo: str,
         user_message: dict[str, Any],
         lease_id: str | None = None,
+        source_persona: str = "",
     ) -> TurnRecord:
         """登记 running 轮次；``event_key`` 重复时幂等返回既有记录（去重）。"""
 
@@ -316,8 +478,9 @@ class TurnLedger:
                 conn.execute(
                     "INSERT INTO turns (identity_key, epoch, seq, event_key, status,"
                     " source_type, source_id, umo, user_message, trajectory, reply_text,"
-                    " send_state, lease_id, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,?,?)",
+                    " send_state, lease_id, created_at, updated_at,"
+                    " source_persona, mode_generation)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,?,?,?,?)",
                     (
                         identity_key,
                         epoch,
@@ -332,6 +495,8 @@ class TurnLedger:
                         lease_id,
                         now,
                         now,
+                        source_persona,
+                        self.current_mode_generation(identity_key),
                     ),
                 )
                 row = conn.execute(
@@ -449,11 +614,12 @@ class TurnLedger:
         """
 
         epoch = self.current_epoch(identity_key)
+        mode_gen = self.current_mode_generation(identity_key)
         with self._lock:
             rows = self._require_conn().execute(
                 "SELECT * FROM turns WHERE identity_key=? AND epoch=? AND status=?"
-                " ORDER BY seq ASC",
-                (identity_key, epoch, STATUS_COMPLETED),
+                " AND mode_generation=? ORDER BY seq ASC",
+                (identity_key, epoch, STATUS_COMPLETED, mode_gen),
             ).fetchall()
         if max_turns is not None and max_turns >= 0 and len(rows) > max_turns:
             rows = rows[-max_turns:]
@@ -654,4 +820,10 @@ class TurnLedger:
             user_message=json.loads(row["user_message"]),
             trajectory=json.loads(row["trajectory"]) if row["trajectory"] else [],
             reply_text=row["reply_text"],
+            source_persona=(
+                row["source_persona"] if "source_persona" in row.keys() else ""
+            ),
+            mode_generation=(
+                row["mode_generation"] if "mode_generation" in row.keys() else 0
+            ),
         )

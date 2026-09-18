@@ -23,7 +23,7 @@ from typing import Any
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.platform.message_type import MessageType
 
-from .identity import SharedIdentity, identity_from_event
+from .identity import MODE_USER_SCOPE, SharedIdentity, build_identity, identity_from_event
 
 SUPPORTED_PLATFORM_NAMES = frozenset({"aiocqhttp"})
 """v1 支持的平台适配器类型（QQ OneBot v11）。其他类型不采集。"""
@@ -78,23 +78,88 @@ class MembershipStore:
         self._path = path
         self._lock = threading.Lock()
         self._optout: set[str] = set()
+        self._base_protected: set[str] = set()
+        self._persona_on: set[str] = set()
         self._load()
 
     def _load(self) -> None:
         if not self._path.exists():
             return
+        self._base_protected: set[str] = set()
+        self._persona_on: set[str] = set()
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
             self._optout = {str(k) for k in data.get("optout", [])}
+            self._base_protected = {str(k) for k in data.get("base_protected", [])}
+            self._persona_on = {str(k) for k in data.get("persona_on", [])}
         except Exception:  # noqa: BLE001 - 损坏文件按空处理
             self._optout = set()
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(
-            json.dumps({"optout": sorted(self._optout)}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {
+                    "optout": sorted(self._optout),
+                    "base_protected": sorted(self._base_protected),
+                    "persona_on": sorted(self._persona_on),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
+
+    @staticmethod
+    def base_key_of(identity: "SharedIdentity") -> str:
+        """基础身份键（platformselfsender，剥离 scope）。"""
+
+        return f"{identity.platform_id}{identity.self_id}{identity.sender_id}"
+
+    def is_base_protected(self, identity: "SharedIdentity") -> bool:
+        """user 模式退出后转入的基础身份保护（覆盖现有人格与未来新人格）。"""
+
+        with self._lock:
+            return self.base_key_of(identity) in self._base_protected
+
+    def has_any_persona_optout(self, identity: "SharedIdentity") -> bool:
+        """persona→user 继承：该基础身份存在任何仍生效的 persona 退出。
+
+        persona 键形如 platformselfscopesender；按
+        (platform, self, sender) 三段匹配任意 scope。
+        """
+
+        platform, self_id = identity.platform_id, identity.self_id
+        sender = identity.sender_id
+        with self._lock:
+            for k in self._optout:
+                parts = k.split("")
+                if (
+                    len(parts) == 4
+                    and parts[0] == platform
+                    and parts[1] == self_id
+                    and parts[3] == sender
+                ):
+                    return True
+            return False
+
+    def persona_explicit_on(self, identity: "SharedIdentity") -> bool:
+        with self._lock:
+            return identity.key in self._persona_on
+
+    def protect_base(self, identity: "SharedIdentity") -> None:
+        """user->persona 转换：基础身份整体进入退出保护。"""
+
+        with self._lock:
+            self._base_protected.add(self.base_key_of(identity))
+            self._save()
+
+    def release_base(self, identity: "SharedIdentity") -> None:
+        """该 persona 显式 on：仅解除该人格（其余人格保护保留）。"""
+
+        with self._lock:
+            self._persona_on.add(identity.key)
+            self._save()
 
     def is_opted_out(self, identity: SharedIdentity) -> bool:
         with self._lock:
@@ -107,8 +172,25 @@ class MembershipStore:
 
     def opt_in(self, identity: SharedIdentity) -> None:
         with self._lock:
+            if identity.persona_scope == "__mode_user__":
+                # user 模式主动 on：解除该基础身份全部人格的退出（N07）
+                self._optout = {
+                    k
+                    for k in self._optout
+                    if not MembershipStore._matches_base(k, identity)
+                }
             self._optout.discard(identity.key)
             self._save()
+
+    @staticmethod
+    def _matches_base(key: str, identity: SharedIdentity) -> bool:
+        parts = key.split("\x1f")
+        return (
+            len(parts) == 4
+            and parts[0] == identity.platform_id
+            and parts[1] == identity.self_id
+            and parts[3] == identity.sender_id
+        )
 
 
 class ScopeResolver:
@@ -118,13 +200,22 @@ class ScopeResolver:
         self,
         config: ScopeConfig,
         membership: MembershipStore | None = None,
+        history_scope: str = "persona",
     ) -> None:
         self._config = config
         self._membership = membership
+        self._history_scope = "user" if history_scope == "user" else "persona"
 
     @property
     def config(self) -> ScopeConfig:
         return self._config
+
+    @property
+    def history_scope(self) -> str:
+        return self._history_scope
+
+    def set_history_scope(self, scope: str) -> None:
+        self._history_scope = "user" if scope == "user" else "persona"
 
     def update_config(self, config: ScopeConfig) -> None:
         self._config = config
@@ -172,11 +263,34 @@ class ScopeResolver:
             return out("not_wake")
 
         identity = identity_from_event(event, persona_scope)
+        if self._history_scope == "user":
+            # user 模式：scope 段用保留字面量 __mode_user__（ADR-015），
+            # 当前人格仅作为源人格元数据记录，不进共享键。
+            identity = build_identity(
+                platform_id=identity.platform_id,
+                self_id=identity.self_id,
+                persona_scope="__mode_user__",
+                sender_id=identity.sender_id,
+            )
 
         if cfg.shared_personas and identity.persona_scope not in cfg.shared_personas:
             return out("persona_not_in_scope", identity)
 
-        if self._membership is not None and self._membership.is_opted_out(identity):
-            return out("personal_optout", identity)
+        if self._membership is not None:
+            if self._membership.is_opted_out(identity):
+                return out("personal_optout", identity)
+            if self._history_scope == "user" and (
+                self._membership.has_any_persona_optout(identity)
+            ):
+                # N07：persona 模式下的退出合并进 user 键
+                return out("personal_optout", identity)
+            if self._history_scope == "persona":
+                # N07 退出继承：user 退出 → base 保护覆盖各人格；
+                # 该人格显式 on 解除保护
+                if (
+                    self._membership.is_base_protected(identity)
+                    and not self._membership.persona_explicit_on(identity)
+                ):
+                    return out("personal_optout", identity)
 
         return ScopeDecision(in_scope=True, identity=identity, reason="ok")
