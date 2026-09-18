@@ -142,3 +142,18 @@ ACCEPTANCE 校准：handler 数 10、T2 8 项、T5/T6 每版 7 项（矩阵另�
 - **V2b 故障注入实调父测试**：fault_inject_check monkeypatch `_run_s6_worker` 在子进程实际运行 `s6_plugin_lifecycle`——正常 16 PASS、10 字段逐个 false 各触发（每字段 2 FAIL）、全 false 8 FAIL/8 PASS。
 - **V2c**：U1 排队取消断言 ev→b 笔误修正。
 - **V2d 文档口径**：T2=9（含 cancel-task-controlled）、U1=15（初始 6+排队 9）、A17 handler=10 单口径、删除"固定成功文案"过期描述（ADR-010 历史保留并标后继决策）。
+
+
+## 六次验收文档收尾（2026-09-18，Codex 六次验收报告 15）
+
+Codex 六次验收确认 V1 与 V2a/V2b/V2c 通过（两版各 298 PASS、ZIP 逐文件一致）；仅剩两处
+上一轮已要求但遗漏的 ACCEPTANCE 数字口径，本提交为纯文档补齐（无运行代码/测试/包变化）：
+
+- A10 证据列：`T2.*（取消窗口 8 项）` → `9 项`（与 A07 及真实日志一致）。
+- A17 行为描述列：`load（绑定 12 handler）` → `绑定 10 个 handler`（与同一行证据列及真实
+  PluginManager 一致）。
+
+**对应关系口径**：实现与测试证据仍对应实现提交 `ac51bde`（0.6.0，两版各 298 PASS、
+ZIP `astrbot_plugin_user_context_bridge-ac51bde.zip` SHA-256 `78e64560334d26bb1b29949967fdb6dea337c764da06a8148021f1aa9b6449af`、12 文件白名单）；
+本次最终 HEAD 仅补文档（ACCEPTANCE/STATUS），未重新执行测试、未重打包——白名单 ZIP 不含
+这两份文档，包无需重打、哈希不变。验收矩阵保持 v6。
