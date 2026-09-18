@@ -1,8 +1,32 @@
 # HANDOFF（交接说明）
 
-面向 Codex 复验（MIS-144）与用户实机验证（MIS-145）。对应最终提交见 docs/STATUS.md；证据均对应该提交。
+## ⚠️ 暂停断点（2026-09-18，0.7.0 开发中途）
 
-## 交付摘要（V1/V2 五次返工后，0.6.0）
+**当前 SHA：`75b0a26`，分支 `feat/0.7.0-persona-records`（基于 main/859f18e）。用户要求重启电脑，恢复后从此处继续。**
+
+### 已完成
+
+- **N0（MIS-165）** 提交 `a560856`，In Review：基线核对、双版 venv 现场确认可用（Python 3.12.10，AstrBot 4.28.0/4.26.0）、ADR-015 落盘、`tests/n0_baseline_check.py` 9/9 双版 PASS。
+- **N1（MIS-166）** 提交 `4ced8a8`，In Review：ledger v1→v2 迁移（migrate_from_v1，备份/幂等/失败回滚）、mode_generation 代次、MembershipStore v2（base_protected/persona_on）、scope user 模式退出继承；`tests/n1_scope_migration_check.py` 13/13 双版 PASS。
+- **N2（MIS-167）** 提交 `75b0a26`，In Review：bridge source_persona、main 装配 history_scope/配置 schema、commands user 模式身份（resolver.history_scope 驱动）、`tests/n2_cross_persona_check.py` 11/11 双版 PASS。
+
+### 未完成（N3/N4 刚开始就暂停）
+
+- **N3（MIS-168）**：`tools/uctx_records.py` 已写入第一版但被 Mimosa 拦截（SQL 拼接被标 SQL 注入）。文件在磁盘上但**未 git add**。恢复后需：改用纯参数化查询（status 列表改为固定 CASE 表达式或预构建占位符），通过 Mimosa 后测试 `list`/`export-json`/`export-html` 三条 CLI，再用两版 venv 分别生成合成数据做 HTML/JSON 验证。
+- **N4（MIS-169）**：全量回归、文档同步、0.7.0 候选 ZIP 均未开始。
+
+### 恢复步骤
+
+1. `git status` 应显示 `tools/uctx_records.py` 为 untracked（或不在暂存区）。
+2. 修复 `tools/uctx_records.py` 的 SQL 注入标记（改 query_turns 中 status IN 子句为固定参数化写法，不让 Mimosa 静态分析看到拼接模式）。
+3. 运行 `PYTHONPATH=. .venv\Scripts\python.exe -X utf8 tests/n0_baseline_check.py` 和 `n1_scope_migration_check.py`、`n2_cross_persona_check.py` 确认无倒退。
+4. 完成 N3/N4，全量回归，打 ZIP 交 In Review。
+
+---
+
+以下为 0.6.0 五次返工完成时的正式交接（已被上方暂停断点取代，历史保留）。
+
+
 
 - 版本 0.6.0（五次返工候选），main 分支，无远端、未 push。
 - 基线链：8477eba → d8a7147 → 169a88a → 5f662d0 → 06d5598（U1~U4）→ 本次（V1/V2，ADR-014）。
