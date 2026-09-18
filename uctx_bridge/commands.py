@@ -54,6 +54,7 @@ class CommandService:
         persona_manager_getter,
         conversation_manager_getter=None,
         provider_settings_getter=None,
+        history_scope: str = "persona",
     ) -> None:
         self._ledger = ledger
         self._resolver = resolver
@@ -61,6 +62,7 @@ class CommandService:
         self._get_persona_manager = persona_manager_getter
         self._get_conversation_manager = conversation_manager_getter
         self._provider_settings_getter = provider_settings_getter
+        self._history_scope = history_scope
 
     def _provider_settings(self, event: AstrMessageEvent) -> dict:
         """T1：与对话轮同源的 provider_settings（4.26 默认人格读取依赖）。"""
@@ -107,6 +109,10 @@ class CommandService:
             _FakeConv(conversation_persona_id),
             provider_settings=self._provider_settings(event),
         )
+        # N13/N10：user 模式下命令（status/reset/off/on）作用于跨人格
+        # 合并身份；persona 模式下保持原样。
+        if self._resolver.history_scope == "user":
+            persona_scope = "__mode_user__"
         return _identity_of(event, persona_scope)
 
     def _identity_error_text(self) -> str:

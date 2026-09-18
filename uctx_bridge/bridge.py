@@ -310,6 +310,7 @@ class ContextBridge:
                 source_id=event.get_group_id() or identity.sender_id,
                 umo=event.unified_msg_origin,
                 user_message=user_message,
+                source_persona=persona_scope,
             )
             if turn.status != STATUS_RUNNING:
                 # S1：重复投递且原轮已终态——必须先释放刚获取的身份锁，

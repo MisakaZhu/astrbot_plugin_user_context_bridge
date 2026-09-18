@@ -13,8 +13,18 @@
   },
   "include_private": {
     "type": "bool",
-    "description": "将该用户的私聊纳入共享范围",
+    "description": "允许私聊参与上下文共享（对范围内符合条件且未退出的用户生效，并非选择某一个 QQ 号）",
     "default": false
+  },
+  "history_scope": {
+    "type": "string",
+    "options": [
+      "persona",
+      "user"
+    ],
+    "description": "共享历史范围：persona=按人格隔离（默认，兼容旧版）；user=同一用户跨人格共享（每个窗口仍使用各自人格与规则）",
+    "hint": "切换共享模式会从新历史开始，旧记录保留供查询；仅 reload 同配置或重启不会清空",
+    "default": "persona"
   },
   "max_history_turns": {
     "type": "int",

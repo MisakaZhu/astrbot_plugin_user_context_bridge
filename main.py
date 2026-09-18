@@ -41,8 +41,18 @@ class UserContextBridgePlugin(Star):
         self._data_dir = StarTools.get_data_dir()
         self._ledger = TurnLedger(self._data_dir / "uctx_ledger.db")
         self._membership = MembershipStore(self._data_dir / "membership.json")
+        raw_scope = str(config.get("history_scope", "persona"))
+        if raw_scope not in ("persona", "user"):
+            logger.warning(
+                "uctx history_scope=%r 非法（仅支持 persona/user），"
+                "保守回退为 persona",
+                raw_scope,
+            )
+            raw_scope = "persona"
+        self._history_scope = raw_scope
         self._resolver = ScopeResolver(
-            ScopeConfig.from_mapping(dict(config)), self._membership
+            ScopeConfig.from_mapping(dict(config)), self._membership,
+            history_scope=raw_scope,
         )
         self._bridge: ContextBridge | None = None
         self._commands: CommandService | None = None
@@ -54,6 +64,25 @@ class UserContextBridgePlugin(Star):
         self._sharing_active = False
 
     # -- 生命周期 ---------------------------------------------------------
+    def _collect_base_identities(self) -> list[str]:
+        """收集账本中已出现的基础身份键（模式切换时按代次归档用）。"""
+
+        import sqlite3 as _s3
+
+        keys: set[str] = set()
+        try:
+            conn = _s3.connect(self._ledger._db_path)
+            try:
+                for (k,) in conn.execute("SELECT DISTINCT identity_key FROM turns"):
+                    parts = k.split("")
+                    if len(parts) == 4:
+                        keys.add("".join((parts[0], parts[1], parts[3])))
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return sorted(keys)
+
     def _provider_settings(self, umo: str | None = None) -> dict:
         """T1：与宿主 _ensure_persona_and_skills 同源的 provider_settings。"""
 
@@ -98,7 +127,22 @@ class UserContextBridgePlugin(Star):
         if recovered:
             logger.info(f"uctx 重启恢复：{recovered} 个挂起轮次标记为 interrupted")
 
+        new_scope = str(self._config.get("history_scope", "persona"))
+        if new_scope not in ("persona", "user"):
+            new_scope = "persona"
+        old_scope = self._history_scope
         self._resolver.update_config(ScopeConfig.from_mapping(dict(self._config)))
+        if new_scope != old_scope:
+            # 显式切换共享模式：新代次从空历史开始（旧记录归档可查）
+            identities = self._collect_base_identities()
+            for base_key in identities:
+                self._ledger.bump_mode_generation(base_key)
+            logger.info(
+                "uctx 共享模式切换 %s -> %s：新代次从空历史开始，旧记录归档",
+                old_scope, new_scope,
+            )
+        self._history_scope = new_scope
+        self._resolver.set_history_scope(new_scope)
         self._bridge = ContextBridge(
             ledger=self._ledger,
             scope_resolver=self._resolver,
@@ -115,6 +159,10 @@ class UserContextBridgePlugin(Star):
             persona_manager_getter=lambda: self.context.persona_manager,
             conversation_manager_getter=lambda: self.context.conversation_manager,
             provider_settings_getter=self._provider_settings,
+            stats_getter=(
+                (lambda: self._bridge.stats) if self._bridge is not None else None
+            ),
+            history_scope=self._history_scope,
         )
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         if self._config.get("enabled", False):

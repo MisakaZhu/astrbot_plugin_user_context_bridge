@@ -77,13 +77,22 @@ async def drive_pipeline(
     extra_parts=None,
     func_tool=None,
     abort_before_run: bool = False,
+    system_prompt: str | None = None,
+    begin_dialog: str | None = None,
 ) -> dict:
     """驱动一轮完整宿主链路：钩子 → reset → 真实调度（yield 即下游）。"""
 
     req = ProviderRequest()
     req.prompt = prompt
     req.contexts = []
-    req.system_prompt = "harness system prompt"
+    # 模拟宿主 build_main_agent 的当前人格注入（在 on_llm_request 之前）
+    if system_prompt is not None:
+        req.system_prompt = system_prompt
+    if begin_dialog is not None:
+        req.contexts = [
+            {"role": "user", "content": begin_dialog + "（问）"},
+            {"role": "assistant", "content": begin_dialog + "（答）"},
+        ]
     req.conversation = FakeConversation(
         user_id=event.unified_msg_origin, persona_id=persona
     )
