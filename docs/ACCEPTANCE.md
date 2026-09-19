@@ -168,3 +168,46 @@ W 返工中发现并修复的新缺陷：`identity_stats` 以 4 段身份键查�
 - N24 朋友演练（含 user 模式切换演示、本地工具实操）：待 MIS-145。
 - N18 视觉复核：本轮新样例截图待 Codex 复核（上轮通过结论不自动继承）。
 - 迁移实库演练：仅合成/真实实现构造的旧库；朋友真实库升级前先备份。
+
+
+---
+
+# 0.7.0 X1–X6 返工后矩阵（N01–N24 v3，2026-09-19）
+
+**对 v2 矩阵的更正**：W 轮的 N01/N07/N08/N22 证据随后被独立复验否定——首次直接
+切换漏登记/漏推进（X1）、旧 persona_on 越过新 user off（X2）、迁移按前缀猜编
+码（X3）、N22 实为 reload 子集而非完整生命周期、N04/N10 仍非真实链、部分任务
+异常未进判定（X6）。本轮逐项修复并以下表为准；v2 表保留作历史。
+
+全量回归（实现 SHA 见提交链；两版各一遍，日志 local_evidence/x_logs/）：
+18 套 × 4.26.0/4.28.0，**每版 745 项断言全 PASS**（旧 10 套 298 + n 系 113 +
+w 系 3 套 170 + x 系 1 套 64；w_lifecycle/w_zip/s6 父套件内部各自跨双版
+spawn worker，不重复计入总数）。
+
+| 编号 | 场景 | 本轮证据 | 状态 |
+| --- | --- | --- | --- |
+| N01 | 默认升级 | 真实 859f18e 旧库迁移对账（w3/x3：键/source_persona/epoch/幂等/WAL 备份/不覆盖）；v1 升级登记不改代次（x1） | PASS（双版） |
+| N02 | user 跨人格接续 | n2 真实调度链 + t1 N04 真实 PersonaManager/ConversationManager 双窗共享 | PASS（双版；实机待 N24） |
+| N03 | persona 隔离 | n0 + T1 真实 PersonaManager（p:persona_a/b 键隔离） | PASS（双版） |
+| N04 | user 当前人格规则（真实链） | t1 N04：真实 PersonaManager/ConversationManager/宿主 `_ensure_persona_and_skills` 装配；每轮 system=当前窗口人格、开场白单次、工具/动态注入保留、u: 单键、source_persona=persona_a/persona_b、跨人格链 | PASS（双版） |
+| N05 | 身份与路由 | p1/p3 + 特殊人格名键不碰撞（真实 PersonaManager 接受 `__mode_user__`/`u:`/`p:maid` 等） | PASS（双版） |
+| N06 | 来源与退出 | p1/r5/w2 | PASS（双版） |
+| N07 | 退出转换 | n1 真实转换函数 + w_lifecycle 退出矩阵（persona off→user 保持；user off→persona 保护现有+未来人格；单人格 on 仅解除该人格） | PASS（双版） |
+| N08 | 模式往返（真实宿主） | w_lifecycle 无预热直切：首轮登记 persona→直切 user 恰好 +1→persona +1→user +1；旧模式/更早同模式内容均不回灌；归档行可查 | PASS（双版） |
+| N09 | 跨人格并发 | n2 屏障（B 未进模型、最终请求含 A 一次完整问答、gather 异常入结论） | PASS（双版） |
+| N10 | reset/new 双模式真实分发 | t5 双模式真实 Context/命令分发矩阵：user 模式 reset 联动、new 无 provider 仍联动、改名/过滤拒绝不清空；persona 模式继承保护下 new 不联动不误提示（X5） | PASS（双版） |
+| N11 | 切换与取消 | w_lifecycle Phase 7（挂起 interrupted/排队受控让出）+ S6 生命周期（turn_off/turn_on/uninstall，含交付 ZIP 版） | PASS（双版） |
+| N12 | 迁移与恢复 | n1 触发器故障→逐项回滚核验→重试完整；w3 WAL/备份/不覆盖 | PASS（双版） |
+| N13 | 状态诊断 | w_lifecycle：fresh/接管后/继承退出的 status 文本与实际一致；identity_stats 代次 bug 已修 | PASS（双版） |
+| N14 | 只读入口 | n3 mode=ro 一致快照 | PASS（双版） |
+| N15 | 过滤与消歧 | n3 真实 CLI：唯一基础身份/歧义候选拒绝/时间边界/状态白名单 | PASS（双版） |
+| N16 | 归档与异常 | n3 archives/状态标注；X1 后归档行可查（archived_rows_queryable） | PASS（双版） |
+| N17 | 一致性快照 | mode=ro 读事务 + w3 WAL 共存备份 | PASS（双版） |
+| N18 | HTML | 本轮 W6/W7 变更后已重渲染（w-render-*.png）；X 轮 HTML/筛选未再变化，视觉结论继承该版本与范围 | PASS（继承+上轮通过；Codex 可复核） |
+| N19 | JSON | n3 信封/记录字段/截断/resolved_identity | PASS（双版） |
+| N20 | 文件与限额 | n3 guards + backups 整树守卫（大小写/相对/等价路径，字节不变） | PASS（双版） |
+| N21 | 数据边界 | 工具不读配置/不连网；Git/ZIP 干净（p6） | PASS（双版） |
+| N22 | ZIP 独立使用（真实交付包） | s_rework `s6_delivered_zip_lifecycle`：定位**实际交付 ZIP**、哈希对 .sha256 核对、解包安装跑完整生命周期（load/reload/turn_off/turn_on/uninstall+活动/排队受控停止+注册表/目录清理断言）双版 70 断言；w_zip 另证工具独立运行 | PASS（双版） |
+| N23 | 测试可信度 | w_lifecycle 故障注入（12 字段翻假+任务 TimeoutError/RuntimeError+缺字段全检出）、_run_worker rc=19 判失败、s6 断言注入（任务异常/生命周期布尔假/卸载未清理全检出）；KeyError 归属查清=宿主 call_event_hook 对已卸载 handler 的日志路径（夹具分类+受控不变量照断言） | PASS（双版） |
+| N24 | 朋友演练 | 同 QQ 黑→白→私聊双向接续、本地查看/JSON、GUI | **待实机（MIS-145）** |
+

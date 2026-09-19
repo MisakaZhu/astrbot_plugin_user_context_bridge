@@ -1,5 +1,37 @@
 # HANDOFF（交接说明）
 
+## 0.7.0 X1–X6 返工交付（2026-09-19，待 Codex 复验）
+
+**分支 `feat/0.7.0-persona-records`；W 返工基线 4f542fe。X 轮修复全部阻断项；未 push/未发布/未部署。**
+
+| 项 | 根因 | 修复 | 证据 |
+| --- | --- | --- | --- |
+| X1 首次切换漏推进 | 全新安装无身份可枚举，首轮只写 turns 不登记 scope_mode；recorded=None 被当初次升级 | begin_turn 同事务登记 scope_mode（首次参与）；apply_scope_mode 语义不变（None=登记不改代次，仅对迁移遗留/仅退出身份） | w_lifecycle Phase 1 无预热直切：登记 persona→直切 user +1→归档可查（双版）；x1 单元 |
+| X2 旧 persona_on 越过新 user off | persona_on 无先后关系 | user 维度 opt_out 撤销该基础身份既有 persona_on；此后单人格 on 才解除 | w_lifecycle Phase 6 + x2 单元（多轮 off/on/往返/磁盘回读） |
+| X3 迁移按前缀猜编码 | 旧数据 scope 是原始人格 ID，`p:maid`/`u:`/`q:foo` 被误当已编码 | _migrate_identity_key/encode_membership_key 按输入版本解码：v1 一律 p:+字面值；v2 仅 __mode_user__ 歧义隔离；两遍改写消除 UNIQUE 中间态碰撞；source_persona 保留字面值；meta 记录来源版本，membership 同源 | x3（真实 859f18e 旧库六个特殊人格名+成对碰撞） |
+| X4 持久化失败内存分裂 | 内存先发布、写盘后行 | MembershipStore 先持久化候选状态成功后发布内存（off/两种 on/protect_base/migrate）；命令层受控失败文案（不泄漏路径） | x4 故障注入（命令→采集→磁盘→重试） |
+| X5 原生联动绕过有效退出 | main.py 仍用 is_opted_out | 改 effective_optout；t5 双模式真实分发矩阵含继承保护场景（不联动/不误提示） | t5 X5 行 + t_rework 父断言 |
+| X6 测试放过失败 | worker 异常转字符串、父未断言；_run_worker 不查 rc/JSON | worker 保留完整栈并入 JSON；父断言任务异常/非零 rc/坏 JSON 全判 FAIL；s6 断言函数化+故障注入（任务异常/生命周期布尔/卸载未清理）；KeyError 归属=宿主 call_event_hook 对已卸载插件 handler 的日志路径（宿主侧边界，夹具分类+受控不变量照断言） | w_lifecycle/s_rework 故障注入段 |
+| N04 | user 模式无真实链 | t1 N04：真实 PersonaManager/ConversationManager/宿主 `_ensure_persona_and_skills`；u: 单键/当前人格 system/开场白/工具/动态注入/source_persona/跨人格链 | t1 双版 + t_rework 父断言 |
+| N22 | 非交付包且无卸载 | s6 worker 支持从交付 ZIP 解包安装；s_rework 定位实际交付包、核对 .sha256、跑完整生命周期（含 turn_off/turn_on/uninstall+活动/排队受控停止+注册表/目录清理） | s_rework 双版 70 断言 |
+
+### 版本与包
+
+- 交付提交 760f647（X 轮主体）+ 4cee8cf（w_rework 适配）；候选包
+  `astrbot_plugin_user_context_bridge-4cee8cf.zip`（13 文件），
+  SHA-256 `6581762dfd2e112a53ccbdb52e7e3925e66d212f439ed6cd9fe384b405941e4d`；
+  双版导入探针 + ZIP 工具独立运行 OK；旧 ac51bde/27aadae/ce8b75c 包未触碰。
+- 全量回归：18 套 × 双版各 **745** 项全 PASS（日志 local_evidence/x_logs/）。
+- 边界：未 push/未发布/未部署；真实 QQ/模型未用；N24 实机待 MIS-145。
+
+---
+
+## 历史交接
+
+<details>
+<summary>W 返工/0.7.0 首候选/0.6.0（历史）</summary>
+
+
 ## 0.7.0 W1–W8 返工交付（2026-09-19，待 Codex 复验）
 
 **分支 `feat/0.7.0-persona-records`；返工基线 219cef2（首个候选，Codex 判未通过）。本次修复 W1–W8 全部阻断项；未 push、未发布、实机未验证。**

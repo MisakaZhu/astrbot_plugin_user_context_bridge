@@ -1,18 +1,16 @@
-# 状态与进度（可恢复断点）
+## 当前：0.7.0 X1–X6 返工完成（待 Codex 复验 MIS-170）
 
-维护规则：每阶段记录当前提交、实际改动、验证命令与结果、失败项、下一步。证据必须对应提交。
-
-## 当前：0.7.0 W1–W8 返工完成（待 Codex 复验 MIS-170）
-
-- 分支 `feat/0.7.0-persona-records`；返工基线 219cef2；交付提交 **ce8b75c**；候选包 `astrbot_plugin_user_context_bridge-ce8b75c.zip`（SHA-256 `40493ca1…a887bd`）。
-- 修复独立验收确认的 W1–W8 全部阻断项：模式持久化（scope_mode/meta）、键结构性编码（p:/u:/q:）、
-  退出继承接入真实命令与转换、迁移原子化+backup API 一致性备份、status 重写（接管证据/有效数）、
-  导出唯一基础身份消歧、backups 守卫、测试与矩阵收紧（含故障注入实调父断言）。
-- 顺带修复：main.py stats_getter 死参数（真实加载失败）、identity_stats 代次读错键（有效数失真）。
-- 全量回归：17 套 × 4.26.0/4.28.0 各 **561** 项断言全 PASS（旧 10 套 298 + n 系 113 + w 系 150），
-  日志 local_evidence/w_logs/。
-- N18 新产物重渲染：local_evidence/n3_html/w-render-*.png（身份行/搜索交互/0 控制台错误）。
-- Linear：MIS-165~169 待本轮完成置 In Review；MIS-170 In Progress 等 Codex 复验；MIS-145 实机不变。
+- 分支 `feat/0.7.0-persona-records`；W 返工基线 4f542fe；X 轮交付提交 **760f647**，
+  补遗 **4cee8cf**；候选包 `astrbot_plugin_user_context_bridge-4cee8cf.zip`
+  （SHA-256 `6581762dfd2e112a53ccbdb52e7e3925e66d212f439ed6cd9fe384b405941e4d`）。
+- 修复独立复验确认的 X1–X6：首次参与模式登记（X1）、user off 撤销旧 persona_on（X2）、
+  迁移按输入版本解码（X3）、持久化失败不发布内存（X4）、原生联动有效退出（X5）、
+  失败检测收紧与真实链补齐（X6：N04 user 真实装配、N10 双模式分发、N22 交付 ZIP
+  全生命周期、故障注入实调父断言含 rc/异常/缺字段）。
+- 全量回归：18 套 × 4.26.0/4.28.0 各 **745** 项断言全 PASS（298+113+170+64），
+  日志 local_evidence/x_logs/。
+- Linear：MIS-165/166/167/169 完成→In Review；MIS-168 保持 In Review（W6/W7 通过，
+  X3 合同变更已跑 n3 回归）；MIS-170 In Progress 等 Codex；MIS-145 实机不变。
 
 ---
 
