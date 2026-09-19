@@ -36,26 +36,41 @@ WHITELIST = [
 ]
 
 
-def locate_delivered_zip() -> Path:
-    """定位**实际交付 ZIP**：release/ 下以当前实现 SHA 命名的候选包。"""
+def locate_delivered_zip(delivered_zip: str | None = None,
+                         expected_sha: str | None = None):
+    """N22（Y1）：正式入口只接受**明确指定的**候选 ZIP 路径与预期
+    SHA-256（--delivered-zip / --delivered-sha256）；不按 mtime 自动
+    选包，缺 .sha256 记录/哈希不匹配/输入包缺失一律判 FAIL。
+    返回 (zip_path | None, 实际摘要 | None)。"""
 
-    # 交付约定：ZIP 以实现提交 SHA 命名（HEAD 可能为纯文档收尾），
-    # 取 release/ 下最新的候选包并核对哈希（旧包不动）。
-    candidates = sorted(
-        (REPO / "release").glob("astrbot_plugin_user_context_bridge-*.zip"),
-        key=lambda p_: p_.stat().st_mtime,
-    )
-    if not candidates:
-        raise SystemExit("release/ 无候选包（先运行打包脚本）")
-    zip_path = candidates[-1]
+    if not delivered_zip:
+        check("N22.delivered-zip-exists", False,
+              "未通过 --delivered-zip 指定候选包路径（不得按 mtime 自动选包）")
+        return None, None
+    zip_path = Path(delivered_zip)
+    if not zip_path.is_file():
+        check("N22.delivered-zip-exists", False,
+              f"指定的候选包不存在：{zip_path}")
+        return None, None
     digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+    if not expected_sha:
+        check("N22.expected-sha-given", False,
+              "未通过 --delivered-sha256 指定预期 SHA-256")
+        return zip_path, digest
+    check("N22.delivered-hash-matches",
+          str(expected_sha).strip().lower() == digest,
+          f"预期 {expected_sha} != 实际 {digest}")
     sha_file = zip_path.with_suffix(zip_path.suffix + ".sha256")
-    if sha_file.exists():
+    if sha_file.is_file():
         recorded = sha_file.read_text(encoding="utf-8").split()[0]
-        assert recorded == digest, "交付包哈希与 .sha256 记录不一致"
+        check("N22.delivered-sha256-record", recorded == digest,
+              f".sha256 记录 {recorded} != 实际 {digest}")
+    else:
+        check("N22.delivered-sha256-record", False,
+              "缺少 .sha256 记录文件（不得视为 PASS）")
     print(f"[N22] 交付 ZIP：{zip_path.name}（{len(WHITELIST)} 文件）")
     print(f"[N22] SHA-256：{digest}")
-    return zip_path
+    return zip_path, digest
 
 
 def zip_tool_standalone(zip_path: Path, td: Path) -> bool:
@@ -102,9 +117,23 @@ def zip_tool_standalone(zip_path: Path, td: Path) -> bool:
 
 
 def main() -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="N22：指定交付 ZIP 的完整生命周期与工具独立运行"
+    )
+    ap.add_argument("--delivered-zip", default=None,
+                    help="候选交付 ZIP 路径（必填，不按 mtime 自动选包）")
+    ap.add_argument("--delivered-sha256", default=None,
+                    help="候选交付 ZIP 预期 SHA-256（必填）")
+    args = ap.parse_args()
+    zip_path, _digest = locate_delivered_zip(
+        args.delivered_zip, args.delivered_sha256)
+    if zip_path is None:
+        print(f"=== N22 ZIP 交付链：PASS={len(PASS)} FAIL={len(FAIL)} ===")
+        return 1
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         tdp = Path(td)
-        zip_path = locate_delivered_zip()
 
         # 工具独立运行验证（与宿主无关，跑一次）
         ok_tool = zip_tool_standalone(zip_path, tdp / "toolcheck")

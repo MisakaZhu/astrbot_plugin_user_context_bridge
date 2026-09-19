@@ -474,7 +474,8 @@ def t1_t5_t6_workers() -> None:
             and out.get("failure_key_absent") is True,
             "",
         )
-        # N04（X6）：user 模式真实 PersonaManager/ConversationManager/宿主装配
+        # N04（Y3）：user 模式真实链——宿主装配 → 注册请求钩子 →
+        # Runner/假模型实际调用 → 真实终态钩子 → 下一窗口请求
         check(
             f"N04.{tag}.user-single-u-key",
             out.get("n04_single_u_key") is True,
@@ -482,8 +483,23 @@ def t1_t5_t6_workers() -> None:
         )
         check(
             f"N04.{tag}.source-personas",
-            out.get("n04_source_personas") == ["persona_a", "persona_b"],
+            out.get("n04_source_personas")
+            == ["persona_a", "persona_b", "persona_c"],
             f"got={out.get('n04_source_personas')}",
+        )
+        check(
+            f"N04.{tag}.all-model-called",
+            out.get("n04_all_model_called") is True,
+            f"calls={out.get('n04_model_calls')}",
+        )
+        check(
+            f"N04.{tag}.all-completed-zero-watchdog-zero-pending",
+            out.get("n04_all_completed") is True
+            and out.get("n04_watchdog_zero") is True
+            and out.get("n04_pending_zero") is True,
+            f"completed={out.get('n04_all_completed')} "
+            f"watchdog={out.get('n04_watchdog_zero')} "
+            f"pending={out.get('n04_pending_zero')}",
         )
         check(
             f"N04.{tag}.system-current-persona",
@@ -506,9 +522,14 @@ def t1_t5_t6_workers() -> None:
             "",
         )
         check(
+            f"N04.{tag}.dynamic-not-persisted",
+            out.get("n04_dynamic_not_in_ledger") is True,
+            "",
+        )
+        check(
             f"N04.{tag}.cross-persona-chain",
             out.get("n04_cross_persona_chain") is True,
-            "",
+            f"ctx_b={out.get('n04_debug_bctx')}",
         )
 
     # T5/T6：真实 Context + 命令分发矩阵
@@ -566,6 +587,97 @@ def t1_t5_t6_workers() -> None:
             and ip.get("plugin_notified") is False,
             f"ip={ip}",
         )
+        # N10/Y3：范围外/权限拒绝（persona 方向）
+        oos = out.get("out-of-scope-reset", {})
+        check(
+            f"N10.{tag}.out-of-scope-no-sync",
+            oos.get("native_update_calls") == 1
+            and oos.get("history_after") == 2
+            and oos.get("epoch_bumped") is False
+            and oos.get("plugin_notified") is False,
+            f"oos={oos}",
+        )
+        prm = out.get("permission-denied-reset", {})
+        check(
+            f"N10.{tag}.permission-denied-no-clear",
+            prm.get("native_update_calls") == 0
+            and prm.get("history_after") == 2
+            and prm.get("plugin_notified") is False,
+            f"prm={prm}",
+        )
+        # N10/Y3：user 模式补齐原定分支
+        unpr = out.get("user-no-provider-reset", {})
+        check(
+            f"N10.{tag}.user-no-provider-reset-denied",
+            unpr.get("history_after") == 2
+            and unpr.get("plugin_notified") is False,
+            f"unpr={unpr}",
+        )
+        ubd = out.get("user-builtins-disabled-reset", {})
+        check(
+            f"N10.{tag}.user-disabled-no-clear",
+            ubd.get("native_update_calls") == 0
+            and ubd.get("history_after") == 2,
+            f"ubd={ubd}",
+        )
+        ubdn = out.get("user-builtins-disabled-new", {})
+        check(
+            f"N10.{tag}.user-disabled-new-no-clear",
+            ubdn.get("native_new_calls") == 0
+            and ubdn.get("history_after") == 2,
+            f"ubdn={ubdn}",
+        )
+        urnn = out.get("user-renamed-new-name", {})
+        check(
+            f"N10.{tag}.user-renamed-new-name-syncs",
+            urnn.get("native_update_calls") == 1
+            and urnn.get("history_after") == 0
+            and urnn.get("epoch_bumped") is True,
+            f"urnn={urnn}",
+        )
+        uoos = out.get("user-out-of-scope-reset", {})
+        check(
+            f"N10.{tag}.user-out-of-scope-no-sync",
+            uoos.get("native_update_calls") == 1
+            and uoos.get("history_after") == 2
+            and uoos.get("epoch_bumped") is False
+            and uoos.get("plugin_notified") is False,
+            f"uoos={uoos}",
+        )
+        uprm = out.get("user-permission-denied", {})
+        check(
+            f"N10.{tag}.user-permission-denied-no-clear",
+            uprm.get("native_update_calls") == 0
+            and uprm.get("history_after") == 2,
+            f"uprm={uprm}",
+        )
+        # N10/Y3：user 模式 once-only follower 屏障（一次成功只 bump/
+        # 提示一次；命令挂起期间同账号另一人格新问答不被二次装饰清掉）
+        for _ulabel, _uscen in (
+            ("reset", out.get("user-reset-two-handlers", {})),
+            ("new", out.get("user-new-two-handlers", {})),
+        ):
+            _ufo = _uscen.get("follow_observations", {})
+            check(
+                f"N10.{tag}.user-{_ulabel}-once-only",
+                _uscen.get("epoch_delta") == 1
+                and _uscen.get("notify_count") == 1
+                and _ufo.get("history_before_notice") == 2
+                and _uscen.get("history_after") == 2
+                and (_uscen.get("native_update_calls", 0)
+                     + _uscen.get("native_new_calls", 0)) == 1,
+                f"epoch={_uscen.get('epoch_delta')} "
+                f"notify={_uscen.get('notify_count')} "
+                f"hist={_ufo.get('history_before_notice')}"
+                f"/{_uscen.get('history_after')}",
+            )
+            check(
+                f"N10.{tag}.user-{_ulabel}-new-turn-survives",
+                _ufo.get("command_waiting_during_new_turn") is True
+                and _ufo.get("new_turn_model_calls") == 1
+                and _ufo.get("observer_key_scope") == "u:",
+                f"fo={ {k: v for k, v in _ufo.items() if k != 'new_turn_result'} }",
+            )
         check(
             f"T5.{tag}.no-provider-no-clear",
             out.get("no-provider", {}).get("history_after") == 2

@@ -652,32 +652,51 @@ async def s5_native_reset() -> None:
             ledger.close()
 
 
-def _run_s6_worker(venv, td):
-    """运行 S6 worker 并返回解析结果（None 表示失败）。可被测试替身替换。"""
+def _run_s6_worker(venv, td, *, observer=None, fault="none", zip_arg=None):
+    """运行 S6 worker 并返回解析结果（__error__ 表示失败）。可被测试替身替换。
 
-    import shutil
-    import tempfile
+    Y1：非零退出码与缺失/损坏 JSON 必须转 __error__；observer 传入
+    y_fault_observer.py 时在真实 wait_for 边界注入 fault（task:type 格式）；
+    zip_arg 为交付 ZIP 路径（N22 安装链）。
+    """
 
-    worker = str(Path(__file__).resolve().parent / "s6_plugin_lifecycle_worker.py")
+    tests_dir = Path(__file__).resolve().parent
+    repo = tests_dir.parent
+    py = venv + r"\Scripts\python.exe"
+    tail = [zip_arg] if zip_arg else []
+    if observer:
+        cmd = [py, "-X", "utf8", str(tests_dir / observer),
+               "s6_plugin_lifecycle_worker", td, fault] + tail
+    else:
+        cmd = [py, str(tests_dir / "s6_plugin_lifecycle_worker.py"), td] + tail
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = str(repo)
     r = subprocess.run(
-        [venv + r"\Scripts\python.exe", worker, td],
+        cmd,
         capture_output=True,
         text=True,
         env=env,
-        cwd=str(Path(__file__).resolve().parent.parent),
-        timeout=180,
+        cwd=str(repo),
+        timeout=240,
     )
+    # Y1：非零退出码进入判定（rc=19 + 合法 JSON 也不得视为成功）
+    if r.returncode != 0:
+        return {"__error__": f"s6 worker rc={r.returncode}: "
+                + (r.stderr or r.stdout)[-400:]}
     line = next(
         (l for l in r.stdout.splitlines() if l.startswith("@@RESULT@@")),
         None,
     )
     if line is None:
-        return {"__error__": (r.stderr or r.stdout)[-400:]}
-    return json.loads(line[len("@@RESULT@@") :])
+        return {"__error__": "s6 worker 输出缺少 @@RESULT@@ 行："
+                + (r.stderr or r.stdout)[-400:]}
+    try:
+        return json.loads(line[len("@@RESULT@@") :])
+    except json.JSONDecodeError as exc:
+        return {"__error__": f"s6 worker 结果 JSON 损坏：{exc}："
+                + line[len("@@RESULT@@"):][:200]}
 
 
 def assert_s6_fields(tag: str, out: dict, *, check=check) -> None:
@@ -736,13 +755,26 @@ def assert_s6_fields(tag: str, out: dict, *, check=check) -> None:
         and out.get("recovery_no_backfill"),
         f"out={ {k: out.get(k) for k in ('turn_on_activated','recovery_turn_completed','recovery_no_backfill')} }",
     )
+    # Y1：卸载任务结果必须显式归类（returned / cancelled=明确预期停止；
+    # failed:* 与缺失一律 FAIL），事件停止与完整栈一并判定
+    uninstall_outcome = out.get("uninstall_task_outcome")
     check(
         f"S6.{tag}.uninstall",
         out.get("uninstall_no_late_output")
         and out.get("uninstall_interrupted_pending")
         and out.get("uninstall_removed_from_registry")
-        and out.get("uninstall_dir_removed"),
-        f"out={out}",
+        and out.get("uninstall_dir_removed")
+        and out.get("uninstall_active_stopped") is True
+        and (
+            uninstall_outcome == "returned"
+            or (
+                uninstall_outcome == "cancelled"
+                and bool(out.get("uninstall_task_traceback"))
+            )
+        ),
+        f"outcome={uninstall_outcome!r} "
+        f"stopped={out.get('uninstall_active_stopped')!r} "
+        f"tb={str(out.get('uninstall_task_traceback'))[:200]}",
     )
 
 
@@ -760,70 +792,238 @@ def s6_plugin_lifecycle() -> None:
             assert_s6_fields(Path(venv).name, out)
 
 
-def s6_delivered_zip_lifecycle() -> None:
-    """N22（X6）：从**实际交付 ZIP** 解包安装并跑完整生命周期（含
-    turn_off/turn_on/uninstall 与活动/排队受控停止），双版运行；
-    哈希与交付记录核对。"""
+def _verify_delivered_zip(zip_path, expected_sha, *, check) -> None:
+    """N22 输入校验（Y1）：显式路径 + 预期 SHA-256 + .sha256 记录，
+    三者与实际字节全部对上才通过；缺失/不匹配一律 FAIL。"""
 
     import hashlib
-    import tempfile
 
-    # 交付约定：ZIP 以实现提交 SHA 命名；HEAD 可能为纯文档收尾提交。
-    # 取 release/ 下最新的带 .sha256 记录的候选包（旧包不动，打包脚本
-    # 每次生成新名字，不会覆盖历史包）。
-    candidates = sorted(
-        (REPO / "release").glob("astrbot_plugin_user_context_bridge-*.zip"),
-        key=lambda p_: p_.stat().st_mtime,
-    )
-    zip_path = candidates[-1] if candidates else None
-    if zip_path is None:
-        check("N22.delivered-zip-exists", False, "release/ 无候选包")
+    zip_path = Path(zip_path)
+    if not zip_path.is_file():
+        check("N22.delivered-zip-exists", False,
+              f"指定的候选包不存在：{zip_path}")
         return
     digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+    check(
+        "N22.delivered-hash-matches",
+        str(expected_sha).strip().lower() == digest,
+        f"预期 {expected_sha} != 实际 {digest}",
+    )
     sha_file = zip_path.with_suffix(zip_path.suffix + ".sha256")
-    if sha_file.exists():
-        recorded = sha_file.read_text(encoding="utf-8").split()[0]
-        check("N22.delivered-hash-matches", recorded == digest,
-              f"{recorded} != {digest}")
+    if sha_file.is_file():
+        recorded = (
+            sha_file.read_text(encoding="utf-8").split()[0].strip().lower()
+        )
+        check(
+            "N22.delivered-sha256-record",
+            recorded == digest,
+            f".sha256 记录 {recorded} != 实际 {digest}",
+        )
     else:
-        check("N22.delivered-hash-matches", True, "（无 .sha256 记录文件）")
+        check("N22.delivered-sha256-record", False,
+              "缺少 .sha256 记录文件（不得视为 PASS）")
+
+
+def s6_delivered_zip_lifecycle(delivered_zip: str | None,
+                               expected_sha: str | None) -> None:
+    """N22（Y1）：正式入口只接受**明确指定的**候选 ZIP 路径与预期
+    SHA-256（--delivered-zip / --delivered-sha256），核对实际字节与
+    .sha256 记录后，从该包安装并跑完整生命周期（含 turn_off/turn_on/
+    uninstall 与活动/排队受控停止），双版运行。不按 mtime 选包；
+    缺哈希记录、哈希不匹配、输入包缺失必须失败。"""
+
+    import zipfile
+
+    if not delivered_zip:
+        check("N22.delivered-zip-exists", False,
+              "未通过 --delivered-zip 指定候选包路径（不得按 mtime 自动选包）")
+        return
+    if not expected_sha:
+        check("N22.delivered-hash-matches", False,
+              "未通过 --delivered-sha256 指定预期 SHA-256")
+        return
+    zip_path = Path(delivered_zip)
+    _verify_delivered_zip(zip_path, expected_sha, check=check)
+    if not zip_path.is_file():
+        return
     with zipfile.ZipFile(zip_path) as zf:
         names = sorted(zf.namelist())
     check("N22.delivered-zip-manifest",
           "tools/uctx_records.py" in names and len(names) >= 13,
           f"names={names}")
 
-    worker = str(Path(__file__).resolve().parent / "s6_plugin_lifecycle_worker.py")
-    env = dict(os.environ)
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONPATH"] = str(REPO)
     for venv in (
         r"D:\第三方插件完善\.venv",
         r"D:\第三方插件完善\.venv426",
     ):
         tag = Path(venv).name
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            r = subprocess.run(
-                [venv + r"\Scripts\python.exe", worker, td, str(zip_path)],
-                capture_output=True, text=True, env=env, cwd=str(REPO),
-                timeout=240,
-            )
-            # X6：非零退出码进入判定
-            line = next(
-                (l for l in r.stdout.splitlines()
-                 if l.startswith("@@RESULT@@")), None)
-            if r.returncode != 0 or line is None:
-                check(f"N22.{tag}.zip-lifecycle", False,
-                      f"rc={r.returncode} err={(r.stderr or r.stdout)[-400:]}")
-                continue
-            out = json.loads(line[len("@@RESULT@@"):])
+            out = _run_s6_worker(venv, td, zip_arg=str(zip_path))
             assert_s6_fields(f"N22.{tag}", out)
             # X6：卸载清理断言（显式，不再只看 load_ok）
             check(f"N22.{tag}.zip-uninstall-cleaned",
                   out.get("uninstall_removed_from_registry") is True
                   and out.get("uninstall_dir_removed") is True,
                   f"out={ {k: out.get(k) for k in ('uninstall_removed_from_registry','uninstall_dir_removed')} }")
+
+
+def s6_fault_injection_real_paths() -> None:
+    """Y1/N23：故障注入作用于真实路径——y_fault_observer 在真实 worker
+    进程的真实 wait_for 边界注入（活动/排队/卸载任务），输出交由真实
+    _run_s6_worker 解析、真实 assert_s6_fields 判定；正常对照必须过，
+    逐个故障必须判 FAIL。另对真实 _run_s6_worker 子进程入口注入
+    rc=19 / 缺 RESULT 行 / 损坏 JSON，以及关键字段缺失/翻假。
+    （观测运行只取单版解释器：检测机制与解释器版本无关。）"""
+
+    venv = r"D:\第三方插件完善\.venv"
+    scenarios = [
+        "t6:RuntimeError",
+        "t6:TimeoutError",
+        "t3:RuntimeError",
+        "t4:RuntimeError",
+    ]
+    good = None
+    for spec in scenarios:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            out = _run_s6_worker(venv, td, observer="y_fault_observer.py",
+                                 fault=spec)
+        lp: list = []
+        lf: list = []
+
+        def local_check(n, cond, detail=""):
+            (lp if cond else lf).append(n)
+
+        if "__error__" in out:
+            lf.append("worker-error")
+        else:
+            assert_s6_fields("FI", out, check=local_check)
+        check(
+            f"Y1.s6-realpath-{spec.replace(':', '-')}-detected",
+            bool(lf),
+            f"未检出：spec={spec} pass={len(lp)} lf={lf}",
+        )
+
+    # 正常对照：观测器驱动（fault=none）必须与直跑同样全过
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        good = _run_s6_worker(venv, td, observer="y_fault_observer.py",
+                              fault="none")
+    lp: list = []
+    lf: list = []
+
+    def local_check2(n, cond, detail=""):
+        (lp if cond else lf).append(n)
+
+    if "__error__" in good:
+        lf.append("worker-error")
+    else:
+        assert_s6_fields("OBS", good, check=local_check2)
+    check("Y1.s6-observer-normal-passes", not lf, f"lf={lf}")
+
+    if "__error__" in good:
+        return
+
+    # 真实子进程入口：rc=19 / 缺 RESULT 行 / 损坏 JSON → 真实
+    # _run_s6_worker 必须转 __error__，并由真实父断言判 FAIL
+    class FakeResult:
+        def __init__(self, rc, stdout, stderr=""):
+            self.returncode = rc
+            self.stdout = stdout
+            self.stderr = stderr
+
+    good_line = "@@RESULT@@" + json.dumps(good, ensure_ascii=False) + "\n"
+    entry_cases = {
+        "rc19": FakeResult(19, good_line, "injected nonzero exit"),
+        "no-result-line": FakeResult(0, "no marker here\n", ""),
+        "bad-json": FakeResult(0, "@@RESULT@@{oops", ""),
+    }
+    for name, result in entry_cases.items():
+        with patch.object(subprocess, "run", return_value=result):
+            read = _run_s6_worker("synthetic-venv", "synthetic-td")
+        entry_lf: list = []
+
+        def entry_check(n, cond, detail=""):
+            if not cond:
+                entry_lf.append(n)
+
+        assert_s6_fields("ENTRY", read, check=entry_check)
+        check(
+            f"Y1.s6-entry-{name}-detected",
+            "__error__" in read and bool(entry_lf),
+            f"read={str(read)[:150]} lf={entry_lf}",
+        )
+
+    # 关键字段缺失也必须 FAIL（现有 scenarios 覆盖翻假/清理缺失）
+    for missing in ("queued_task_returned", "uninstall_task_outcome"):
+        doctored = dict(good)
+        doctored.pop(missing, None)
+        missing_lf: list = []
+
+        def missing_check(n, cond, detail=""):
+            if not cond:
+                missing_lf.append(n)
+
+        assert_s6_fields("FI", doctored, check=missing_check)
+        check(
+            f"Y1.s6-field-missing-{missing}-detected",
+            bool(missing_lf),
+            f"未检出缺失字段：{missing} lf={missing_lf}",
+        )
+
+
+def s6_delivered_zip_input_guards() -> None:
+    """N22 校验器自检（Y1）：缺 .sha256 记录、错哈希、包缺失的输入必须
+    被拒绝——用临时副本验证，不动 release/ 下任何真实交付包。"""
+
+    import hashlib
+    import shutil
+
+    src = None
+    for cand in sorted((REPO / "release").glob(
+            "astrbot_plugin_user_context_bridge-*.zip")):
+        sha_file = cand.with_suffix(cand.suffix + ".sha256")
+        if sha_file.is_file():
+            src = cand
+            break
+    if src is None:
+        check("N22.input-guards", False, "release/ 无带 .sha256 的包可作样本")
+        return
+    digest = hashlib.sha256(src.read_bytes()).hexdigest()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        # 1) 缺 .sha256 记录 → 必须拒绝
+        no_sha = Path(td) / "no_sha.zip"
+        shutil.copy2(src, no_sha)
+        lp: list = []
+        lf: list = []
+
+        def local_check(n, cond, detail=""):
+            (lp if cond else lf).append(n)
+
+        _verify_delivered_zip(no_sha, digest, check=local_check)
+        check("N22.guard-missing-sha256-record-rejected",
+              any("sha256-record" in n for n in lf),
+              f"lf={lf}")
+
+        # 2) 预期哈希不匹配 → 必须拒绝
+        lf2: list = []
+
+        def local_check2(n, cond, detail=""):
+            (lp if cond else lf2).append(n)
+
+        _verify_delivered_zip(src, "0" * 64, check=local_check2)
+        check("N22.guard-wrong-expected-sha-rejected",
+              any("hash-matches" in n for n in lf2), f"lf={lf2}")
+
+        # 3) 输入包缺失 → 必须拒绝
+        lf3: list = []
+
+        def local_check3(n, cond, detail=""):
+            (lp if cond else lf3).append(n)
+
+        _verify_delivered_zip(Path(td) / "ghost.zip", digest,
+                              check=local_check3)
+        check("N22.guard-missing-zip-rejected",
+              any("zip-exists" in n for n in lf3), f"lf={lf3}")
 
 
 def s6_fault_injection_calls_parent() -> None:
@@ -855,7 +1055,23 @@ def s6_fault_injection_calls_parent() -> None:
 
 
 async def main() -> int:
-    s6_delivered_zip_lifecycle()
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="S1~S6 返工回归（N22 必须显式指定交付包与预期哈希）"
+    )
+    ap.add_argument(
+        "--delivered-zip", default=None,
+        help="候选交付 ZIP 路径（N22 必填，不按 mtime 自动选包）",
+    )
+    ap.add_argument(
+        "--delivered-sha256", default=None,
+        help="候选交付 ZIP 预期 SHA-256（N22 必填）",
+    )
+    args = ap.parse_args()
+    s6_delivered_zip_lifecycle(args.delivered_zip, args.delivered_sha256)
+    s6_delivered_zip_input_guards()
+    s6_fault_injection_real_paths()
     s6_fault_injection_calls_parent()
     await s1_duplicate_lock()
     await s2_real_stop()

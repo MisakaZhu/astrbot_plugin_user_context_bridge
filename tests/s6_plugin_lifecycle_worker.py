@@ -19,6 +19,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -226,16 +227,18 @@ async def main() -> int:
     try:
         await asyncio.wait_for(t3, 3)
         out["active_task_returned"] = True
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
         out["active_task_returned"] = type(exc).__name__
+        out["active_task_traceback"] = traceback.format_exc()
     out["active_no_late_output"] = not any(
         "LATE" in (c.get_plain_text() or "") for c in ev3.sent_chains
     )
     try:
         await asyncio.wait_for(t4, 3)
         out["queued_task_returned"] = True
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
         out["queued_task_returned"] = f"{type(exc).__name__}:{exc}"
+        out["queued_task_traceback"] = traceback.format_exc()
     out["queued_no_output"] = not any(
         (c.get_plain_text() or "").strip() for c in ev4.sent_chains
     )
@@ -283,10 +286,20 @@ async def main() -> int:
     await asyncio.wait_for(entered_c.wait(), 3)
     await pm.uninstall_plugin(PLUGIN_DIR_NAME)
     release_c.set()
+    # Y1：卸载任务结果必须显式归类（正常返回/取消=明确预期停止/失败），
+    # 异常与超时不得吞掉；失败时保留完整调用栈供父断言判定。
     try:
         await asyncio.wait_for(t6, 3)
-    except Exception:  # noqa: BLE001
-        pass
+        out["uninstall_task_outcome"] = "returned"
+    except asyncio.CancelledError:
+        out["uninstall_task_outcome"] = "cancelled"
+        out["uninstall_task_traceback"] = traceback.format_exc()
+    except BaseException as exc:  # noqa: BLE001
+        out["uninstall_task_outcome"] = f"failed:{type(exc).__name__}"
+        out["uninstall_task_traceback"] = traceback.format_exc()
+    out["uninstall_active_stopped"] = (
+        ev6.get_extra("agent_stop_requested") is True or ev6.is_stopped()
+    )
     out["uninstall_no_late_output"] = not any(
         "LATE-UNINSTALL" in (c.get_plain_text() or "") for c in ev6.sent_chains
     )

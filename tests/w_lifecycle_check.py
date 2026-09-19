@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -28,19 +29,30 @@ def check(name, cond, detail=""):
     print(f"[{'PASS' if cond else 'FAIL'}] {name} {detail if not cond else ''}")
 
 
-def _run_worker(venv: str, td: str) -> dict:
-    worker = str(Path(__file__).resolve().parent / "w_lifecycle_worker.py")
+def _run_worker(venv: str, td: str, *, observer: str | None = None,
+                fault: str = "none") -> dict:
+    """运行 W worker 并解析结果（__error__ 表示失败）。observer 传入
+    y_fault_observer.py 时在真实 wait_for 边界注入 fault（task:type）；
+    非观测路径命令行与原直跑完全一致。"""
+
+    tests_dir = Path(__file__).resolve().parent
+    py = venv + r"\Scripts\python.exe"
+    if observer:
+        cmd = [py, "-X", "utf8", str(tests_dir / observer),
+               "w_lifecycle_worker", td, fault]
+    else:
+        cmd = [py, str(tests_dir / "w_lifecycle_worker.py"), td]
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONPATH"] = str(REPO)
     r = subprocess.run(
-        [venv + r"\Scripts\python.exe", worker, td],
+        cmd,
         capture_output=True,
         text=True,
         env=env,
         cwd=str(REPO),
-        timeout=240,
+        timeout=300,
     )
     line = next(
         (l for l in r.stdout.splitlines() if l.startswith("@@RESULT@@")),
@@ -87,18 +99,39 @@ def assert_worker_fields(tag: str, out: dict, *, check=check) -> None:
         check(f"W1.{tag}.worker-runs", False, out["__error__"])
         return
     check(f"W1.{tag}.worker-runs", True)
-    # X6：任务异常/超时必须判 FAIL；仅宿主已卸载插件日志边界的 KeyError
-    # （switch_queued_host_boundary=True）且无输出/已停止才视为干净让出
-    for task in ("switch_active_returned", "switch_queued_returned"):
-        check(f"X6.{tag}.{task}", out.get(task) is True,
-              f"{task}={out.get(task)!r}")
-    for tb in ("switch_active_traceback", "switch_queued_traceback"):
-        check(f"X6.{tag}.{tb}-absent", tb not in out, str(out.get(tb, ""))[:300])
-    check(f"X6.{tag}.queued-controlled-if-host-boundary",
-          "switch_queued_host_boundary" not in out
-          or (out.get("switch_queued_no_output") is True
-              and out.get("switch_queued_stopped") is True),
-          f"boundary={out.get('switch_queued_host_boundary')}")
+    # Y1：任务结果显式归类。活动任务必须正常返回；排队任务正常返回或
+    # 精确命中宿主 call_event_hook 卸载插件日志 KeyError 边界（完整栈、
+    # 异常类型/键/来源、已停止、0 模型调用、无共享回写、锁无残留）。
+    check(f"X6.{tag}.switch-active-task",
+          out.get("switch_active_outcome") == "returned",
+          f"outcome={out.get('switch_active_outcome')!r} "
+          f"tb={str(out.get('switch_active_traceback'))[:200]}")
+    queued_outcome = out.get("switch_queued_outcome")
+    boundary_evidence = (
+        out.get("switch_queued_exc_type") == "KeyError"
+        and out.get("switch_queued_exc_key")
+        == "data.plugins.astrbot_plugin_user_context_bridge.main"
+        and out.get("switch_queued_exc_source")
+        == "astrbot/core/pipeline/context_utils.py:call_event_hook"
+        and isinstance(out.get("switch_queued_full_traceback"), str)
+        and out.get("switch_queued_stopped") is True
+        and out.get("switch_queued_model_calls") == 0
+        and out.get("switch_queued_ledger_no_completed") is True
+        and out.get("switch_queued_no_output") is True
+    )
+    check(
+        f"X6.{tag}.switch-queued-task",
+        queued_outcome == "returned"
+        or (queued_outcome == "host_boundary_keyerror" and boundary_evidence),
+        f"outcome={queued_outcome!r} "
+        f"exc_type={out.get('switch_queued_exc_type')!r} "
+        f"exc_key={out.get('switch_queued_exc_key')!r} "
+        f"exc_source={out.get('switch_queued_exc_source')!r} "
+        f"model_calls={out.get('switch_queued_model_calls')!r} "
+        f"ledger_no_completed={out.get('switch_queued_ledger_no_completed')!r} "
+        f"no_output={out.get('switch_queued_no_output')!r} "
+        f"stopped={out.get('switch_queued_stopped')!r}",
+    )
     # 加载与 Phase 0（status 无接管证据不得宣称共享）
     check(f"W1.{tag}.load", out.get("load_ok") is True
           and (out.get("bound_handlers") or 0) >= 5, f"out={out}"[:200])
@@ -207,9 +240,9 @@ def fault_injection_calls_parent() -> None:
         assert_worker_fields("FI", doctored, check=local_check)
         if not lf:
             undetected.append(field)
-    # X6：任务异常（TimeoutError）/缺失字段也必须被父断言检出
+    # X6/Y1：任务异常（TimeoutError）/缺失字段也必须被父断言检出
     doctored = dict(good)
-    doctored["switch_active_returned"] = "TimeoutError"
+    doctored["switch_active_outcome"] = "failed:TimeoutError"
     doctored["switch_active_traceback"] = "Traceback ... TimeoutError"
     doctored.pop("switch_new_config_turn_done", None)
     lp: list = []
@@ -236,6 +269,91 @@ def fault_injection_calls_parent() -> None:
     check("X6.worker-rc0-passes", "__error__" not in ok)
 
 
+def fault_injection_real_paths() -> None:
+    """Y1/N23：故障注入作用于真实路径——y_fault_observer 在真实 worker
+    进程的真实 wait_for 边界注入，输出交由真实 _run_worker 解析、真实
+    assert_worker_fields 判定；正常对照必须过，逐个故障必须判 FAIL。
+    另对真实 _run_worker 子进程入口注入 rc=19 / 缺 RESULT 行 / 损坏 JSON。
+    （观测运行只取单版解释器：检测机制与解释器版本无关。）"""
+
+    venv = r"D:\第三方插件完善\.venv"
+    scenarios = [
+        "t_a:RuntimeError",
+        "t_a:TimeoutError",
+        "t_b:RuntimeError",
+        "t_b:KeyErrorOther",
+    ]
+    for spec in scenarios:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            out = _run_worker(venv, td, observer="y_fault_observer.py",
+                              fault=spec)
+        lp: list = []
+        lf: list = []
+
+        def local_check(n, cond, detail=""):
+            (lp if cond else lf).append(n)
+
+        if "__error__" in out:
+            lf.append("worker-error")
+        else:
+            assert_worker_fields("FI", out, check=local_check)
+        check(
+            f"Y1.w-realpath-{spec.replace(':', '-')}-detected",
+            bool(lf),
+            f"未检出：spec={spec} pass={len(lp)} lf={lf}",
+        )
+
+    # 正常对照：观测器驱动（fault=none）必须与直跑同样全过
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        good = _run_worker(venv, td, observer="y_fault_observer.py",
+                           fault="none")
+    lp: list = []
+    lf: list = []
+
+    def local_check2(n, cond, detail=""):
+        (lp if cond else lf).append(n)
+
+    if "__error__" in good:
+        lf.append("worker-error")
+    else:
+        assert_worker_fields("OBS", good, check=local_check2)
+    check("Y1.w-observer-normal-passes", not lf,
+          f"lf={lf} err={str(good.get('__error__'))[:300]}")
+
+    if "__error__" in good:
+        return
+
+    # 真实子进程入口：rc=19 / 缺 RESULT 行 / 损坏 JSON → 真实 _run_worker
+    # 必须转 __error__，并由真实父断言判 FAIL
+    class FakeResult:
+        def __init__(self, rc, stdout, stderr=""):
+            self.returncode = rc
+            self.stdout = stdout
+            self.stderr = stderr
+
+    good_line = "@@RESULT@@" + json.dumps(good, ensure_ascii=False) + "\n"
+    entry_cases = {
+        "rc19": FakeResult(19, good_line, "injected nonzero exit"),
+        "no-result-line": FakeResult(0, "no marker here\n", ""),
+        "bad-json": FakeResult(0, "@@RESULT@@{oops", ""),
+    }
+    for name, result in entry_cases.items():
+        with patch.object(subprocess, "run", return_value=result):
+            read = _run_worker("synthetic-venv", "synthetic-td")
+        entry_lf: list = []
+
+        def entry_check(n, cond, detail=""):
+            if not cond:
+                entry_lf.append(n)
+
+        assert_worker_fields("ENTRY", read, check=entry_check)
+        check(
+            f"Y1.w-entry-{name}-detected",
+            "__error__" in read and bool(entry_lf),
+            f"read={str(read)[:150]} lf={entry_lf}",
+        )
+
+
 def main() -> int:
     for venv in (
         r"D:\第三方插件完善\.venv",
@@ -246,6 +364,7 @@ def main() -> int:
             out = _run_worker(venv, td)
             assert_worker_fields(tag, out)
     fault_injection_calls_parent()
+    fault_injection_real_paths()
     print(f"\n=== W 生命周期回归：PASS={len(PASS)} FAIL={len(FAIL)} ===")
     if FAIL:
         print("失败项：", FAIL)

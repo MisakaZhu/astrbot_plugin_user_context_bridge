@@ -89,7 +89,8 @@ def user_ident_of(identity):
 
 async def scenario(name, *, mode="persona", disabled=False, renamed=False,
                    filtered=False, cmd="reset", provider=True, prefix=False,
-                   follower=False, recover=False, inherit_protected=False):
+                   follower=False, recover=False, inherit_protected=False,
+                   group="700000001", role="admin", sender="10001"):
     state_dir = ROOT / ("s-" + name)
     state_dir.mkdir(parents=True, exist_ok=True)
     bridge, resolver, membership, ledger = make_bridge_stack(str(state_dir))
@@ -168,14 +169,17 @@ async def scenario(name, *, mode="persona", disabled=False, renamed=False,
             from astrbot.core.star.star_handler import StarHandlerMetadata, EventType
             from astrbot.core.star.star import StarMetadata
             from astrbot.core.message.message_event_result import MessageEventResult
-            from tests.r_rework_check import identity_of as _ident_of
 
             async def after_command_notice(ev):
+                # N10/Y3：follower 查询键随命令事件身份走（user 模式即
+                # u: 键），不得固定查 persona 键冒充 user 证据
+                follow_obs["observer_key_scope"] = identity.key.split(
+                    chr(31))[2][:2]
                 follow_obs["epoch_after_native"] = ledger.current_epoch(
-                    _ident_of("10001")
+                    identity.key
                 )
                 follow_obs["history_after_native"] = len(
-                    ledger.load_history(_ident_of("10001"))
+                    ledger.load_history(identity.key)
                 )
                 follower_ready.set()
                 await follower_release.wait()
@@ -203,15 +207,17 @@ async def scenario(name, *, mode="persona", disabled=False, renamed=False,
                 obs_meta.handler_full_name
             ] = obs_meta
             followers.append(obs_meta)
+        # sender 不得在 admins_id（否则 wake 阶段会提权为 admin，
+        # 权限拒绝分支无法真实触达）
         event = FakeEvent(
-            sender_id="10001", group_id="700000001", role="admin",
+            sender_id=sender, group_id=group, role=role,
             message_str="/" + cmd,
         )
         event.message_obj.message = [Plain("/" + cmd)]
         identity, _persona = await plugin._commands._identity(event)
         ledger.begin_turn(
             identity_key=identity.key, event_key="seed-" + name,
-            source_type="group", source_id="700000001",
+            source_type="group", source_id=group,
             umo=event.unified_msg_origin,
             user_message={"role": "user", "content": "SYNTHETIC-BEFORE-COMMAND"},
         )
@@ -467,12 +473,31 @@ async def main() -> int:
         "new-without-provider-then-recovery", cmd="new", provider=False,
         recover=True,
     )
+    # N10/Y3：范围外与权限拒绝（persona 方向）
+    await scenario("out-of-scope-reset", group="999999999")
+    await scenario(
+        "permission-denied-reset", role="member", sender="30003")
     # X5/N10：user 模式真实分发矩阵（关键行）
     await scenario("user-default-reset", mode="user")
     await scenario("user-new-with-provider", mode="user", cmd="new")
     await scenario("user-no-provider-new", mode="user", cmd="new", provider=False)
     await scenario("user-renamed-old-name", mode="user", renamed=True)
     await scenario("user-custom-filter-denied", mode="user", filtered=True)
+    # N10/Y3：user 模式补齐原定分支
+    await scenario("user-no-provider-reset", mode="user", provider=False)
+    await scenario("user-builtins-disabled-reset", mode="user", disabled=True)
+    await scenario(
+        "user-builtins-disabled-new", mode="user", disabled=True, cmd="new")
+    await scenario(
+        "user-renamed-new-name", mode="user", renamed=True, cmd="clear-history")
+    await scenario("user-out-of-scope-reset", mode="user", group="999999999")
+    await scenario(
+        "user-permission-denied", mode="user", role="member",
+        sender="30003")
+    # N10/Y3：user 模式 once-only follower 屏障
+    await scenario("user-reset-two-handlers", mode="user", follower=True)
+    await scenario(
+        "user-new-two-handlers", mode="user", cmd="new", follower=True)
     # X5：继承保护（user off→persona）下原生 new 不得联动/误提示
     await scenario(
         "persona-inherit-protected-new", mode="persona", cmd="new",

@@ -24,7 +24,7 @@ from .identity import (
     build_identity,
     resolve_persona_scope,
 )
-from .ledger import TurnLedger
+from .ledger import LedgerError, TurnLedger
 from .scope import MembershipError, MembershipStore, ScopeResolver
 
 
@@ -155,6 +155,27 @@ class CommandService:
             "请检查数据目录的磁盘空间与写入权限后重试。"
         )
 
+    def _register_mode_fact(self, identity: SharedIdentity) -> str | None:
+        """Y2：仅执行命令的身份也登记当前生效模式（X1 合同的命令入口）。
+
+        - 未记录（0.6.0 升级/新身份首次命令）：登记当前模式，代次不变；
+        - 已记录且相同：幂等 no-op（同模式重复命令/重载不清代次）；
+        - 已记录且不同：代次 +1（显式切换合同，与 initialize 对账一致）。
+        登记失败返回受控文案（此时退出/加入本身已持久化，状态安全），
+        不得假报整条命令成功。
+        """
+
+        try:
+            self._ledger.apply_scope_mode(
+                self._ledger.base_key_of(identity.key), identity.mode
+            )
+        except LedgerError:
+            return (
+                "⚠️ 本次操作已保存，但共享模式记录更新失败；"
+                "请在确认共享状态后重试一次本命令。"
+            )
+        return None
+
     def _scope_line(self) -> str:
         cfg = self._resolver.config
         return (
@@ -264,6 +285,10 @@ class CommandService:
             self._membership.opt_out(identity)
         except MembershipError:
             return self._persist_failure_text()
+        # Y2：首次 off（或已生效身份）登记模式事实，失败不假报成功
+        reg_err = self._register_mode_fact(identity)
+        if reg_err is not None:
+            return reg_err
         if identity.mode == MODE_USER:
             return (
                 "🚪 已退出跨人格共享：该账号的全部人格从下一轮起不再读取、"
@@ -293,6 +318,10 @@ class CommandService:
                 self._membership.opt_in_persona(identity)
         except MembershipError:
             return self._persist_failure_text()
+        # Y2：首次 on（或已生效身份）登记模式事实，失败不假报成功
+        reg_err = self._register_mode_fact(identity)
+        if reg_err is not None:
+            return reg_err
         if not self._window_in_scope(event):
             return (
                 "⚠️ 已取消退出标记，但当前窗口不在管理员允许范围内，"

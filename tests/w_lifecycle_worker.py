@@ -452,27 +452,52 @@ async def main() -> int:
     release_a.set()
     import traceback
 
+    # Y1：任务结果显式归类（returned / host_boundary_keyerror / failed:*），
+    # 异常始终保留完整调用栈、异常类型、键与最深帧来源；只有精确命中
+    # "宿主 call_event_hook 在事件停止后为已卸载插件打日志索引 star_map"
+    # 这一个边界才可受控让出，其余 KeyError/RuntimeError/TimeoutError 均失败。
     try:
         await asyncio.wait_for(t_a, 3)
-        out["switch_active_returned"] = True
+        out["switch_active_outcome"] = "returned"
     except BaseException as exc:  # noqa: BLE001
-        out["switch_active_returned"] = False
+        out["switch_active_outcome"] = f"failed:{type(exc).__name__}"
         out["switch_active_traceback"] = traceback.format_exc()
+    out["switch_active_returned"] = out["switch_active_outcome"] == "returned"
     try:
         await asyncio.wait_for(t_b, 3)
-        out["switch_queued_returned"] = True
+        out["switch_queued_outcome"] = "returned"
     except BaseException as exc:  # noqa: BLE001
         tb = traceback.format_exc()
-        if (isinstance(exc, KeyError) and "star_map" in tb
-                and "context_utils.py" in tb):
-            # 归属：宿主 context_utils.call_event_hook 在事件停止后为已
-            # 卸载插件残留 handler 打日志时索引 star_map（宿主侧边界）。
-            # 受控让出：返回 True，不变量由 queued_no_output/stopped 断言
-            out["switch_queued_returned"] = True
-            out["switch_queued_host_boundary"] = True
+        out["switch_queued_full_traceback"] = tb
+        out["switch_queued_exc_type"] = type(exc).__name__
+        out["switch_queued_exc_key"] = (
+            exc.args[0] if isinstance(exc, KeyError) and exc.args else None
+        )
+        frames = traceback.extract_tb(exc.__traceback__)
+        if frames:
+            deepest = frames[-1]
+            rel = Path(deepest.filename).as_posix().split("site-packages/")[-1]
+            out["switch_queued_exc_source"] = f"{rel}:{deepest.name}"
         else:
-            out["switch_queued_returned"] = False
-            out["switch_queued_traceback"] = tb
+            out["switch_queued_exc_source"] = None
+        classified = (
+            isinstance(exc, KeyError)
+            and out["switch_queued_exc_key"]
+            == f"data.plugins.{PLUGIN_DIR_NAME}.main"
+            and out["switch_queued_exc_source"]
+            == "astrbot/core/pipeline/context_utils.py:call_event_hook"
+            and (
+                ev_b.get_extra("agent_stop_requested") is True
+                or ev_b.is_stopped()
+            )
+        )
+        out["switch_queued_outcome"] = (
+            "host_boundary_keyerror"
+            if classified
+            else f"failed:{type(exc).__name__}"
+        )
+    out["switch_queued_returned"] = out["switch_queued_outcome"] == "returned"
+    out["switch_queued_model_calls"] = len(prov_b.call_log)
     out["switch_active_no_late"] = not any(
         "LATE-SWITCH" in (c.get_plain_text() or "") for c in ev_a.sent_chains
     )
@@ -492,6 +517,20 @@ async def main() -> int:
     )
     # X6：受控让出的事件停止证据（宿主边界 KeyError 路径下事件应已停止）
     out["switch_queued_stopped"] = ev_b.is_stopped()
+    # Y1：受控让出还需 0 模型调用、无共享回写、锁无残留等待者
+    with sqlite3.connect(
+        instance_root / "data" / "plugin_data" / PLUGIN_DIR_NAME / "uctx_ledger.db"
+    ) as db:
+        queued_rows = db.execute(
+            "SELECT status FROM turns WHERE user_message LIKE '%切换期排队%'"
+        ).fetchall()
+    out["switch_queued_ledger_no_completed"] = not any(
+        r[0] == "completed" for r in queued_rows
+    )
+    out["switch_queued_lock_waiters_after"] = sum(
+        len(lock._waiters or [])
+        for lock in plugin._bridge._identity_locks.values()
+    )
     done, ctx, _ev, cap_new = await ask(plugin, "700000001", "NEW-问", "NEW-答")
     out["switch_new_config_turn_done"] = done
     out["switch_new_config_fresh"] = (

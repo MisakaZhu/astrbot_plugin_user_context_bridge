@@ -186,11 +186,13 @@ async def main() -> int:
                 ).fetchall()]
             )
         )
-        # ---- N04（X6）：user 模式真实 PersonaManager/ConversationManager/
-        # 宿主请求装配 —— 当前窗口人格 system/begin_dialogs 经宿主
-        # _ensure_persona_and_skills 注入，工具/动态注入保留，跨人格共享
-        from astrbot.core.star import Context as HostContext
-
+        # ---- N04（Y3）：user 模式真实 PersonaManager/ConversationManager/
+        # 宿主请求装配 → 注册请求钩子 → Runner/假模型实际调用 → 真实终态
+        # 钩子（on_agent_done 提交 completed）→ 下一窗口请求。
+        # 群A(persona_a) → 群B(persona_b) → 私聊(persona_c) 链式继承。
+        # 先受控收尾 explicit-check 场景遗留的挂起轮（其终态本就在
+        # shutdown 时落 interrupted），使 N04 从 0 pending 起步。
+        bridge.finalize_pending_as_interrupted()
         resolver.set_history_scope("user")
         # 恢复真实人格管理器（T1 失败场景曾替换为 BrokenManager）
         bridge._get_persona_manager = lambda: pm
@@ -198,16 +200,97 @@ async def main() -> int:
             "persona_u", "PERSONA-U-SYSTEM",
             ["U-BEGIN-Q", "U-BEGIN-A"], tools=[], skills=[],
         )
+        await pm.create_persona(
+            "persona_c", "PERSONA-C-SYSTEM",
+            ["C-BEGIN-Q", "C-BEGIN-A"], tools=[], skills=[],
+        )
         tool_marker = {"type": "function", "function": {"name": "u_tool"}}
         dyn_marker = "DYNAMIC-INJECTION-MARKER"
 
-        async def drive_user_window(window_group, answer, persona_default):
+        async def _drive_real_chain(ev, provider, req) -> dict:
+            """宿主装配后的同一 req 走完整宿主链：注册请求钩子 →
+            ToolLoopAgentRunner/假模型 → 真实终态钩子 → 装饰与投递。"""
+            from copy import deepcopy
+
+            from astrbot.core.agent.run_context import ContextWrapper
+            from astrbot.core.agent.runners.tool_loop_agent_runner import (
+                ToolLoopAgentRunner,
+            )
+            from astrbot.core.astr_agent_hooks import MAIN_AGENT_HOOKS
+            from astrbot.core.astr_agent_run_util import run_agent
+            from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
+            from astrbot.core.config.default import DEFAULT_CONFIG
+            from astrbot.core.pipeline.result_decorate.stage import (
+                ResultDecorateStage,
+            )
+            from astrbot.core.pipeline.scheduler import PipelineScheduler
+
+            stopped = await call_event_hook(
+                ev, EventType.OnLLMRequestEvent, req
+            )
+            info = {"hook_stopped": bool(stopped or ev.is_stopped())}
+            if info["hook_stopped"]:
+                info["model_calls"] = 0
+                return info
+            runner = ToolLoopAgentRunner()
+            await runner.reset(
+                provider=provider,
+                request=req,
+                run_context=ContextWrapper(context=SimpleNamespace(event=ev)),
+                tool_executor=FunctionToolExecutor(),
+                agent_hooks=MAIN_AGENT_HOOKS,
+                streaming=False,
+            )
+
+            class AgentStage:
+                async def process(self, ev_inner):
+                    async for _ in run_agent(runner, 30, True, False, False):
+                        yield
+
+            class Transport:
+                async def process(self, ev_inner):
+                    result = ev_inner.get_result()
+                    if result is not None and getattr(result, "chain", None):
+                        await ev_inner.send(result)
+                        await call_event_hook(
+                            ev_inner, EventType.OnAfterMessageSentEvent
+                        )
+
+            cfg = deepcopy(DEFAULT_CONFIG)
+            cfg["t2i"] = False
+            cfg["content_safety"]["also_use_in_response"] = False
+            cfg["provider_tts_settings"]["enable"] = False
+            cfg["platform_settings"]["reply_with_mention"] = False
+            cfg["platform_settings"]["reply_with_quote"] = False
+            cfg["platform_settings"]["segmented_reply"]["enable"] = False
+            stage_ctx = SimpleNamespace(
+                astrbot_config=cfg,
+                plugin_manager=SimpleNamespace(
+                    context=SimpleNamespace(
+                        get_using_tts_provider_async=AsyncMock(return_value=None),
+                        get_using_tts_provider=lambda umo: None,
+                    )
+                ),
+            )
+            decorator = ResultDecorateStage()
+            await decorator.initialize(stage_ctx)
+            scheduler = PipelineScheduler.__new__(PipelineScheduler)
+            scheduler.ctx = stage_ctx
+            scheduler.stages = [AgentStage(), decorator, Transport()]
+            await scheduler._process_stages(ev)
+            info["model_calls"] = len(provider.call_log)
+            return info
+
+        async def drive_user_window(label, answer, persona_default,
+                                    private=False):
+            window_group = "" if private else f"70000000{label}"
             ev = FakeEvent(
                 sender_id="10001", group_id=window_group,
-                message_str="USER-MODE-" + window_group)
+                message_str="USER-MODE-" + label)
             req = ProviderRequest()
             req.prompt = ev.message_str
             req.contexts = []
+            req.system_prompt = ""
             req.conversation = await _get_session_conv(
                 ev, SimpleNamespace(
                     persona_manager=pm, conversation_manager=cm,
@@ -243,57 +326,75 @@ async def main() -> int:
             cfg_ps = provider_settings_for(ev.unified_msg_origin)
             await _ensure_persona_and_skills(
                 req, cfg_ps, host_ctx, ev)
-            # 工具/动态注入（宿主装配之后、插件接管之前）
+            # 宿主工具集合 + 请求阶段动态注入（等价另一插件在
+            # OnLLMRequestEvent 时点的注入，随请求存在、不落共享历史）
             req.func_tool = [tool_marker]
             req.system_prompt = (req.system_prompt or "") + chr(10) + dyn_marker
-            cap0 = ledger.stats_captured() if hasattr(ledger, "stats_captured") else None
-            await bridge.handle_llm_request(ev, req)
-            return req
+            provider = FakeProvider([answer])
+            info = await _drive_real_chain(ev, provider, req)
+            return ev, req, provider, info
 
-        req_a = await drive_user_window("700000001", "UA-ANSWER", "persona_a")
-        # 直接 handle 只登记 running 轮——模拟 on_agent_done 提交，B 才能在
-        # 历史中读到 A（真实提交点见 bridge 终态机）
-        ev_key_a = bridge.event_key_for(
-            FakeEvent(sender_id="10001", group_id="700000001",
-                      message_str="USER-MODE-700000001"))
-        with sqlite3.connect(ledger._db_path) as conn:
-            row = conn.execute(
-                "SELECT event_key FROM turns WHERE status='running'"
-                " ORDER BY id DESC LIMIT 1").fetchone()
-        ek = row[0] if row else ev_key_a
-        ledger.commit_turn(
-            event_key=ek, status="completed",
-            trajectory=[{"role": "assistant", "content": "UA-ANSWER"}],
-            reply_text="UA-ANSWER")
-        req_b = await drive_user_window("700000002", "UB-ANSWER", "persona_b")
+        _ev_a, req_a, prov_a, info_a = await drive_user_window(
+            "1", "UA-ANSWER", "persona_a")
+        _ev_b, req_b, prov_b, info_b = await drive_user_window(
+            "2", "UB-ANSWER", "persona_b")
+        _ev_c, req_c, prov_c, info_c = await drive_user_window(
+            "3", "UC-ANSWER", "persona_c", private=True)
 
-        with sqlite3.connect(ledger._db_path) as db:
-            all_rows = db.execute(
-                "SELECT identity_key, user_message FROM turns ORDER BY id"
-            ).fetchall()
-        observed["n04_debug_rows"] = [
-            (r[0][-20:], r[1][:60]) for r in all_rows]
         with sqlite3.connect(ledger._db_path) as db:
             u_rows = db.execute(
-                "SELECT identity_key, source_persona, user_message FROM turns"
-                " WHERE user_message LIKE '%USER-MODE%'"
+                "SELECT identity_key, source_persona, status FROM turns"
+                " WHERE user_message LIKE '%USER-MODE-%'"
                 " ORDER BY id").fetchall()
-        observed["n04_user_identity_keys"] = [
-            r[0] for r in u_rows]
+        observed["n04_user_identity_keys"] = [r[0] for r in u_rows]
         observed["n04_single_u_key"] = (
             len({r[0] for r in u_rows}) == 1
-            and "u:" in u_rows[0][0]
+            and "u:" in (u_rows[0][0] if u_rows else "")
         )
         observed["n04_source_personas"] = [r[1] for r in u_rows]
-        # 最终请求：当前窗口人格 system/begin_dialogs + 工具/动态注入保留
-        ctx_b = json.dumps(req_b.call_log if hasattr(req_b, "call_log") else [],
-                           ensure_ascii=False)
+        # 真实终态：三窗全部经 on_agent_done 提交 completed；
+        # 0 watchdog、0 pending、每窗恰好一次真实模型调用
+        observed["n04_model_calls"] = [
+            info_a.get("model_calls"), info_b.get("model_calls"),
+            info_c.get("model_calls")]
+        observed["n04_all_model_called"] = all(
+            i.get("model_calls") == 1 and not i.get("hook_stopped")
+            for i in (info_a, info_b, info_c)
+        )
+        observed["n04_all_completed"] = (
+            len(u_rows) == 3 and all(r[2] == "completed" for r in u_rows))
+        observed["n04_pending_zero"] = bridge.pending_count == 0
+        observed["n04_watchdog_zero"] = bridge.stats.watchdog_failures == 0
+
+        # 终模型实参（假模型 call_log）：Runner 会把 system_prompt 折入
+        # contexts 首条 system 消息，故以"system_prompt + contexts 中
+        # system 消息"的合并视图断言。当前窗口人格 system、当前开场白
+        # 恰好一次、动态注入到达模型；不含旧人格 system/开场白；后继窗口
+        # 含前一窗口完整问答；动态临时内容不落共享账本。
+        def _model_view(log):
+            parts = [log.get("system_prompt") or ""]
+            for m in log["contexts"]:
+                if isinstance(m, dict) and m.get("role") == "system":
+                    parts.append(str(m.get("content") or ""))
+            return "\n".join(parts)
+
+        log_a = prov_a.call_log[0]
+        log_b = prov_b.call_log[0]
+        log_c = prov_c.call_log[0]
+        view_b = _model_view(log_b)
+        view_c = _model_view(log_c)
+        ctx_b = json.dumps(log_b["contexts"], ensure_ascii=False, default=str)
+        ctx_c = json.dumps(log_c["contexts"], ensure_ascii=False, default=str)
         observed["n04_system_current_persona"] = (
-            "PERSONA-B-SYSTEM" in (req_b.system_prompt or "")
-            and "PERSONA-A-SYSTEM" not in (req_b.system_prompt or "")
+            "PERSONA-B-SYSTEM" in view_b
+            and "PERSONA-A-SYSTEM" not in view_b
+            and "PERSONA-C-SYSTEM" in view_c
+            and "PERSONA-B-SYSTEM" not in view_c
         )
         observed["n04_begin_dialog_current"] = (
-            "B-BEGIN-Q" in json.dumps(req_b.contexts, ensure_ascii=False)
+            ctx_b.count("B-BEGIN-Q") == 1 and ctx_b.count("B-BEGIN-A") == 1
+            and "A-BEGIN-Q" not in ctx_b
+            and ctx_c.count("C-BEGIN-Q") == 1
         )
         observed["n04_tool_preserved"] = (
             json.dumps(tool_marker, ensure_ascii=False)
@@ -301,15 +402,24 @@ async def main() -> int:
                           ensure_ascii=False, default=str)
         )
         observed["n04_dynamic_injection_preserved"] = (
-            dyn_marker in (req_b.system_prompt or "")
+            dyn_marker in view_b and dyn_marker in view_c
+        )
+        with sqlite3.connect(ledger._db_path) as db:
+            blobs = db.execute(
+                "SELECT IFNULL(user_message,'') || ',' ||"
+                " IFNULL(trajectory,'') || ',' || IFNULL(reply_text,'')"
+                " FROM turns WHERE identity_key LIKE '%"
+                + chr(31) + "u:" + chr(31) + "%'"
+            ).fetchall()
+        observed["n04_dynamic_not_in_ledger"] = all(
+            dyn_marker not in (r[0] or "") for r in blobs
         )
         observed["n04_cross_persona_chain"] = (
-            "USER-MODE-700000001" in json.dumps(req_b.contexts,
-                                                ensure_ascii=False,
-                                                default=str)
+            "USER-MODE-1" in ctx_b and "UA-ANSWER" in ctx_b
+            and "PERSONA-A-SYSTEM" not in view_b
+            and "USER-MODE-2" in ctx_c and "UB-ANSWER" in ctx_c
         )
-        observed["n04_debug_bctx"] = json.dumps(
-            req_b.contexts, ensure_ascii=False, default=str)[:400]
+        observed["n04_debug_bctx"] = ctx_b[:300]
 
         print("@@RESULT@@" + json.dumps(observed, ensure_ascii=False))
     finally:
