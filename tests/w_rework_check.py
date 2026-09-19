@@ -337,59 +337,57 @@ def w3_migration() -> None:
 # W4：键编码结构性无碰撞
 # ---------------------------------------------------------------------------
 def w4_key_encoding() -> None:
-    # 任意 persona id（包括保留样式与编码前缀样式）的 persona 键
-    # 都不会与 user 键 / quarantine 键混淆
-    tricky_personas = [
-        "__mode_user__", "u:", "u:x", "p:black", "q:x", "__default__",
-        "带中文", "with:colon", "a\x1fb",
-    ]
-    collisions = []
-    for pid in tricky_personas:
-        persona = build_identity(
-            platform_id="aiocqhttp", self_id="bot_001",
-            persona_scope=pid, sender_id="10001").key
-        user = build_identity(
-            platform_id="aiocqhttp", self_id="bot_001",
-            persona_scope=None, sender_id="10001", mode=MODE_USER).key
-        p_token = persona.split("\x1f")[2]
-        if persona == user or p_token == SCOPE_USER_TOKEN:
-            collisions.append(pid)
-    check("W4.no-collision-with-user-token", not collisions,
-          f"collisions={collisions}")
+    sep = chr(31)
 
-    # from_key 往返与模式解码
-    p_key = identity_of("10001", "black")
-    u_key = identity_of("10002", "user")
-    q_key = f"aiocqhttp\x1fbot_001\x1fq:__mode_user__\x1f10003"
-    from uctx_bridge.identity import SharedIdentity
+    def raw_key(scope):
+        return sep.join(("aiocqhttp", "bot", scope, "10001"))
 
-    dec_p = SharedIdentity.from_key(p_key)
-    dec_u = SharedIdentity.from_key(u_key)
-    dec_q = SharedIdentity.from_key(q_key)
-    check("W4.decode-persona",
-          dec_p.mode == "persona" and dec_p.persona_scope == "black"
-          and dec_p.key == p_key)
-    check("W4.decode-user",
-          dec_u.mode == MODE_USER and dec_u.key == u_key)
-    check("W4.decode-quarantine",
-          dec_q.mode == "quarantine"
-          and dec_q.persona_scope == "__mode_user__")
-
-    # 迁移改写矩阵：裸→p:；裸 __mode_user__→q:；已编码不动；base 键不动
+    # v1 输入：scope 一律是原始人格 ID 字面值 → p:+字面值（无歧义）
     check("W4.rewrite-bare",
-          _migrate_identity_key(f"aiocqhttp\x1fbot\x1fmaid\x1f10001")
-          == identity_of("10001", "maid", self_id="bot", platform="aiocqhttp").replace("bot\x1f", "bot\x1f"))
-    check("W4.rewrite-legacy-user-token-quarantined",
-          _migrate_identity_key(f"aiocqhttp\x1fbot\x1f__mode_user__\x1f10001")
-          == f"aiocqhttp\x1fbot\x1fq:__mode_user__\x1f10001")
-    check("W4.rewrite-keeps-encoded",
-          _migrate_identity_key(u_key) == u_key
-          and _migrate_identity_key(p_key) == p_key
-          and _migrate_identity_key(q_key) == q_key)
-    base = base_of("10001")
-    check("W4.rewrite-base-key-untouched", _migrate_identity_key(base) == base)
+          _migrate_identity_key(raw_key("maid"), 1)
+          == sep.join(("aiocqhttp", "bot", "p:maid", "10001")))
+    check("W4.v1-literal-p-colon-prefixed",
+          _migrate_identity_key(raw_key("p:maid"), 1)
+          == sep.join(("aiocqhttp", "bot", "p:p:maid", "10001")))
+    check("W4.v1-literal-u-colon-prefixed",
+          _migrate_identity_key(raw_key("u:"), 1)
+          == sep.join(("aiocqhttp", "bot", "p:u:", "10001")))
+    check("W4.v1-literal-q-colon-prefixed",
+          _migrate_identity_key(raw_key("q:foo"), 1)
+          == sep.join(("aiocqhttp", "bot", "p:q:foo", "10001")))
+    check("W4.v1-mode-user-not-quarantined",
+          _migrate_identity_key(raw_key("__mode_user__"), 1)
+          == sep.join(("aiocqhttp", "bot", "p:__mode_user__", "10001")))
 
-    # inspect_schema_version：新库/旧库/损坏
+    # v2 输入：仅字面 __mode_user__ 歧义隔离；其余原始名加 p:
+    check("W4.v2-mode-user-quarantined",
+          _migrate_identity_key(raw_key("__mode_user__"), 2)
+          == sep.join(("aiocqhttp", "bot", "q:__mode_user__", "10001")))
+    check("W4.v2-ordinary-persona-prefixed",
+          _migrate_identity_key(raw_key("u:"), 2)
+          == sep.join(("aiocqhttp", "bot", "p:u:", "10001")))
+
+    # v3 输入不重写（幂等由版本判定，而非“看起来像已编码”）
+    u_key = sep.join(("aiocqhttp", "bot", "u:", "10001"))
+    p_key = sep.join(("aiocqhttp", "bot", "p:black", "10001"))
+    q_key = sep.join(("aiocqhttp", "bot", "q:foo", "10001"))
+    check("W4.rewrite-keeps-encoded",
+          _migrate_identity_key(u_key, 3) == u_key
+          and _migrate_identity_key(p_key, 3) == p_key
+          and _migrate_identity_key(q_key, 3) == q_key)
+    base = sep.join(("aiocqhttp", "bot", "10001"))
+    check("W4.rewrite-base-key-untouched",
+          _migrate_identity_key(base, 1) == base)
+
+    # membership 编码矩阵同源
+    mk = raw_key("__mode_user__")
+    check("X3.membership-v1-not-ambiguous",
+          encode_membership_key(mk, 1)
+          == (sep.join(("aiocqhttp", "bot", "p:__mode_user__", "10001")), False))
+    check("X3.membership-v2-ambiguous",
+          encode_membership_key(mk, 2)[1] is True)
+
+    # inspect_schema_version：新库/损坏
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         led = TurnLedger(Path(td) / "n.db")
         led.open()
@@ -406,6 +404,7 @@ def w4_key_encoding() -> None:
         except Exception:
             raised = False
         check("W3.inspect-corrupt-controlled", raised)
+
 
 
 def main() -> int:
