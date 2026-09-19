@@ -20,7 +20,7 @@
 ### 版本与包
 
 - 全量回归：17 套 × 4.26.0/4.28.0 各 **561 项全 PASS**（298+113+150）；日志 local_evidence/w_logs/（34 份）。
-- 候选包：release/astrbot_plugin_user_context_bridge-<sha>.zip（13 文件白名单含 tools/）+ SHA-256，见交付报告；旧 0.6.0 包未触碰。
+- 交付提交 ce8b75c（实现+文档）；候选包 release/astrbot_plugin_user_context_bridge-ce8b75c.zip（13 文件白名单含 tools/uctx_records.py），SHA-256 40493ca1623d3589ae0572cd6a6dac0cfa4f1cfb51e9453559c6e8d33da887bd；双版导入探针 OK + ZIP 解包后工具独立运行 OK；旧 0.6.0 包（ac51bde，78e64560…9af）逐字节未触碰。
 - 边界：未 push、未建 Release、未部署；真实 QQ/模型未用；迁移仅合成/真实实现构造旧库；N24 实机待 MIS-145。
 
 ### 历史

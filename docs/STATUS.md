@@ -4,7 +4,7 @@
 
 ## 当前：0.7.0 W1–W8 返工完成（待 Codex 复验 MIS-170）
 
-- 分支 `feat/0.7.0-persona-records`；返工基线 219cef2；提交链见 HANDOFF.md 顶部。
+- 分支 `feat/0.7.0-persona-records`；返工基线 219cef2；交付提交 **ce8b75c**；候选包 `astrbot_plugin_user_context_bridge-ce8b75c.zip`（SHA-256 `40493ca1…a887bd`）。
 - 修复独立验收确认的 W1–W8 全部阻断项：模式持久化（scope_mode/meta）、键结构性编码（p:/u:/q:）、
   退出继承接入真实命令与转换、迁移原子化+backup API 一致性备份、status 重写（接管证据/有效数）、
   导出唯一基础身份消歧、backups 守卫、测试与矩阵收紧（含故障注入实调父断言）。
