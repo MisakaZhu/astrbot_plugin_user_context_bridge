@@ -1,4 +1,30 @@
-## 当前：0.7.0 X1–X6 返工完成（待 Codex 复验 MIS-170）
+## 当前：0.7.0 Y1–Y4 返工完成（待 Codex 复验 MIS-170）
+
+- 分支 `feat/0.7.0-persona-records`；X 轮基线 4d73c7a；Y 轮交付提交 **1efc0d2**；
+  候选包 `astrbot_plugin_user_context_bridge-1efc0d2.zip`
+  （SHA-256 `9f6299eab0bab7b6fb6547418880d71ede1597b166c64a7f4a03c2d64842ec57`，13 文件，
+  以 `--delivered-zip`/`--delivered-sha256` 显式指定跑 N22）。
+- 修复独立复验确认的 Y1–Y4：任务/子进程失败全入验收（Y1：S6 卸载等待
+  归类+完整栈、两个 worker 入口 rc/缺行/坏 JSON、故障注入走真实
+  wait_for 边界与真实父断言、W KeyError 精确边界严格分类）；首次命令
+  身份登记模式事实（Y2：off/on 登记、直接切换两方向恰好 +1、失败边界
+  受控）；N04 真实链走到模型与终态（Y3：三窗全 completed、0 watchdog、
+  0 pending、B/C 含前一窗完整问答）；N10 双模式矩阵补齐+user follower
+  屏障（Y3）；N22 显式 ZIP+SHA（Y1）；文档按真实 0.6.0 代码验证更正
+  （Y4：pre-migrate-v3-*/backup API、直接换旧代码=静默键分裂而非列
+  冲突、X 轮 745 更正为 708、ADR-017）。
+- 全量回归：**19 套** × 4.26.0/4.28.0 各 **814** 项断言全 PASS
+  （0 FAIL，38 次运行 rc 全 0），日志 local_evidence/y_logs/
+  （分套：p0–p6 17/36/27/19/22/16/8 + r/s/t 38/84/125 + n0–n3
+  10/30/14/59 + w 75/37/69 + x 64 + y2 64；父套件内部跨双版
+  spawn worker，同一条 PASS 只计一次）。
+- Linear：MIS-165/166/167/169 完成→In Review（附脱敏证据）；MIS-168
+  保持 In Review（只读工具与视觉范围未变化）；MIS-170 In Progress 等
+  Codex；MIS-145 实机不变。
+
+---
+
+## 前轮：0.7.0 X1–X6 返工（基线 4f542fe，交付 760f647/4cee8cf；历史记录，745 统计与部分完整链表述已被 Y 轮复验更正）
 
 - 分支 `feat/0.7.0-persona-records`；W 返工基线 4f542fe；X 轮交付提交 **760f647**，
   补遗 **4cee8cf**；候选包 `astrbot_plugin_user_context_bridge-4cee8cf.zip`
@@ -7,8 +33,9 @@
   迁移按输入版本解码（X3）、持久化失败不发布内存（X4）、原生联动有效退出（X5）、
   失败检测收紧与真实链补齐（X6：N04 user 真实装配、N10 双模式分发、N22 交付 ZIP
   全生命周期、故障注入实调父断言含 rc/异常/缺字段）。
-- 全量回归：18 套 × 4.26.0/4.28.0 各 **745** 项断言全 PASS（298+113+170+64），
-  日志 local_evidence/x_logs/。
+- 全量回归：18 套 × 4.26.0/4.28.0；~~745 项全 PASS~~（**Y 轮更正：
+  745 不成立，实际每版 708** = 348+113+183+64），日志
+  local_evidence/x_logs/。
 - Linear：MIS-165/166/167/169 完成→In Review；MIS-168 保持 In Review（W6/W7 通过，
   X3 合同变更已跑 n3 回归）；MIS-170 In Progress 等 Codex；MIS-145 实机不变。
 

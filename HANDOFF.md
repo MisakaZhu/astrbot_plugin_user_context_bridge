@@ -17,11 +17,30 @@
 
 ### 版本与包
 
+- **本轮（Y1–Y4）交付提交 1efc0d2**；候选包
+  `astrbot_plugin_user_context_bridge-1efc0d2.zip`（13 文件），
+  SHA-256 `9f6299eab0bab7b6fb6547418880d71ede1597b166c64a7f4a03c2d64842ec57`；
+  全量回归 19 套 × 双版各 **814** 项全 PASS（日志 local_evidence/y_logs/，
+  run_one/run_regression 输出）；N22 以显式路径+SHA 指定该包跑通。
+  N22 复现命令：
+  `PYTHONPATH=. <venv>/Scripts/python.exe -X utf8 tests/s_rework_check.py --delivered-zip release/astrbot_plugin_user_context_bridge-1efc0d2.zip --delivered-sha256 9f6299eab0bab7b6fb6547418880d71ede1597b166c64a7f4a03c2d64842ec57`
+  及同参 `tests/w_zip_lifecycle_check.py`。
+- 修复范围：Y1 任务/子进程失败全入验收（S6 卸载等待归类+完整栈、
+  worker 入口 rc/缺行/坏 JSON、真实路径故障注入 y_fault_observer、
+  W KeyError 精确边界严格分类、N22 显式 ZIP+SHA）；Y2 首次 off/on
+  命令登记模式事实（新套件 y2_command_first_use_check）；Y3 N04
+  真实链（t1 重写：模型调用/真实终态/0 watchdog/0 pending）与 N10
+  双模式矩阵+user follower 屏障（t5 扩展）；Y4 文档按真实 0.6.0
+  （859f18e）代码验证更正（回滚步骤、pre-migrate-v3-*/backup API、
+  静默键分裂、ADR-017、X 轮 745→708）。
+- 断点恢复：工作区应干净；实现提交 1efc0d2，纯文档收尾为后续提交；
+  旧包 ac51bde/27aadae/ce8b75c/4cee8cf 未触碰。
+
 - 交付提交 760f647（X 轮主体）+ 4cee8cf（w_rework 适配）；候选包
   `astrbot_plugin_user_context_bridge-4cee8cf.zip`（13 文件），
   SHA-256 `6581762dfd2e112a53ccbdb52e7e3925e66d212f439ed6cd9fe384b405941e4d`；
   双版导入探针 + ZIP 工具独立运行 OK；旧 ac51bde/27aadae/ce8b75c 包未触碰。
-- 全量回归：18 套 × 双版各 **745** 项全 PASS（日志 local_evidence/x_logs/）。
+- 全量回归：18 套 × 双版；~~745~~（**Y 轮更正：实际每版 708**，日志 local_evidence/x_logs/）。
 - 边界：未 push/未发布/未部署；真实 QQ/模型未用；N24 实机待 MIS-145。
 
 ---

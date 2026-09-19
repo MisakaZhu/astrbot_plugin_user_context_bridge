@@ -172,7 +172,49 @@ W 返工中发现并修复的新缺陷：`identity_stats` 以 4 段身份键查�
 
 ---
 
-# 0.7.0 X1–X6 返工后矩阵（N01–N24 v3，2026-09-19）
+# 0.7.0 Y1–Y4 返工后矩阵（N01–N24 v4，2026-09-20）
+
+**对 v3 矩阵与 X 轮统计的更正**：Codex 对 4d73c7a 的独立复验（报告 27 号）
+确认——S6 卸载等待吞异常且父断言 8 PASS、`_run_s6_worker` 不检查 rc
+（rc=19+合法 JSON 仍 8 PASS）、W 排队 KeyError 以子串匹配放宽分类且
+未留完整栈、N22 按 mtime 选包且缺 `.sha256` 记 PASS；仅执行命令的新
+身份不登记模式事实（首次切换两方向漏推进）；N04 user 场景 0 模型调用
+（watchdog failed/interrupted 而布尔全 true）；N10 缺权限拒绝/禁用/
+改名新名成功/无 provider reset/范围外与 user follower 屏障；X 轮
+"745 项"统计不成立（实际每版 708=348+113+183+64，"298+113+170+64"
+算式本身也不成立）。
+
+全量回归（实现提交 1efc0d2；候选包
+`astrbot_plugin_user_context_bridge-1efc0d2.zip`，SHA-256
+`9f6299eab0bab7b6fb6547418880d71ede1597b166c64a7f4a03c2d64842ec57`；
+日志 local_evidence/y_logs/，逐套 rc/PASS/FAIL 见
+regression_summary.json）：**19 套 × 4.26.0/4.28.0，每版 814 项断言
+全 PASS（0 FAIL，38 次运行 rc 全 0）**。分套：p0–p6 17/36/27/19/22/16/8
++ r/s/t 38/84/125 + n0–n3 10/30/14/59 + w_lifecycle/w_rework/w_zip
+75/37/69 + x 64 + y2 64。计数口径：每套父运行日志行，w_lifecycle、
+w_zip、s6、y2 父套件内部各自跨双版 spawn worker，同一条 PASS 只计
+一次；S 套 84 条含 ZIP 生命周期、故障注入与 S1–S5 原生链，不全部
+归为 ZIP 断言。
+
+v3 表逐行状态以本轮证据继续成立，以下仅列 Y 轮实质变化行：
+
+| 编号 | Y 轮变化 | 本轮证据 | 状态 |
+| --- | --- | --- | --- |
+| N04 | 真实链补全：群A→群B→私聊三窗走 注册请求钩子→ToolLoopAgentRunner/假模型实际调用→真实 on_agent_done 终态提交；每窗恰好 1 次模型调用、账本 3 行全部 completed、0 watchdog、0 pending；后继窗口终模型实参=当前人格 system+当前开场白恰好一次+工具+动态注入，不含旧人格 system/开场白，含前一窗完整问答；动态临时内容不落账本（t1 N04 段重写+父套件新断言 11 项/版） | PASS（双版） |
+| N10 | 两模式矩阵补齐：新增 权限拒绝（真实宿主群聊 /reset 默认需 admin，非 admin 发送=宿主拒绝且插件不联动）、禁用（reset/new）、改名新名成功（user）、无 provider reset 拒绝（user）、范围外（双模式：宿主命令成功但插件不 bump 不提示）、user follower 屏障（once-only：epoch_delta=1、提示 1 次、挂起期间同账号另一人格新问答不被二次装饰清掉）；follower 观察键改随命令事件身份（user 模式查 u: 键，断言 observer_key_scope="u:"） | PASS（双版） |
+| N22 | 正式入口改为显式 --delivered-zip/--delivered-sha256（s6_delivered_zip_lifecycle 与 w_zip_lifecycle_check 同口径）：缺哈希记录/哈希不匹配/输入包缺失必须 FAIL，不按 mtime 选包；校验器自检用临时副本验证三种坏输入均被拒；本轮以 1efc0d2 包显式指定跑通完整链（含活动/排队/卸载与工具独立运行） | PASS（双版） |
+| N23 | 故障注入作用于真实路径：tests/y_fault_observer.py 在真实 worker 进程的真实 wait_for 等待边界注入（S6 活动/排队/卸载、W 活动/排队；RuntimeError/TimeoutError/无关 KeyError），输出经真实 _run_*_worker 解析、真实 assert_*_fields 判定，正常对照必须过、逐个故障必须 FAIL；worker 入口 rc=19/缺 RESULT 行/损坏 JSON/缺字段全部检出；卸载任务结果显式归类（returned/cancelled/failed:*），异常保留完整栈 | PASS（双版） |
+| N08 | 模式事实登记扩展到命令入口（Y2）：y2_command_first_use_check（新套件，真实 PluginManager+CommandService，双版 64 断言/版）——v1 旧退出升级登记不推进；新身份仅 off/on（零对话）登记当前模式，直接切另一模式两方向恰好 +1；重复命令幂等；登记边界失败→受控文案+退出不失+重载对账补登记+重试不多推进；已生效身份切换恰好一次、同模式重载不动 | PASS（双版） |
+
+---
+
+# 0.7.0 X1–X6 返工后矩阵（N01–N24 v3，2026-09-19；历史记录）
+
+> Y 轮更正：本节"每版 745 项断言全 PASS（298+113+170+64）"与实际日志
+> 不符——X 轮实际每版 708（348+113+183+64），且 N04/N10/N22 的
+> "真实链/完整生命周期"表述超出当时
+> 证据（见 v4 节更正明细）。表中其余行为 X 轮真实通过项。X 轮实际
+> 分套：旧 10 套 348 + n 系 113 + w 系 183 + x 系 64 = 708/版。
 
 **对 v2 矩阵的更正**：W 轮的 N01/N07/N08/N22 证据随后被独立复验否定——首次直接
 切换漏登记/漏推进（X1）、旧 persona_on 越过新 user off（X2）、迁移按前缀猜编
@@ -180,9 +222,9 @@ W 返工中发现并修复的新缺陷：`identity_stats` 以 4 段身份键查�
 异常未进判定（X6）。本轮逐项修复并以下表为准；v2 表保留作历史。
 
 全量回归（实现 SHA 见提交链；两版各一遍，日志 local_evidence/x_logs/）：
-18 套 × 4.26.0/4.28.0，**每版 745 项断言全 PASS**（旧 10 套 298 + n 系 113 +
-w 系 3 套 170 + x 系 1 套 64；w_lifecycle/w_zip/s6 父套件内部各自跨双版
-spawn worker，不重复计入总数）。
+18 套 × 4.26.0/4.28.0；~~每版 745 项断言全 PASS~~（**Y 轮更正：745 不
+成立，实际每版 708** = 348 + 113 + 183 + 64；w_lifecycle/w_zip/s6 父
+套件内部各自跨双版 spawn worker，不重复计入总数）。
 
 | 编号 | 场景 | 本轮证据 | 状态 |
 | --- | --- | --- | --- |
