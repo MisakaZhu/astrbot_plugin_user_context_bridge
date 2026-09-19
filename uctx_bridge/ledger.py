@@ -57,25 +57,30 @@ _LEGACY_USER_TOKEN = "__mode_user__"
 UNKNOWN_PERSONA = "__unknown__"
 
 
-def _migrate_identity_key(raw: str) -> str:
-    """旧身份键 → v3 编码；已是新编码原样返回。
+def _migrate_identity_key(raw: str, source_version: int) -> str:
+    """按**输入版本**解码旧身份键并编码到 v3（X3：不凭前缀猜）。
 
-    裸 scope：``__mode_user__`` → q:（0.7.0 首个候选键无法区分"真实
-    同名人格"与 user 模式记录，按 W4 恢复规则隔离保留、不注入）；
-    其余裸值 → p:<scope>（0.6.0 只有 persona 键）。
+    - v1（0.6.0）：scope 段一律是原始人格 ID 字面值（v1 无 user 模式），
+      完整保留字面值并加 ``p:`` 前缀——包括字面上叫 ``p:maid``/``u:``/
+      ``q:foo``/``__mode_user__`` 的人格（分别得到 ``p:p:maid``/``p:u:``/
+      ``p:q:foo``/``p:__mode_user__``）。
+    - v2（0.7.0 首个候选）：普通轮次 scope 同样是原始人格 ID，加 ``p:``；
+      仅字面 ``__mode_user__`` 承载过 user 模式行，与同名真实人格不可
+      辨认——按恢复规则改写 ``q:`` 隔离保留。
+    - v3：不重写（migrate_ledger 对 v3 输入提前幂等返回，不应到达此处；
+      防御性原样返回）。
+
+    每版本内编码是单射（scope 字面值完整保留），消除 ``maid`` 与
+    ``p:maid`` 并存时的 UNIQUE 冲突。
     """
 
     parts = raw.split("\x1f")
     if len(parts) != 4:
         return raw
     token = parts[2]
-    if (
-        token == _SCOPE_USER_TOKEN
-        or token.startswith(_SCOPE_PERSONA_PREFIX)
-        or token.startswith(_SCOPE_QUARANTINE_PREFIX)
-    ):
+    if source_version >= SCHEMA_VERSION:
         return raw
-    if token == _LEGACY_USER_TOKEN:
+    if source_version == 2 and token == _LEGACY_USER_TOKEN:
         new_token = _SCOPE_QUARANTINE_PREFIX + token
     else:
         new_token = _SCOPE_PERSONA_PREFIX + token
@@ -214,31 +219,44 @@ def migrate_ledger(db_path, *, backup_dir=None):
                     "ALTER TABLE turns ADD COLUMN mode_generation INTEGER"
                     " NOT NULL DEFAULT 0"
                 )
-            # 键改写（v1/v2 都执行；已编码键原样保留）
+            # 键改写（X3：按输入版本解码——v1/v2 的 scope 都是原始人格
+            # ID 字面值，加 p: 前缀；仅 v2 的字面 __mode_user__ 因承载过
+            # user 模式行而不可辨认，改写 q: 隔离）。
+            # 两遍改写：先全部落到临时唯一键，再写最终键——避免逐行更新
+            # 的中间态碰撞（如 v1 中 maid→p:maid 撞上字面 p:maid 行）。
             rows = conn.execute(
                 "SELECT id, identity_key FROM turns"
             ).fetchall()
             for row in rows:
-                new_key = _migrate_identity_key(row["identity_key"])
-                if new_key != row["identity_key"]:
-                    conn.execute(
-                        "UPDATE turns SET identity_key=? WHERE id=?",
-                        (new_key, row["id"]),
-                    )
+                conn.execute(
+                    "UPDATE turns SET identity_key=? WHERE id=?",
+                    (f"__tmp__{row['id']}", row["id"]),
+                )
+            for row in rows:
+                new_key = _migrate_identity_key(row["identity_key"], source_version)
+                conn.execute(
+                    "UPDATE turns SET identity_key=? WHERE id=?",
+                    (new_key, row["id"]),
+                )
             meta_keys = conn.execute(
                 "SELECT DISTINCT identity_key FROM meta"
             ).fetchall()
-            for mrow in meta_keys:
-                old = mrow["identity_key"]
-                if len(old.split("\x1f")) != 4:
-                    continue  # 3 段基础键（mode_generation 等）不含 scope
-                new_key = _migrate_identity_key(old)
-                if new_key != old:
-                    conn.execute(
-                        "UPDATE meta SET identity_key=? WHERE identity_key=?",
-                        (new_key, old),
-                    )
-            # source_persona 回填：仅补缺失/未知（v2 已回填不覆盖）
+            meta_four = [k for k in (r["identity_key"] for r in meta_keys)
+                         if len(k.split("\x1f")) == 4]
+            for old in meta_four:
+                conn.execute(
+                    "UPDATE meta SET identity_key=? WHERE identity_key=?",
+                    (f"__tmp__{old}", old),
+                )
+            for old in meta_four:
+                new_key = _migrate_identity_key(old, source_version)
+                conn.execute(
+                    "UPDATE meta SET identity_key=? WHERE identity_key=?",
+                    (new_key, f"__tmp__{old}"),
+                )
+            # source_persona 回填：仅补缺失/未知（v2 已回填不覆盖）。
+            # v1/v2 的 scope 都是原始人格 ID 字面值——含 __special__ 等
+            # 双下划线人格（X3：不再误判 unknown）
             rows = conn.execute(
                 "SELECT id, identity_key FROM turns WHERE source_persona IS NULL"
                 " OR source_persona='' OR source_persona='" + UNKNOWN_PERSONA + "'"
@@ -248,7 +266,7 @@ def migrate_ledger(db_path, *, backup_dir=None):
                 parts = row["identity_key"].split("\x1f")
                 if len(parts) == 4 and parts[2].startswith(_SCOPE_PERSONA_PREFIX):
                     candidate = parts[2][len(_SCOPE_PERSONA_PREFIX):]
-                    if candidate and not candidate.startswith("__"):
+                    if candidate:
                         persona = candidate
                 conn.execute(
                     "UPDATE turns SET source_persona=? WHERE id=?",
@@ -262,6 +280,14 @@ def migrate_ledger(db_path, *, backup_dir=None):
                 "INSERT OR REPLACE INTO schema_version (version, migrated_at)"
                 " VALUES (?, ?)",
                 (SCHEMA_VERSION, _time.time()),
+            )
+            # 记录迁移来源版本（X3）：membership 编码升级与账本同源
+            conn.execute(
+                "INSERT INTO meta (identity_key, name, value)"
+                " SELECT '__migration__', 'source_version', ?"
+                " WHERE NOT EXISTS (SELECT 1 FROM meta WHERE"
+                " identity_key='__migration__' AND name='source_version')",
+                (str(source_version),),
             )
             conn.execute("COMMIT")
         except Exception:
@@ -496,6 +522,20 @@ class TurnLedger:
         migrate_ledger(self._db_path)
         with self._lock:
             self._finish_schema_locked()
+
+    def migration_source_version(self) -> int | None:
+        """本次安装迁移的来源 schema 版本（X3；未迁移过返回 None）。
+
+        membership 编码升级须与账本同源：v1 来源的退出键全部是原始
+        人格 ID；v2 来源才存在 __mode_user__ 歧义行。
+        """
+
+        with self._lock:
+            row = self._require_conn().execute(
+                "SELECT value FROM meta WHERE identity_key='__migration__'"
+                " AND name='source_version'"
+            ).fetchone()
+        return int(row["value"]) if row else None
 
     def close(self) -> None:
         with self._lock:
@@ -766,8 +806,14 @@ class TurnLedger:
         user_message: dict[str, Any],
         lease_id: str | None = None,
         source_persona: str = "",
+        scope_mode: str | None = None,
     ) -> TurnRecord:
-        """登记 running 轮次；``event_key`` 重复时幂等返回既有记录（去重）。"""
+        """登记 running 轮次；``event_key`` 重复时幂等返回既有记录（去重）。
+
+        ``scope_mode``（X1）：身份**首次参与**时（本事务内创建 epoch 行），
+        同事务把当前生效模式登记到基础身份的 scope_mode——保证全新安装
+        第一轮之后即有可靠持久化事实，后续显式切换可正确推进代次。
+        """
 
         cleaned_user = sanitize_message(user_message)
         if cleaned_user is None:
@@ -788,6 +834,18 @@ class TurnLedger:
                     "ON CONFLICT(identity_key, name) DO NOTHING",
                     (identity_key,),
                 )
+                # X1：身份首次参与时同事务登记当前生效模式（基础身份维度）。
+                # 仅在该基础身份尚无 scope_mode 记录时写入；已记录（含迁移
+                # 登记与此前切换）不覆盖——模式变化只能走 apply_scope_mode。
+                if scope_mode in ("persona", "user"):
+                    base = self.base_key_of(identity_key)
+                    conn.execute(
+                        "INSERT INTO meta (identity_key, name, value)"
+                        " SELECT ?, 'scope_mode', ?"
+                        " WHERE NOT EXISTS (SELECT 1 FROM meta WHERE"
+                        " identity_key=? AND name='scope_mode')",
+                        (base, scope_mode, base),
+                    )
                 epoch = int(
                     conn.execute(
                         "SELECT value FROM meta WHERE identity_key=? AND name='epoch'",

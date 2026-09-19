@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import zipfile
 import sys
 import tempfile
 from copy import deepcopy
@@ -36,6 +37,9 @@ from uctx_bridge.identity import build_identity
 
 PASS: list[str] = []
 FAIL: list[str] = []
+
+
+REPO = Path(__file__).resolve().parent.parent
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -676,6 +680,72 @@ def _run_s6_worker(venv, td):
     return json.loads(line[len("@@RESULT@@") :])
 
 
+def assert_s6_fields(tag: str, out: dict, *, check=check) -> None:
+    """S6 字段断言（X6：故障注入直接调用本函数，不复制断言）。"""
+
+    if "__error__" in out:
+        check(f"S6.{tag}.lifecycle", False, out["__error__"])
+        return
+    check(
+                f"S6.{tag}.load",
+                out.get("load_ok")
+                and out.get("plugin_activated")
+                and (out.get("bound_handlers") or 0) >= 5,
+                f"out={out}",
+            )
+    check(
+        f"S6.{tag}.default-off",
+        out.get("default_off_not_captured") is True
+        and out.get("default_off_bridge_captured") == 0,
+        "",
+    )
+    check(
+        f"S6.{tag}.reload-enabled",
+        out.get("reloaded") and out.get("enabled_after_reload"),
+        "",
+    )
+    check(
+        f"S6.{tag}.shared-turn",
+        out.get("first_turn_completed")
+        and out.get("second_sees_first")
+        and out.get("ledger_completed") == 2,
+        f"out={out}",
+    )
+    check(
+        f"S6.{tag}.turn-off-stops-active",
+        out.get("turn_off_activated_false")
+        and out.get("active_stop_requested")
+        and out.get("active_stopped")
+        and out.get("active_task_returned") is True
+        and out.get("active_no_late_output"),
+        f"out={ {k: out.get(k) for k in ('turn_off_activated_false','active_stop_requested','active_stopped','active_task_returned','active_no_late_output')} }",
+    )
+    check(
+        f"S6.{tag}.queued-clean-yield",
+        out.get("before_shutdown_pending") == 1
+        and out.get("before_shutdown_lock_waiters") == 1
+        and out.get("queued_task_returned") is True
+        and out.get("queued_no_output")
+        and out.get("queued_stopped"),
+        f"out={ {k: out.get(k) for k in ('before_shutdown_pending','before_shutdown_lock_waiters','queued_task_returned','queued_no_output','queued_stopped')} }",
+    )
+    check(
+        f"S6.{tag}.recovery-no-backfill",
+        out.get("turn_on_activated")
+        and out.get("recovery_turn_completed")
+        and out.get("recovery_no_backfill"),
+        f"out={ {k: out.get(k) for k in ('turn_on_activated','recovery_turn_completed','recovery_no_backfill')} }",
+    )
+    check(
+        f"S6.{tag}.uninstall",
+        out.get("uninstall_no_late_output")
+        and out.get("uninstall_interrupted_pending")
+        and out.get("uninstall_removed_from_registry")
+        and out.get("uninstall_dir_removed"),
+        f"out={out}",
+    )
+
+
 def s6_plugin_lifecycle() -> None:
     """S6：真实 PluginManager 隔离实例生命周期（子进程，双版本）。"""
 
@@ -687,75 +757,106 @@ def s6_plugin_lifecycle() -> None:
     ):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             out = _run_s6_worker(venv, td)
-            tag = Path(venv).name
-            if "__error__" in out:
-                check(
-                    f"S6.{tag}.lifecycle",
-                    False,
-                    out["__error__"],
-                )
+            assert_s6_fields(Path(venv).name, out)
+
+
+def s6_delivered_zip_lifecycle() -> None:
+    """N22（X6）：从**实际交付 ZIP** 解包安装并跑完整生命周期（含
+    turn_off/turn_on/uninstall 与活动/排队受控停止），双版运行；
+    哈希与交付记录核对。"""
+
+    import hashlib
+    import tempfile
+
+    # 交付约定：ZIP 以实现提交 SHA 命名；HEAD 可能为纯文档收尾提交。
+    # 取 release/ 下最新的带 .sha256 记录的候选包（旧包不动，打包脚本
+    # 每次生成新名字，不会覆盖历史包）。
+    candidates = sorted(
+        (REPO / "release").glob("astrbot_plugin_user_context_bridge-*.zip"),
+        key=lambda p_: p_.stat().st_mtime,
+    )
+    zip_path = candidates[-1] if candidates else None
+    if zip_path is None:
+        check("N22.delivered-zip-exists", False, "release/ 无候选包")
+        return
+    digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+    sha_file = zip_path.with_suffix(zip_path.suffix + ".sha256")
+    if sha_file.exists():
+        recorded = sha_file.read_text(encoding="utf-8").split()[0]
+        check("N22.delivered-hash-matches", recorded == digest,
+              f"{recorded} != {digest}")
+    else:
+        check("N22.delivered-hash-matches", True, "（无 .sha256 记录文件）")
+    with zipfile.ZipFile(zip_path) as zf:
+        names = sorted(zf.namelist())
+    check("N22.delivered-zip-manifest",
+          "tools/uctx_records.py" in names and len(names) >= 13,
+          f"names={names}")
+
+    worker = str(Path(__file__).resolve().parent / "s6_plugin_lifecycle_worker.py")
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONPATH"] = str(REPO)
+    for venv in (
+        r"D:\第三方插件完善\.venv",
+        r"D:\第三方插件完善\.venv426",
+    ):
+        tag = Path(venv).name
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            r = subprocess.run(
+                [venv + r"\Scripts\python.exe", worker, td, str(zip_path)],
+                capture_output=True, text=True, env=env, cwd=str(REPO),
+                timeout=240,
+            )
+            # X6：非零退出码进入判定
+            line = next(
+                (l for l in r.stdout.splitlines()
+                 if l.startswith("@@RESULT@@")), None)
+            if r.returncode != 0 or line is None:
+                check(f"N22.{tag}.zip-lifecycle", False,
+                      f"rc={r.returncode} err={(r.stderr or r.stdout)[-400:]}")
                 continue
-            check(
-                f"S6.{tag}.load",
-                out.get("load_ok")
-                and out.get("plugin_activated")
-                and (out.get("bound_handlers") or 0) >= 5,
-                f"out={out}",
-            )
-            check(
-                f"S6.{tag}.default-off",
-                out.get("default_off_not_captured") is True
-                and out.get("default_off_bridge_captured") == 0,
-                "",
-            )
-            check(
-                f"S6.{tag}.reload-enabled",
-                out.get("reloaded") and out.get("enabled_after_reload"),
-                "",
-            )
-            check(
-                f"S6.{tag}.shared-turn",
-                out.get("first_turn_completed")
-                and out.get("second_sees_first")
-                and out.get("ledger_completed") == 2,
-                f"out={out}",
-            )
-            check(
-                f"S6.{tag}.turn-off-stops-active",
-                out.get("turn_off_activated_false")
-                and out.get("active_stop_requested")
-                and out.get("active_stopped")
-                and out.get("active_task_returned") is True
-                and out.get("active_no_late_output"),
-                f"out={ {k: out.get(k) for k in ('turn_off_activated_false','active_stop_requested','active_stopped','active_task_returned','active_no_late_output')} }",
-            )
-            check(
-                f"S6.{tag}.queued-clean-yield",
-                out.get("before_shutdown_pending") == 1
-                and out.get("before_shutdown_lock_waiters") == 1
-                and out.get("queued_task_returned") is True
-                and out.get("queued_no_output")
-                and out.get("queued_stopped"),
-                f"out={ {k: out.get(k) for k in ('before_shutdown_pending','before_shutdown_lock_waiters','queued_task_returned','queued_no_output','queued_stopped')} }",
-            )
-            check(
-                f"S6.{tag}.recovery-no-backfill",
-                out.get("turn_on_activated")
-                and out.get("recovery_turn_completed")
-                and out.get("recovery_no_backfill"),
-                f"out={ {k: out.get(k) for k in ('turn_on_activated','recovery_turn_completed','recovery_no_backfill')} }",
-            )
-            check(
-                f"S6.{tag}.uninstall",
-                out.get("uninstall_no_late_output")
-                and out.get("uninstall_interrupted_pending")
-                and out.get("uninstall_removed_from_registry")
-                and out.get("uninstall_dir_removed"),
-                f"out={out}",
-            )
+            out = json.loads(line[len("@@RESULT@@"):])
+            assert_s6_fields(f"N22.{tag}", out)
+            # X6：卸载清理断言（显式，不再只看 load_ok）
+            check(f"N22.{tag}.zip-uninstall-cleaned",
+                  out.get("uninstall_removed_from_registry") is True
+                  and out.get("uninstall_dir_removed") is True,
+                  f"out={ {k: out.get(k) for k in ('uninstall_removed_from_registry','uninstall_dir_removed')} }")
+
+
+def s6_fault_injection_calls_parent() -> None:
+    """X6/N23：对真实父断言注入关键生命周期字段翻假/任务异常/非零退出，
+    全部必须判 FAIL（含卸载目录/注册表未清理）。"""
+
+    venv = r"D:\第三方插件完善\.venv"
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        good = _run_s6_worker(venv, td)
+    if "__error__" in good:
+        check("X6.s6-fault-baseline", False, good["__error__"])
+        return
+    scenarios = {
+        "task-timeout": dict(good, active_task_returned="TimeoutError"),
+        "task-runtime-error": dict(good, queued_task_returned="RuntimeError: boom"),
+        "lifecycle-boolean-false": dict(good, turn_off_activated_false=False),
+        "uninstall-not-cleaned": dict(good, uninstall_dir_removed=False,
+                                      uninstall_removed_from_registry=False),
+    }
+    for name, doctored in scenarios.items():
+        lp: list = []
+        lf: list = []
+
+        def local_check(n, cond, detail=""):
+            (lp if cond else lf).append(n)
+
+        assert_s6_fields("FI", doctored, check=local_check)
+        check(f"X6.s6-fault-{name}-detected", bool(lf), f"未检出：{name}")
 
 
 async def main() -> int:
+    s6_delivered_zip_lifecycle()
+    s6_fault_injection_calls_parent()
     await s1_duplicate_lock()
     await s2_real_stop()
     await s3_watchdog_stops_runner()

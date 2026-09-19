@@ -25,7 +25,7 @@ from .identity import (
     resolve_persona_scope,
 )
 from .ledger import TurnLedger
-from .scope import MembershipStore, ScopeResolver
+from .scope import MembershipError, MembershipStore, ScopeResolver
 
 
 class _FakeConv:
@@ -146,6 +146,15 @@ class CommandService:
     def _unavailable_text(self) -> str:
         return f"⚠️ 共享功能当前不可用：{self._unavailable_reason or '状态存储不可用'}"
 
+    def _persist_failure_text(self) -> str:
+        """退出状态写失败的用户文案（X4：与实际结果一致，不泄漏本地
+        路径或聊天内容；因内存状态未发布，共享保持原状态）。"""
+
+        return (
+            "⚠️ 退出状态保存失败，本次操作未生效（共享保持原状态）。"
+            "请检查数据目录的磁盘空间与写入权限后重试。"
+        )
+
     def _scope_line(self) -> str:
         cfg = self._resolver.config
         return (
@@ -251,7 +260,10 @@ class CommandService:
             identity, persona = await self._identity(event)
         except PersonaResolutionError:
             return self._identity_error_text()
-        self._membership.opt_out(identity)
+        try:
+            self._membership.opt_out(identity)
+        except MembershipError:
+            return self._persist_failure_text()
         if identity.mode == MODE_USER:
             return (
                 "🚪 已退出跨人格共享：该账号的全部人格从下一轮起不再读取、"
@@ -272,12 +284,15 @@ class CommandService:
             return self._identity_error_text()
         if not self._resolver.config.enabled:
             return "⚠️ 共享未启用，无法加入。范围由管理员在插件配置中开启。"
-        if identity.mode == MODE_USER:
-            # user on：解除 user 键退出与基础保护；人格维度显式退出保留
-            self._membership.opt_in_user(identity)
-        else:
-            # persona on：仅解除本人格（基础保护对其他人格继续生效）
-            self._membership.opt_in_persona(identity)
+        try:
+            if identity.mode == MODE_USER:
+                # user on：解除 user 键退出与基础保护；人格维度显式退出保留
+                self._membership.opt_in_user(identity)
+            else:
+                # persona on：仅解除本人格（基础保护对其他人格继续生效）
+                self._membership.opt_in_persona(identity)
+        except MembershipError:
+            return self._persist_failure_text()
         if not self._window_in_scope(event):
             return (
                 "⚠️ 已取消退出标记，但当前窗口不在管理员允许范围内，"

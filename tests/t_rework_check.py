@@ -474,6 +474,42 @@ def t1_t5_t6_workers() -> None:
             and out.get("failure_key_absent") is True,
             "",
         )
+        # N04（X6）：user 模式真实 PersonaManager/ConversationManager/宿主装配
+        check(
+            f"N04.{tag}.user-single-u-key",
+            out.get("n04_single_u_key") is True,
+            f"keys={out.get('n04_user_identity_keys')}",
+        )
+        check(
+            f"N04.{tag}.source-personas",
+            out.get("n04_source_personas") == ["persona_a", "persona_b"],
+            f"got={out.get('n04_source_personas')}",
+        )
+        check(
+            f"N04.{tag}.system-current-persona",
+            out.get("n04_system_current_persona") is True,
+            f"sp={out.get('n04_system_current_persona')}",
+        )
+        check(
+            f"N04.{tag}.begin-dialog-current",
+            out.get("n04_begin_dialog_current") is True,
+            "",
+        )
+        check(
+            f"N04.{tag}.tool-preserved",
+            out.get("n04_tool_preserved") is True,
+            "",
+        )
+        check(
+            f"N04.{tag}.dynamic-injection-preserved",
+            out.get("n04_dynamic_injection_preserved") is True,
+            "",
+        )
+        check(
+            f"N04.{tag}.cross-persona-chain",
+            out.get("n04_cross_persona_chain") is True,
+            "",
+        )
 
     # T5/T6：真实 Context + 命令分发矩阵
     res = _run_worker("t5_native_worker.py")
@@ -489,6 +525,46 @@ def t1_t5_t6_workers() -> None:
             and dr.get("history_after") == 0
             and dr.get("epoch_bumped") is True,
             f"dr={dr}",
+        )
+        # X5/N10：user 模式真实分发矩阵
+        udr = out.get("user-default-reset", {})
+        check(
+            f"X5.{tag}.user-real-context-reset-syncs",
+            udr.get("native_update_calls") == 1
+            and udr.get("history_after") == 0
+            and udr.get("epoch_bumped") is True,
+            f"udr={udr}",
+        )
+        check(
+            f"X5.{tag}.user-new-with-provider-syncs",
+            out.get("user-new-with-provider", {}).get("history_after") == 0
+            and out.get("user-new-with-provider", {}).get("plugin_notified") is True,
+            f"unp={out.get('user-new-with-provider')}",
+        )
+        # U2 语义：new 不要求 provider——无 provider 的 new 成功仍联动
+        check(
+            f"X5.{tag}.user-no-provider-new-syncs",
+            out.get("user-no-provider-new", {}).get("history_after") == 0
+            and out.get("user-no-provider-new", {}).get("plugin_notified") is True,
+            f"unp2={out.get('user-no-provider-new')}",
+        )
+        check(
+            f"X5.{tag}.user-renamed-old-name-no-clear",
+            out.get("user-renamed-old-name", {}).get("history_after") == 2,
+            f"ur={out.get('user-renamed-old-name')}",
+        )
+        check(
+            f"X5.{tag}.user-filter-denied-no-clear",
+            out.get("user-custom-filter-denied", {}).get("history_after") == 2,
+            f"uf={out.get('user-custom-filter-denied')}",
+        )
+        # X5：继承保护下原生 new 不联动、不误提示
+        ip = out.get("persona-inherit-protected-new", {})
+        check(
+            f"X5.{tag}.inherit-protected-new-no-sync",
+            ip.get("history_after") == 2
+            and ip.get("plugin_notified") is False,
+            f"ip={ip}",
         )
         check(
             f"T5.{tag}.no-provider-no-clear",

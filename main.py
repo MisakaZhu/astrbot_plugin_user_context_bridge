@@ -192,18 +192,22 @@ class UserContextBridgePlugin(Star):
             )
             return
         try:
-            self._membership.migrate_legacy_keys()
-        except MembershipError as exc:
-            self._disable_sharing(f"uctx 共享已禁用：{exc}")
-            return
-
-        try:
             self._ledger.ensure_migrated()
         except MigrationError as exc:
             self._disable_sharing(
                 f"uctx 共享已禁用：账本迁移未完成（{exc}）。"
                 "请检查 backups/ 备份与日志后重试；数据未被修改。"
             )
+            return
+        # X3：membership 编码升级与账本同源——v1 来源的退出键全部是
+        # 原始人格 ID；仅 v2 候选来源才存在 __mode_user__ 歧义行。
+        # 未迁移过（全新安装）则无旧键，任意取值无效果。
+        try:
+            self._membership.migrate_legacy_keys(
+                source_version=self._ledger.migration_source_version() or 2
+            )
+        except MembershipError as exc:
+            self._disable_sharing(f"uctx 共享已禁用：{exc}")
             return
 
         recovered = self._ledger.recover_running(own_lease_id=self._lease_id)
@@ -457,7 +461,9 @@ class UserContextBridgePlugin(Star):
             identity, _persona = await self._commands._identity(event)
             if not self._commands._window_in_scope(event):
                 return
-            if self._membership is not None and self._membership.is_opted_out(identity):
+            # X5：原生成功关联与运行时/status 同一有效退出语义——
+            # is_opted_out 只查直接键，会漏掉 base_protected 继承保护
+            if self._membership is not None and self._membership.effective_optout(identity):
                 return
             self._ledger.bump_epoch(identity.key)
             await event.send(

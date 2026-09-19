@@ -75,12 +75,25 @@ star_map.pop(plugin_module.__name__, None)
 OUT: dict = {}
 
 
-async def scenario(name, *, disabled=False, renamed=False, filtered=False,
-                   cmd="reset", provider=True, prefix=False, follower=False,
-                   recover=False):
+def user_ident_of(identity):
+    """同基础账号的 user 维度身份（X5 继承保护场景用）。"""
+
+    parts = identity.key.split("")
+    from uctx_bridge.identity import build_identity
+
+    return build_identity(
+        platform_id=parts[0], self_id=parts[1], persona_scope=None,
+        sender_id=parts[3], mode="user",
+    )
+
+
+async def scenario(name, *, mode="persona", disabled=False, renamed=False,
+                   filtered=False, cmd="reset", provider=True, prefix=False,
+                   follower=False, recover=False, inherit_protected=False):
     state_dir = ROOT / ("s-" + name)
     state_dir.mkdir(parents=True, exist_ok=True)
     bridge, resolver, membership, ledger = make_bridge_stack(str(state_dir))
+    resolver.set_history_scope(mode)
     metas = register_bridge(bridge)
     try:
         conv = SimpleNamespace(
@@ -207,6 +220,11 @@ async def scenario(name, *, disabled=False, renamed=False, filtered=False,
             trajectory=[{"role": "assistant", "content": "SYNTHETIC-ANSWER"}],
             reply_text="SYNTHETIC-ANSWER",
         )
+        if inherit_protected:
+            # X5：user off→persona 基础保护（模拟切换协议产物）——
+            # 身份本身无直接键退出，但有效退出为 True
+            membership.opt_out(user_ident_of(identity))
+            membership.protect_base(user_ident_of(identity))
         old_epoch = ledger.current_epoch(identity.key)
         before = len(ledger.load_history(identity.key))
         wake = WakingCheckStage()
@@ -448,6 +466,17 @@ async def main() -> int:
     await scenario(
         "new-without-provider-then-recovery", cmd="new", provider=False,
         recover=True,
+    )
+    # X5/N10：user 模式真实分发矩阵（关键行）
+    await scenario("user-default-reset", mode="user")
+    await scenario("user-new-with-provider", mode="user", cmd="new")
+    await scenario("user-no-provider-new", mode="user", cmd="new", provider=False)
+    await scenario("user-renamed-old-name", mode="user", renamed=True)
+    await scenario("user-custom-filter-denied", mode="user", filtered=True)
+    # X5：继承保护（user off→persona）下原生 new 不得联动/误提示
+    await scenario(
+        "persona-inherit-protected-new", mode="persona", cmd="new",
+        inherit_protected=True,
     )
     OUT["recovery_no_backfill_after_new"] = {
         "old_leak": OUT["new-without-provider-then-recovery"]

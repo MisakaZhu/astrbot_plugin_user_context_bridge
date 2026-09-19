@@ -36,15 +36,24 @@ WHITELIST = [
 ]
 
 
-def build_candidate_zip(td: Path) -> Path:
-    zip_path = td / "astrbot_plugin_user_context_bridge-w-n22.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for rel in WHITELIST:
-            zf.write(REPO / rel, rel)
-    with zipfile.ZipFile(zip_path) as zf:
-        assert sorted(zf.namelist()) == sorted(WHITELIST)
+def locate_delivered_zip() -> Path:
+    """定位**实际交付 ZIP**：release/ 下以当前实现 SHA 命名的候选包。"""
+
+    # 交付约定：ZIP 以实现提交 SHA 命名（HEAD 可能为纯文档收尾），
+    # 取 release/ 下最新的候选包并核对哈希（旧包不动）。
+    candidates = sorted(
+        (REPO / "release").glob("astrbot_plugin_user_context_bridge-*.zip"),
+        key=lambda p_: p_.stat().st_mtime,
+    )
+    if not candidates:
+        raise SystemExit("release/ 无候选包（先运行打包脚本）")
+    zip_path = candidates[-1]
     digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
-    print(f"[N22] 候选 ZIP：{zip_path.name}（{len(WHITELIST)} 文件）")
+    sha_file = zip_path.with_suffix(zip_path.suffix + ".sha256")
+    if sha_file.exists():
+        recorded = sha_file.read_text(encoding="utf-8").split()[0]
+        assert recorded == digest, "交付包哈希与 .sha256 记录不一致"
+    print(f"[N22] 交付 ZIP：{zip_path.name}（{len(WHITELIST)} 文件）")
     print(f"[N22] SHA-256：{digest}")
     return zip_path
 
@@ -95,7 +104,7 @@ def zip_tool_standalone(zip_path: Path, td: Path) -> bool:
 def main() -> int:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         tdp = Path(td)
-        zip_path = build_candidate_zip(tdp)
+        zip_path = locate_delivered_zip()
 
         # 工具独立运行验证（与宿主无关，跑一次）
         ok_tool = zip_tool_standalone(zip_path, tdp / "toolcheck")

@@ -311,6 +311,9 @@ class ContextBridge:
                 umo=event.unified_msg_origin,
                 user_message=user_message,
                 source_persona=persona_scope,
+                # X1：身份首次参与时同事务登记当前生效模式，保证全新
+                # 安装第一轮后即有持久化事实，后续显式切换可正确推进代次
+                scope_mode=self._scope.history_scope,
             )
             if turn.status != STATUS_RUNNING:
                 # S1：重复投递且原轮已终态——必须先释放刚获取的身份锁，

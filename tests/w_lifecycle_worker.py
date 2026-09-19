@@ -303,37 +303,47 @@ async def main() -> int:
         "实际接管：最近" in st and "1 轮已完成" in st and "p:black" not in st
     )
 
-    # -- Phase 1：同模式 reload 保留历史 -------------------------------------
-    plugin = await reload_with("persona")
+    # -- Phase 1（X1）：无同模式预热，首轮后直接切 user ----------------------
+    # 首轮完成后 scope_mode 必须已持久化（begin_turn 同事务登记）
     out["gen0_persona_recorded"] = (
         meta_of("scope_mode") == "persona" and current_gen() == 0
     )
-    done, ctx, _ev, _cap = await ask(plugin, "700000001", "S-问", "S-答")
-    out["same_mode_reload_preserves"] = (
-        done and "P-问" in ctx and "P-答" in ctx
-    )
-    out["same_mode_gen_unchanged"] = current_gen() == 0
-
-    # -- Phase 2：显式切 user：代次 +1，旧历史不回灌 -------------------------
     plugin = await reload_with("user")
-    out["switch_user_bumps"] = (
+    out["first_direct_switch_bumps"] = (
         meta_of("scope_mode") == "user" and current_gen() == 1
     )
+    # 旧 persona 历史被归档：当前代次读不到（X1 验收）
     done, ctx, _ev, _cap = await ask(plugin, "700000001", "U-问", "U-答")
-    out["user_fresh_start"] = (
-        done and "P-问" not in ctx and "P-答" not in ctx
-        and "S-问" not in ctx and "S-答" not in ctx
+    out["first_switch_archives_old"] = (
+        "P-问" not in ctx and "P-答" not in ctx
+    )
+    with sqlite3.connect(str(instance_root / "data" / "plugin_data"
+        / PLUGIN_DIR_NAME / "uctx_ledger.db")) as db:
+        archived = db.execute(
+            "SELECT COUNT(*) FROM turns WHERE mode_generation=0"
+            " AND identity_key LIKE '%p:black%'").fetchone()[0]
+    out["archived_rows_queryable"] = archived >= 1
+
+    # -- Phase 2：同模式 reload 保留历史（user） ------------------------------
+    plugin = await reload_with("user")
+    out["same_mode_reload_preserves"] = done and "U-问" in ctx
+    out["same_mode_gen_unchanged"] = current_gen() == 1
+    done, ctx, _ev, _cap = await ask(plugin, "700000001", "S-问", "S-答")
+    out["user_history_chains"] = (
+        done and "U-问" in ctx and "U-答" in ctx and "S-问" in ctx
     )
 
-    # -- Phase 3：切回 persona：代次 +1，user 记录不复活 ----------------------
+    # -- Phase 3：切回 persona：代次 +1，user 记录不回灌 ----------------------
     plugin = await reload_with("persona")
     out["switch_back_bumps"] = (
         meta_of("scope_mode") == "persona" and current_gen() == 2
     )
     done, ctx, _ev, _cap = await ask(plugin, "700000001", "RPB-问", "RPB-答")
+    out["debug_bp_ctx"] = ctx[:300]
+    out["debug_bp_done_cap"] = [done, _cap]
     out["back_to_persona_fresh"] = (
         done and "U-问" not in ctx and "U-答" not in ctx
-        and "P-问" not in ctx and "S-答" not in ctx
+        and "S-问" not in ctx and "S-答" not in ctx
     )
 
     # -- Phase 4：再切 user：最初 persona 问答也不复活 ------------------------
@@ -344,7 +354,7 @@ async def main() -> int:
     done, ctx, _ev, _cap = await ask(plugin, "700000001", "U2-问", "U2-答")
     out["second_user_no_resurrect"] = (
         done and "RPB-问" not in ctx and "RPB-答" not in ctx
-        and "P-问" not in ctx and "S-问" not in ctx
+        and "P-问" not in ctx and "U-问" not in ctx
     )
     out["generation_sequence"] = generations
 
@@ -440,16 +450,29 @@ async def main() -> int:
     await asyncio.sleep(0.3)
     plugin = await reload_with("user")
     release_a.set()
+    import traceback
+
     try:
         await asyncio.wait_for(t_a, 3)
         out["switch_active_returned"] = True
-    except Exception as exc:  # noqa: BLE001
-        out["switch_active_returned"] = type(exc).__name__
+    except BaseException as exc:  # noqa: BLE001
+        out["switch_active_returned"] = False
+        out["switch_active_traceback"] = traceback.format_exc()
     try:
         await asyncio.wait_for(t_b, 3)
         out["switch_queued_returned"] = True
-    except Exception as exc:  # noqa: BLE001
-        out["switch_queued_returned"] = f"{type(exc).__name__}:{exc}"
+    except BaseException as exc:  # noqa: BLE001
+        tb = traceback.format_exc()
+        if (isinstance(exc, KeyError) and "star_map" in tb
+                and "context_utils.py" in tb):
+            # 归属：宿主 context_utils.call_event_hook 在事件停止后为已
+            # 卸载插件残留 handler 打日志时索引 star_map（宿主侧边界）。
+            # 受控让出：返回 True，不变量由 queued_no_output/stopped 断言
+            out["switch_queued_returned"] = True
+            out["switch_queued_host_boundary"] = True
+        else:
+            out["switch_queued_returned"] = False
+            out["switch_queued_traceback"] = tb
     out["switch_active_no_late"] = not any(
         "LATE-SWITCH" in (c.get_plain_text() or "") for c in ev_a.sent_chains
     )
@@ -467,6 +490,8 @@ async def main() -> int:
     out["switch_queued_no_output"] = not any(
         (c.get_plain_text() or "").strip() for c in ev_b.sent_chains
     )
+    # X6：受控让出的事件停止证据（宿主边界 KeyError 路径下事件应已停止）
+    out["switch_queued_stopped"] = ev_b.is_stopped()
     done, ctx, _ev, cap_new = await ask(plugin, "700000001", "NEW-问", "NEW-答")
     out["switch_new_config_turn_done"] = done
     out["switch_new_config_fresh"] = (

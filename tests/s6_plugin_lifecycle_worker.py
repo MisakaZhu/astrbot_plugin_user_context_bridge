@@ -39,11 +39,25 @@ SOURCE_FILES = [
 ]
 
 
-def setup_instance_root(root: Path) -> None:
+def setup_instance_root(root: Path, zip_path: str | None = None) -> None:
+    """插件落位：默认源码复制；给定 zip_path 时从**交付 ZIP** 解包（N22）。"""
+
     plug = root / "data" / "plugins" / PLUGIN_DIR_NAME
     plug.mkdir(parents=True, exist_ok=True)
     # 4.26 的 AstrBotConfig 保存不自动创建 data/config（FileNotFoundError）
     (root / "data" / "config").mkdir(parents=True, exist_ok=True)
+    if zip_path:
+        import zipfile
+
+        with zipfile.ZipFile(zip_path) as zf:
+            names = zf.namelist()
+            assert "tools/uctx_records.py" in names, "交付包应含只读工具"
+            for name in names:
+                target = (plug / name).resolve()
+                if not str(target).startswith(str(plug.resolve())):
+                    raise ValueError(f"ZIP 条目路径异常：{name}")
+            zf.extractall(plug)
+        return
     for rel in SOURCE_FILES:
         src = REPO / rel
         dst = plug / rel
@@ -53,7 +67,8 @@ def setup_instance_root(root: Path) -> None:
 
 async def main() -> int:
     instance_root = Path(sys.argv[1])
-    setup_instance_root(instance_root)
+    zip_arg = sys.argv[2] if len(sys.argv) > 2 else None
+    setup_instance_root(instance_root, zip_path=zip_arg)
     os.environ["ASTRBOT_ROOT"] = str(instance_root)
     sys.path.insert(0, str(instance_root))
     sys.path.insert(0, str(REPO))  # tests.fakes / tests.harness 复用

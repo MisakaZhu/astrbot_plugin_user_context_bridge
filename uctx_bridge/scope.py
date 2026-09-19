@@ -106,30 +106,30 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
-def encode_membership_key(key: str) -> tuple[str, bool]:
-    """旧 membership 键 → 新编码；返回 (新键或 None, 是否不可辨认)。
+def encode_membership_key(key: str, source_version: int = 2) -> tuple[str, bool]:
+    """旧 membership 键 → 新编码（X3：按来源版本解码，不凭前缀猜）。
 
-    - 裸人格 scope：加 ``p:`` 前缀（0.6.0 只有 persona 键）；
-    - ``__mode_user__``：0.6.0 不存在 user 模式，该键在 0.6.0 文件中
-      只可能是同名人格；但在 0.7.0 首个候选文件中又可能是 user 退出
-      ——归属不可辨认。按安全方向处理：保留为同名 persona 的 ``p:``
-      退出**并**追加基础身份保护（宁过度保护不误采集），
-      由调用方追加 base_protected。
+    返回 (新键, 是否不可辨认)。
+
+    - v1 来源（source_version=1，0.6.0 无 user 模式）：scope 一律是
+      原始人格 ID 字面值——**无条件**加 ``p:`` 前缀并保留字面值。
+      ``__mode_user__`` 在 v1 只可能是同名人格（→ ``p:__mode_user__``，
+      不隔离）；``p:maid``/``u:``/``q:foo`` 同理（→ ``p:p:maid`` 等）。
+    - v2 候选来源（source_version=2）：普通 scope 同为原始人格 ID 加
+      ``p:``；仅字面 ``__mode_user__`` 承载过 user 退出、与同名真实
+      人格不可辨认——按安全方向保留为 ``p:__mode_user__`` 退出**并**
+      由调用方追加基础身份保护（宁过度保护不误采集）。
     """
 
     parts = key.split("\x1f")
     if len(parts) != 4:
         return key, False
     scope = parts[2]
-    if (
-        scope.startswith(SCOPE_PERSONA_PREFIX)
-        or scope == SCOPE_USER_TOKEN
-        or scope.startswith(SCOPE_QUARANTINE_PREFIX)
-    ):
-        return key, False  # 已是新编码
-    if scope == "__mode_user__":
-        return "\x1f".join((parts[0], parts[1], SCOPE_PERSONA_PREFIX + scope, parts[3])), True
-    return "\x1f".join((parts[0], parts[1], SCOPE_PERSONA_PREFIX + scope, parts[3])), False
+    is_ambiguous = source_version >= 2 and scope == "__mode_user__"
+    new_key = "\x1f".join(
+        (parts[0], parts[1], SCOPE_PERSONA_PREFIX + scope, parts[3])
+    )
+    return new_key, is_ambiguous
 
 
 class MembershipStore:
@@ -177,13 +177,24 @@ class MembershipStore:
             ) from exc
 
     def _save(self) -> None:
+        self._save_sets(self._optout, self._base_protected, self._persona_on,
+                        self._ambiguous)
+
+    def _save_sets(self, optout, base_protected, persona_on,
+                   ambiguous=()) -> None:
+        """把给定集合写入磁盘（不触碰内存状态，X4）。
+
+        失败抛 MembershipError；调用方必须在成功后才发布内存新状态，
+        或进入明确受控状态——绝不留下"内存已解除、磁盘仍退出"的分裂。
+        """
+
         payload = json.dumps(
             {
                 "key_scheme": MEMBERSHIP_KEY_SCHEME,
-                "optout": sorted(self._optout),
-                "base_protected": sorted(self._base_protected),
-                "persona_on": sorted(self._persona_on),
-                "ambiguous_legacy": sorted(self._ambiguous),
+                "optout": sorted(optout),
+                "base_protected": sorted(base_protected),
+                "persona_on": sorted(persona_on),
+                "ambiguous_legacy": sorted(ambiguous),
             },
             ensure_ascii=False,
             indent=2,
@@ -193,10 +204,16 @@ class MembershipStore:
         except OSError as exc:
             raise MembershipError(f"退出状态写入失败：{exc}") from exc
 
-    def migrate_legacy_keys(self) -> bool:
-        """0.6.0/旧候选键 → scheme 3（幂等；先备份再原子改写）。
+    def migrate_legacy_keys(self, source_version: int = 2) -> bool:
+        """旧键 → scheme 3（幂等；先备份再原子改写；X3/X4 修订）。
 
-        返回是否发生了改写。不可辨认键的处置见 encode_membership_key。
+        ``source_version``：配对账本的迁移来源 schema 版本（与账本同源，
+        由 main 传入）。v1 来源的退出键全部是原始人格 ID 字面值（含
+        ``__mode_user__``/``u:``/``p:maid`` 等——v1 无 user 模式，一律
+        加 ``p:`` 前缀）；仅 v2 候选来源才存在 ``__mode_user__`` 歧义
+        （可能承载 user 退出），按安全方向转 p: 退出并追加基础保护。
+
+        返回是否发生了改写。失败时内存状态不变（X4）。
         """
 
         with self._lock:
@@ -217,7 +234,7 @@ class MembershipStore:
             new_on: set[str] = set()
             ambiguous: list[str] = []
             for key in self._optout:
-                new_key, is_ambiguous = encode_membership_key(key)
+                new_key, is_ambiguous = encode_membership_key(key, source_version)
                 if is_ambiguous:
                     ambiguous.append(key)
                     new_optout.add(new_key)
@@ -225,23 +242,24 @@ class MembershipStore:
                 else:
                     new_optout.add(new_key)
             for key in self._persona_on:
-                new_key, is_ambiguous = encode_membership_key(key)
+                new_key, is_ambiguous = encode_membership_key(key, source_version)
                 if is_ambiguous:
                     # on 是解除标记：不可辨认时丢弃（欠解除安全，可重新 on）
                     ambiguous.append(key)
                     continue
                 new_on.add(new_key)
-            self._optout = new_optout
-            self._base_protected = new_base
-            self._persona_on = new_on
-            self._ambiguous = ambiguous
+            # 先持久化候选状态，成功后才发布内存（X4）
             if self._path.exists():
                 backup = self._path.with_name(
                     self._path.name + ".pre-scheme3.bak"
                 )
                 if not backup.exists():
                     backup.write_bytes(self._path.read_bytes())
-            self._save()
+            self._save_sets(new_optout, new_base, new_on, ambiguous)
+            self._optout = new_optout
+            self._base_protected = new_base
+            self._persona_on = new_on
+            self._ambiguous = ambiguous
             return True
 
     # -- 基础键 ------------------------------------------------------------
@@ -331,20 +349,36 @@ class MembershipStore:
                     return "该账号受基础身份退出保护（user 退出继承）"
             return ""
 
-    # -- 写入（命令与转换） -------------------------------------------------
+    # -- 写入（命令与转换；X4：先持久化成功再发布内存） ---------------------
     def opt_out(self, identity: SharedIdentity) -> None:
+        """退出共享。user 维度退出（X2）会撤销该基础身份**既有的**
+        persona_on 解除记录——较早的加入例外不能越过较晚的全账号退出；
+        此后需在某人格主动 on 才能解除本次保护对该人格的覆盖。"""
+
         with self._lock:
-            self._optout.add(identity.key)
-            self._save()
+            new_optout = set(self._optout) | {identity.key}
+            new_on = set(self._persona_on)
+            if identity.mode == MODE_USER:
+                new_on = {
+                    k for k in new_on
+                    if not MembershipStore._matches_base(k, identity)
+                }
+            self._save_sets(new_optout, self._base_protected, new_on,
+                            self._ambiguous)
+            self._optout = new_optout
+            self._persona_on = new_on
 
     def opt_in_persona(self, identity: SharedIdentity) -> None:
         """persona 模式主动 on：解除本人格退出，并记录显式 on
         （从基础保护中释放**仅本人格**，不影响其他人格与既有保护）。"""
 
         with self._lock:
-            self._optout.discard(identity.key)
-            self._persona_on.add(identity.key)
-            self._save()
+            new_optout = set(self._optout) - {identity.key}
+            new_on = set(self._persona_on) | {identity.key}
+            self._save_sets(new_optout, self._base_protected, new_on,
+                            self._ambiguous)
+            self._optout = new_optout
+            self._persona_on = new_on
 
     def opt_in_user(self, identity: SharedIdentity) -> None:
         """user 模式主动 on：解除 user 键退出与该基础身份保护。
@@ -354,9 +388,12 @@ class MembershipStore:
         """
 
         with self._lock:
-            self._optout.discard(identity.key)
-            self._base_protected.discard(self.base_key_of(identity))
-            self._save()
+            new_optout = set(self._optout) - {identity.key}
+            new_base = set(self._base_protected) - {self.base_key_of(identity)}
+            self._save_sets(new_optout, new_base, self._persona_on,
+                            self._ambiguous)
+            self._optout = new_optout
+            self._base_protected = new_base
 
     # 兼容别名（旧测试/调用逐步迁移）
     def opt_in(self, identity: SharedIdentity) -> None:
@@ -369,21 +406,35 @@ class MembershipStore:
         """user→persona 转换：基础身份整体进入退出保护（幂等加法）。"""
 
         with self._lock:
-            self._base_protected.add(self.base_key_of(identity))
-            self._save()
+            if self.base_key_of(identity) in self._base_protected:
+                return
+            new_base = set(self._base_protected) | {self.base_key_of(identity)}
+            self._save_sets(self._optout, new_base, self._persona_on,
+                            self._ambiguous)
+            self._base_protected = new_base
 
     def release_base(self, identity: "SharedIdentity") -> None:
         """该 persona 显式 on：仅解除该人格（其余人格保护保留）。"""
 
-        with self._lock:
-            self._persona_on.add(identity.key)
-            self._save()
+        self.opt_in_persona(identity)
 
     def raw_sets(self) -> tuple[set[str], set[str], set[str]]:
         """测试/迁移自省用：(optout, base_protected, persona_on)。"""
 
         with self._lock:
             return (set(self._optout), set(self._base_protected), set(self._persona_on))
+
+    @staticmethod
+    def _matches_base(key: str, identity: SharedIdentity) -> bool:
+        """键是否属于该身份的基础账号（platform+self+sender 匹配）。"""
+
+        parts = key.split("")
+        return (
+            len(parts) == 4
+            and parts[0] == identity.platform_id
+            and parts[1] == identity.self_id
+            and parts[3] == identity.sender_id
+        )
 
 
 def _base_of_raw_key(key: str) -> str:

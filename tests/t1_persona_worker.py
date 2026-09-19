@@ -171,6 +171,7 @@ async def main() -> int:
         ev_fail = FakeEvent(
             sender_id="10001", group_id="700000001", message_str="resolution-fail"
         )
+        # 夹具注意：失败场景结束后必须恢复真实 manager（N04 场景依赖）
         req_fail = ProviderRequest()
         req_fail.prompt = "resolution-fail"
         req_fail.contexts = []
@@ -185,6 +186,131 @@ async def main() -> int:
                 ).fetchall()]
             )
         )
+        # ---- N04（X6）：user 模式真实 PersonaManager/ConversationManager/
+        # 宿主请求装配 —— 当前窗口人格 system/begin_dialogs 经宿主
+        # _ensure_persona_and_skills 注入，工具/动态注入保留，跨人格共享
+        from astrbot.core.star import Context as HostContext
+
+        resolver.set_history_scope("user")
+        # 恢复真实人格管理器（T1 失败场景曾替换为 BrokenManager）
+        bridge._get_persona_manager = lambda: pm
+        await pm.create_persona(
+            "persona_u", "PERSONA-U-SYSTEM",
+            ["U-BEGIN-Q", "U-BEGIN-A"], tools=[], skills=[],
+        )
+        tool_marker = {"type": "function", "function": {"name": "u_tool"}}
+        dyn_marker = "DYNAMIC-INJECTION-MARKER"
+
+        async def drive_user_window(window_group, answer, persona_default):
+            ev = FakeEvent(
+                sender_id="10001", group_id=window_group,
+                message_str="USER-MODE-" + window_group)
+            req = ProviderRequest()
+            req.prompt = ev.message_str
+            req.contexts = []
+            req.conversation = await _get_session_conv(
+                ev, SimpleNamespace(
+                    persona_manager=pm, conversation_manager=cm,
+                    get_config=lambda umo=None, **kw: config_for(umo),
+                )
+            )
+            # 会话人格指向当前窗口人格（真实 ConversationManager 路径）
+            if req.conversation is not None:
+                await cm.update_conversation(
+                    ev.unified_msg_origin,
+                    await cm.get_curr_conversation_id(ev.unified_msg_origin),
+                    persona_id=persona_default,
+                )
+                req.conversation = await cm.get_conversation(
+                    ev.unified_msg_origin,
+                    await cm.get_curr_conversation_id(ev.unified_msg_origin),
+                )
+            # 宿主真实人格装配（_ensure_persona_and_skills）
+            from astrbot.core.astr_main_agent import (
+                _ensure_persona_and_skills,
+            )
+
+            host_ctx = SimpleNamespace(
+                persona_manager=pm,
+                get_llm_tool_manager=lambda: SimpleNamespace(
+                    get_full_tool_set=lambda: {},
+                    get_builtin_tool=lambda t: None,
+                ),
+                get_using_provider=lambda umo: None,
+                get_config=lambda: config_for(None),
+                subagent_orchestrator=None,
+            )
+            cfg_ps = provider_settings_for(ev.unified_msg_origin)
+            await _ensure_persona_and_skills(
+                req, cfg_ps, host_ctx, ev)
+            # 工具/动态注入（宿主装配之后、插件接管之前）
+            req.func_tool = [tool_marker]
+            req.system_prompt = (req.system_prompt or "") + chr(10) + dyn_marker
+            cap0 = ledger.stats_captured() if hasattr(ledger, "stats_captured") else None
+            await bridge.handle_llm_request(ev, req)
+            return req
+
+        req_a = await drive_user_window("700000001", "UA-ANSWER", "persona_a")
+        # 直接 handle 只登记 running 轮——模拟 on_agent_done 提交，B 才能在
+        # 历史中读到 A（真实提交点见 bridge 终态机）
+        ev_key_a = bridge.event_key_for(
+            FakeEvent(sender_id="10001", group_id="700000001",
+                      message_str="USER-MODE-700000001"))
+        with sqlite3.connect(ledger._db_path) as conn:
+            row = conn.execute(
+                "SELECT event_key FROM turns WHERE status='running'"
+                " ORDER BY id DESC LIMIT 1").fetchone()
+        ek = row[0] if row else ev_key_a
+        ledger.commit_turn(
+            event_key=ek, status="completed",
+            trajectory=[{"role": "assistant", "content": "UA-ANSWER"}],
+            reply_text="UA-ANSWER")
+        req_b = await drive_user_window("700000002", "UB-ANSWER", "persona_b")
+
+        with sqlite3.connect(ledger._db_path) as db:
+            all_rows = db.execute(
+                "SELECT identity_key, user_message FROM turns ORDER BY id"
+            ).fetchall()
+        observed["n04_debug_rows"] = [
+            (r[0][-20:], r[1][:60]) for r in all_rows]
+        with sqlite3.connect(ledger._db_path) as db:
+            u_rows = db.execute(
+                "SELECT identity_key, source_persona, user_message FROM turns"
+                " WHERE user_message LIKE '%USER-MODE%'"
+                " ORDER BY id").fetchall()
+        observed["n04_user_identity_keys"] = [
+            r[0] for r in u_rows]
+        observed["n04_single_u_key"] = (
+            len({r[0] for r in u_rows}) == 1
+            and "u:" in u_rows[0][0]
+        )
+        observed["n04_source_personas"] = [r[1] for r in u_rows]
+        # 最终请求：当前窗口人格 system/begin_dialogs + 工具/动态注入保留
+        ctx_b = json.dumps(req_b.call_log if hasattr(req_b, "call_log") else [],
+                           ensure_ascii=False)
+        observed["n04_system_current_persona"] = (
+            "PERSONA-B-SYSTEM" in (req_b.system_prompt or "")
+            and "PERSONA-A-SYSTEM" not in (req_b.system_prompt or "")
+        )
+        observed["n04_begin_dialog_current"] = (
+            "B-BEGIN-Q" in json.dumps(req_b.contexts, ensure_ascii=False)
+        )
+        observed["n04_tool_preserved"] = (
+            json.dumps(tool_marker, ensure_ascii=False)
+            in json.dumps(getattr(req_b, "func_tool", []) or [],
+                          ensure_ascii=False, default=str)
+        )
+        observed["n04_dynamic_injection_preserved"] = (
+            dyn_marker in (req_b.system_prompt or "")
+        )
+        observed["n04_cross_persona_chain"] = (
+            "USER-MODE-700000001" in json.dumps(req_b.contexts,
+                                                ensure_ascii=False,
+                                                default=str)
+        )
+        observed["n04_debug_bctx"] = json.dumps(
+            req_b.contexts, ensure_ascii=False, default=str)[:400]
+
         print("@@RESULT@@" + json.dumps(observed, ensure_ascii=False))
     finally:
         bridge.shutdown()
