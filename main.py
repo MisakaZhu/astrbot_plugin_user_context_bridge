@@ -22,8 +22,14 @@ from astrbot.core.provider.entities import ProviderRequest
 
 from .uctx_bridge.bridge import ContextBridge
 from .uctx_bridge.commands import CommandService
-from .uctx_bridge.ledger import LeaseConflictError, TurnLedger
-from .uctx_bridge.scope import MembershipStore, ScopeConfig, ScopeResolver
+from .uctx_bridge.identity import MODE_USER, build_identity
+from .uctx_bridge.ledger import LeaseConflictError, MigrationError, TurnLedger
+from .uctx_bridge.scope import (
+    MembershipError,
+    MembershipStore,
+    ScopeConfig,
+    ScopeResolver,
+)
 
 _HEARTBEAT_INTERVAL_SECONDS = 60.0
 
@@ -32,7 +38,7 @@ _HEARTBEAT_INTERVAL_SECONDS = 60.0
     "astrbot_plugin_user_context_bridge",
     "Ewnscat-ya",
     "同一用户跨会话上下文共享（群聊/私聊连续真实对话历史）",
-    "0.6.0",
+    "0.7.0",
 )
 class UserContextBridgePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -40,7 +46,14 @@ class UserContextBridgePlugin(Star):
         self._config = config
         self._data_dir = StarTools.get_data_dir()
         self._ledger = TurnLedger(self._data_dir / "uctx_ledger.db")
-        self._membership = MembershipStore(self._data_dir / "membership.json")
+        self._membership_error: str | None = None
+        try:
+            self._membership = MembershipStore(self._data_dir / "membership.json")
+        except MembershipError as exc:
+            # 损坏/不可读：保持 None，initialize 禁用共享（绝不按空退出
+            # 集合继续采集）
+            self._membership = None
+            self._membership_error = str(exc)
         raw_scope = str(config.get("history_scope", "persona"))
         if raw_scope not in ("persona", "user"):
             logger.warning(
@@ -49,6 +62,10 @@ class UserContextBridgePlugin(Star):
                 raw_scope,
             )
             raw_scope = "persona"
+        self._config_scope = raw_scope
+        # W1：_history_scope 不在构造器定案——构造器读到的是"本次配置"，
+        # 不是上一生效模式；真实生效模式以账本持久化（meta.scope_mode）
+        # 为准，initialize 对账后写入。占位先用配置值供命令兜底显示。
         self._history_scope = raw_scope
         self._resolver = ScopeResolver(
             ScopeConfig.from_mapping(dict(config)), self._membership,
@@ -64,25 +81,6 @@ class UserContextBridgePlugin(Star):
         self._sharing_active = False
 
     # -- 生命周期 ---------------------------------------------------------
-    def _collect_base_identities(self) -> list[str]:
-        """收集账本中已出现的基础身份键（模式切换时按代次归档用）。"""
-
-        import sqlite3 as _s3
-
-        keys: set[str] = set()
-        try:
-            conn = _s3.connect(self._ledger._db_path)
-            try:
-                for (k,) in conn.execute("SELECT DISTINCT identity_key FROM turns"):
-                    parts = k.split("")
-                    if len(parts) == 4:
-                        keys.add("".join((parts[0], parts[1], parts[3])))
-            finally:
-                conn.close()
-        except Exception:  # noqa: BLE001
-            pass
-        return sorted(keys)
-
     def _provider_settings(self, umo: str | None = None) -> dict:
         """T1：与宿主 _ensure_persona_and_skills 同源的 provider_settings。"""
 
@@ -93,34 +91,118 @@ class UserContextBridgePlugin(Star):
         except Exception:  # noqa: BLE001
             return {}
 
+    def _disable_sharing(self, reason: str) -> None:
+        """受控禁用共享（保持插件加载；命令可应答"已禁用"）。"""
+
+        logger.warning(reason)
+        self._bridge = ContextBridge(
+            ledger=self._ledger,
+            scope_resolver=ScopeResolver(
+                ScopeConfig(enabled=False), self._membership
+            ),
+            persona_manager_getter=lambda: self.context.persona_manager,
+            provider_settings_getter=self._provider_settings,
+            logger=logger,
+        )
+        self._commands = CommandService(
+            ledger=self._ledger,
+            resolver=ScopeResolver(ScopeConfig(enabled=False), self._membership),
+            membership=self._membership,
+            persona_manager_getter=lambda: self.context.persona_manager,
+            conversation_manager_getter=lambda: self.context.conversation_manager,
+            provider_settings_getter=self._provider_settings,
+            history_scope=self._history_scope,
+            unavailable_reason=(
+                reason if self._membership is None else None
+            ),
+        )
+
+    def _membership_base_keys(self) -> set[str]:
+        """membership 侧出现过的全部基础身份键（含仅有退出的身份）。"""
+
+        bases: set[str] = set()
+        if self._membership is None:
+            return bases
+        optout, base_protected, persona_on = self._membership.raw_sets()
+        for key in optout | persona_on:
+            parts = key.split("\x1f")
+            if len(parts) == 4:
+                bases.add("\x1f".join((parts[0], parts[1], parts[3])))
+            elif len(parts) == 3:
+                bases.add(key)
+        for key in base_protected:
+            if len(key.split("\x1f")) == 3:
+                bases.add(key)
+        return bases
+
+    def _convert_exit_for_mode_change(
+        self, base_key: str, old_mode: str | None, new_mode: str
+    ) -> None:
+        """模式切换的退出状态转换（W2；只做加法，崩溃重放幂等）。
+
+        - → user：该基础身份存在任何仍生效退出（人格退出/基础保护）
+          → user 键保持退出，直到主动 on；
+        - → persona：user 键处于退出 → 基础身份保护，覆盖现有与未来
+          人格；单人格 on 只解除该人格（MembershipStore 语义）。
+        """
+
+        if self._membership is None:
+            return
+        parts = base_key.split("\x1f")
+        if len(parts) != 3:
+            return
+        platform, self_id, sender = parts[0], parts[1], parts[2]
+
+        def ident(mode: str):
+            return build_identity(
+                platform_id=platform, self_id=self_id,
+                persona_scope="", sender_id=sender, mode=mode,
+            )
+
+        if new_mode == MODE_USER:
+            probe = ident("persona")
+            if (
+                self._membership.has_any_persona_optout(probe)
+                or self._membership.is_base_protected(probe)
+            ) and not self._membership.is_opted_out(ident(MODE_USER)):
+                self._membership.opt_out(ident(MODE_USER))
+        else:  # → persona
+            if self._membership.is_opted_out(ident(MODE_USER)):
+                self._membership.protect_base(ident(MODE_USER))
+
     async def initialize(self) -> None:
         await super().initialize()
-        self._ledger.open()
+        # W3 顺序：连接（不迁移）→ 取租约 → 迁移。迁移只在租约持有序列
+        # 内进行，避免与另一实例并发写交错。
+        self._ledger.open(auto_migrate=False)
         try:
             self._lease_token = self._ledger.acquire_lease(self._lease_id)
         except LeaseConflictError as exc:
-            # 同库双实例防护：保持加载但禁用共享，避免并发写
-            logger.warning(
+            # 同库双实例防护：保持加载但禁用共享，避免并发写。
+            # 不做迁移/模式对账（数据不动，等单实例时再处理）。
+            self._disable_sharing(
                 "uctx 共享已禁用：检测到另一 AstrBot 实例正在使用同一数据目录"
                 f"（{exc}）。如需启用，请先停用另一个实例。"
             )
-            self._bridge = ContextBridge(
-                ledger=self._ledger,
-                scope_resolver=ScopeResolver(
-                    ScopeConfig(enabled=False), self._membership
-                ),
-                persona_manager_getter=lambda: self.context.persona_manager,
-                provider_settings_getter=self._provider_settings,
-                logger=logger,
+            return
+
+        if self._membership is None:
+            self._disable_sharing(
+                "uctx 共享已禁用：" + (self._membership_error or "退出状态不可用")
             )
-            self._commands = CommandService(
-                ledger=self._ledger,
-                resolver=ScopeResolver(ScopeConfig(enabled=False), self._membership),
-                membership=self._membership,
-                persona_manager_getter=lambda: self.context.persona_manager,
-                conversation_manager_getter=lambda: self.context.conversation_manager,
-                provider_settings_getter=self._provider_settings,
-                history_scope=self._history_scope,
+            return
+        try:
+            self._membership.migrate_legacy_keys()
+        except MembershipError as exc:
+            self._disable_sharing(f"uctx 共享已禁用：{exc}")
+            return
+
+        try:
+            self._ledger.ensure_migrated()
+        except MigrationError as exc:
+            self._disable_sharing(
+                f"uctx 共享已禁用：账本迁移未完成（{exc}）。"
+                "请检查 backups/ 备份与日志后重试；数据未被修改。"
             )
             return
 
@@ -128,22 +210,32 @@ class UserContextBridgePlugin(Star):
         if recovered:
             logger.info(f"uctx 重启恢复：{recovered} 个挂起轮次标记为 interrupted")
 
-        new_scope = str(self._config.get("history_scope", "persona"))
-        if new_scope not in ("persona", "user"):
-            new_scope = "persona"
-        old_scope = self._history_scope
+        desired = self._config_scope
         self._resolver.update_config(ScopeConfig.from_mapping(dict(self._config)))
-        if new_scope != old_scope:
-            # 显式切换共享模式：新代次从空历史开始（旧记录归档可查）
-            identities = self._collect_base_identities()
-            for base_key in identities:
-                self._ledger.bump_mode_generation(base_key)
+        # W1：与持久化生效模式对账。同配置 reload/重启/人格黑白切换
+        # （recorded == desired）不产生代次变化；显式模式变化才转换退出
+        # 状态并推进代次。转换只做加法且先于模式提交——中途失败重启后
+        # 重放幂等，不会出现"一半新模式一半旧退出状态"。
+        switches: list[tuple[str, str | None, str, int]] = []
+        bases = set(self._ledger.enumerate_base_keys()) | self._membership_base_keys()
+        for base_key in sorted(bases):
+            recorded = self._ledger.get_scope_mode(base_key)
+            if recorded == desired:
+                continue
+            self._convert_exit_for_mode_change(base_key, recorded, desired)
+            gen, changed = self._ledger.apply_scope_mode(base_key, desired)
+            if changed:
+                switches.append((base_key, recorded, desired, gen))
+        if switches:
             logger.info(
-                "uctx 共享模式切换 %s -> %s：新代次从空历史开始，旧记录归档",
-                old_scope, new_scope,
+                "uctx 共享模式切换 %s -> %s（%d 个基础身份）：新代次从空历史"
+                "开始，旧记录归档可查",
+                "mixed",
+                desired,
+                len(switches),
             )
-        self._history_scope = new_scope
-        self._resolver.set_history_scope(new_scope)
+        self._history_scope = desired
+        self._resolver.set_history_scope(desired)
         self._bridge = ContextBridge(
             ledger=self._ledger,
             scope_resolver=self._resolver,
@@ -165,9 +257,10 @@ class UserContextBridgePlugin(Star):
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         if self._config.get("enabled", False):
             logger.info(
-                "uctx 已启用：共享群=%s 私聊=%s（默认关闭时无任何采集）",
+                "uctx 已启用：共享群=%s 私聊=%s 模式=%s（默认关闭时无任何采集）",
                 list(self._resolver.config.shared_groups),
                 self._resolver.config.include_private,
+                self._history_scope,
             )
 
     async def _heartbeat_loop(self) -> None:

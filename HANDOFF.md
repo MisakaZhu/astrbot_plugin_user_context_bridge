@@ -1,6 +1,38 @@
 # HANDOFF（交接说明）
 
-## 0.7.0 候选交付（2026-09-19，待 Codex 独立验收 MIS-170）
+## ⚠️ 暂停断点（2026-09-19，W1–W8 返工中途，用户升级 ZCode）
+
+**基线 219cef2（W 返工起点，工作区干净）。返工依据：`上下文共享-规划交接-20260917\24_ZCode_GLM53_0.7.0_W1-W8返工提示词.md` + `23_Codex独立验收_0.7.0_219cef2.md` + 证据目录 `上下文共享-独立验收-219cef2-20260919`。Linear MIS-165~169 已置 In Progress。**
+
+### 本次已改（未提交 → 立即以 WIP 提交保存）
+
+- **W4 identity.py**：scope 段改结构化编码 `p:<persona>` / `u:`（user）/ `q:`（迁移隔离），SharedIdentity 增加 mode 字段，key/from_key/build_identity/identity_from_event 全部按编码；`MODE_USER_SCOPE="__mode_user__"` 已删除（结构性无碰撞方案，不再靠保留字）。
+- **W2 scope.py**：MembershipStore 重写——`effective_optout`（唯一有效退出语义，persona=直接退出或(基础保护且未 persona_on)；user=直接退出或基础保护；**不**按 persona 退出阻断 user，否则 user on 后永远无法恢复）、`opt_in_persona`/`opt_in_user`（user on 解除 user 键+基础保护，保留人格显式退出）、损坏文件抛 MembershipError（不再按空集合继续）、原子写、`migrate_legacy_keys()`（scheme3，`__mode_user__` 不可辨认键→p: 退出+base_protected 安全方向，备份 .pre-scheme3.bak）；resolver evaluate 用 mode 构造身份 + effective_optout 单点判定。
+- **W1/W3 ledger.py**：SCHEMA_VERSION=3；`inspect_schema_version()`；`migrate_ledger()`（只读校验→**backup API 一致性备份**含 WAL、临时文件原子改名、唯一名不覆盖→**单 IMMEDIATE 事务**加列+全表键改写（`_migrate_identity_key`：裸 `__mode_user__`→q:，裸其他→p:，3 段 base 键不动）+source_persona 回填+版本标记，失败 ROLLBACK 原库真不变）；`migrate_from_v1` 留兼容别名；`open(auto_migrate=False)` 不写 schema 置 `_legacy_pending`（防 executescript 误标 v1 库）+`ensure_migrated()`；新方法 `get_scope_mode`/`apply_scope_mode`（未记录→登记不改代次 changed=False；已记录不同→代次+1）/`enumerate_base_keys`/`identity_stats`（有效 completed 按 epoch+代次，两条固定字面量 SQL）。
+- **W1/W2 main.py**：构造器只存 `_config_scope`（期望模式，不再当"上一生效模式"）；membership 损坏→None+`_membership_error`；`initialize` 顺序改**连接(不迁移)→取租约→membership 迁移→ensure_migrated→recover→模式对账**；对账：枚举 bases（ledger+membership 侧，含仅有退出的身份）→ recorded!=desired 时 `_convert_exit_for_mode_change`（加法转换：→user 有任何退出则写 user 键退出；→persona user 键退出则 protect_base）→`apply_scope_mode`；`_disable_sharing` 统一受控禁用（租约冲突/membership 损坏/迁移失败三分支）；`_collect_base_identities` 删除；register 版本 0.7.0。
+- **W2/W5 commands.py**：全量重写——`unavailable_reason` 支路；`_identity` 返回(身份,当前真实人格)；off/on 按模式（persona on 仅解除本人格 opt_in_persona；user on 解除 user 键+基础保护）；status 显示模式/当前真实人格/窗口范围/**有效退出（同源语义+来源）**/实际接管证据（last_turn_at 无记录时明确"尚无记录（开关开启不等于已实际接管）"）/有效 completed（当前纪元·代次）/reset 范围说明；reset 文案按模式区分范围。
+
+### 未完成（恢复后从此继续）
+
+1. **tools/uctx_records.py（W4 解码/W6/W7）**：还没改。需：decode_identity 支持 p:/u:/q:/bare(legacy 标注)；删 MODE_USER_SCOPE 常量（47 行、169 行）；版本检查接受 v3（现 `<2` 拒绝逻辑保留即可）；**W6**：export 先解析唯一基础身份（无参/部分参→候选列表+rc=2 不写文件；唯一推断在 stdout+JSON filters+HTML 明示），list 不动；**W7**：guard_output_path 保护 `<db_parent>/backups/`（normcase+resolve，目录级拒绝）；README 示例同步。
+2. **测试**：全部未动——旧 n0/n1/n2/n3 仍用 `__mode_user__` 会红；需按 W8 改写：`tests/user_key()` 改 `build_identity(mode="user")`/`u:` 键；n1 迁移断言收紧（W3 语义变了：失败回滚后重试完整完成）；n3 期望值按新键编码/消歧更新；新增 W 系列（真实 PluginManager 四阶段 reload、退出矩阵、迁移对账/故障/WAL 备份、键碰撞真实 PersonaManager、status 文本对照、CLI 消歧/守卫矩阵、N09 屏障、N04 真实 PersonaManager、N10 真实命令分发、N11/N17、N22 真实 ZIP 生命周期 worker、故障注入实调父测试）。**先跑基线 FAIL 证据再修**的顺序已不适用（源码已修），改为：新测试若在已修复源码上应 PASS，同时用 `git stash`/旧提交快速抽验关键反例确实曾被复现（或在 WIP 提交前的工作树上验证）——如实记录方式。
+3. bridge.py 若引用旧键/mode 需检查（grep 无残留，应该不用动）；`_run_s6_worker` SOURCE_FILES 无 tools/（N22 需新 ZIP 生命周期 worker）。
+4. 全量回归（旧 10+新套×2 版）→ 文档同步（ACCEPTANCE 更正上轮 PASS 口径、ADR-015 修订编码、README/CHANGELOG/COMPATIBILITY/HANDOFF/STATUS）→ 新候选 ZIP（13 文件，含 tools）→ Linear In Review + 证据评论。MIS-170 保持 In Progress 等 Codex。
+
+### 恢复步骤
+
+1. `git log --oneline -2` 应见 WIP 提交（"W1-W8 返工 WIP：源码阶段"）；`git status` 干净。
+2. 按上面"未完成"顺序继续；先改 tools，再测试，跑 `PYTHONPATH=. <venv>/Scripts/python.exe -X utf8 tests/p2_ledger_check.py`（应过）与 n1（需改后）。
+3. 语义要点速查：apply_scope_mode 首次记录返回 (gen, False)；effective_optout user 分支不做 has_any；迁移备份名 `pre-migrate-v3-*`；membership scheme=3。
+
+---
+
+## 0.7.0 候选交付（2026-09-19，已被 W1-W8 返工取代，历史保留）
+
+<details>
+<summary>0.7.0 首个候选（219cef2，Codex 验收未通过，见 23 号验收报告）</summary>
+
+
 
 **分支 `feat/0.7.0-persona-records`（基于 main/859f18e）。N0-N4 本地开发与自测闭环；未 push、未发布、实机未验证。**
 

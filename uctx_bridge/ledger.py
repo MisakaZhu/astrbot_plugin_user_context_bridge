@@ -21,10 +21,10 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sqlite3
 import threading
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,57 +42,216 @@ _TERMINAL_STATUSES = frozenset(
 LEASE_FRESH_SECONDS = 300.0
 """其他实例租约心跳在该窗口内视为存活（双实例防护阈值）。"""
 
-SCHEMA_VERSION = 2
-"""0.7.0 结构：turns 增加 source_persona / mode_generation 列与
-schema_version 表。0.6.0 旧库（无该表）首次 open 自动迁移并先备份。"""
+SCHEMA_VERSION = 3
+"""0.7.0 W 返工结构：v3 = v2 列 + scope 段键编码（p:/u:/q: 前缀，
+与 uctx_bridge.identity 的 SCOPE_* 常量镜像；本模块不导入 astrbot，
+故此处独立定义，一致性由 tests/w4 键对拍保证）+ schema_version 表。
+0.6.0（v1）与 0.7.0 首个候选（v2）账本由 migrate_ledger 原子迁移。"""
+
+# —— scope 段编码（与 uctx_bridge.identity 镜像，勿单边修改）——
+_SCOPE_USER_TOKEN = "u:"
+_SCOPE_PERSONA_PREFIX = "p:"
+_SCOPE_QUARANTINE_PREFIX = "q:"
+_LEGACY_USER_TOKEN = "__mode_user__"
 
 UNKNOWN_PERSONA = "__unknown__"
 
 
-def migrate_from_v1(db_path, *, backup_dir=None):
-    """把 0.6.0（schema v1）账本迁移到 v2；已迁移返回 False（幂等）。
+def _migrate_identity_key(raw: str) -> str:
+    """旧身份键 → v3 编码；已是新编码原样返回。
 
-    ADR-015 A15-2：checkpoint → 备份原库 → 单 IMMEDIATE 事务加列并写
-    schema_version → 提交；失败回滚，原库与备份保持不变。损坏输入抛
-    MigrationError 不写。迁移后从旧 identity_key 第三段还原 source_persona。
+    裸 scope：``__mode_user__`` → q:（0.7.0 首个候选键无法区分"真实
+    同名人格"与 user 模式记录，按 W4 恢复规则隔离保留、不注入）；
+    其余裸值 → p:<scope>（0.6.0 只有 persona 键）。
+    """
+
+    parts = raw.split("\x1f")
+    if len(parts) != 4:
+        return raw
+    token = parts[2]
+    if (
+        token == _SCOPE_USER_TOKEN
+        or token.startswith(_SCOPE_PERSONA_PREFIX)
+        or token.startswith(_SCOPE_QUARANTINE_PREFIX)
+    ):
+        return raw
+    if token == _LEGACY_USER_TOKEN:
+        new_token = _SCOPE_QUARANTINE_PREFIX + token
+    else:
+        new_token = _SCOPE_PERSONA_PREFIX + token
+    return "\x1f".join((parts[0], parts[1], new_token, parts[3]))
+
+
+def inspect_schema_version(db_path) -> int:
+    """只读检测账本 schema 版本（0.6.0=1，首个候选=2，当前=SCHEMA_VERSION）。
+
+    全新/空库返回 SCHEMA_VERSION（无需迁移）；无法识别的结构抛
+    MigrationError。只读打开，不写入。
+    """
+
+    db = Path(str(db_path))
+    posix = urllib.parse.quote(str(db.resolve()).replace("\\", "/"))
+    ro = sqlite3.connect(f"file:{posix}?mode=ro", uri=True, timeout=30.0)
+    try:
+        tables = {
+            r[0]
+            for r in ro.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if not tables:
+            return SCHEMA_VERSION  # 全新/空库
+        if "schema_version" in tables:
+            row = ro.execute("SELECT MAX(version) FROM schema_version").fetchone()
+            if row is not None and row[0] is not None:
+                return int(row[0])
+            return 2
+        if "turns" in tables and "meta" in tables:
+            return 1
+        raise MigrationError("无法识别的账本结构（缺 turns/meta 表）")
+    except sqlite3.DatabaseError as exc:
+        raise MigrationError(f"账本不可读（可能损坏）：{exc}") from exc
+    finally:
+        try:
+            ro.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def migrate_ledger(db_path, *, backup_dir=None):
+    """把 0.6.0（schema v1）或 0.7.0 首个候选（v2）账本迁移到 v3。
+
+    已迁移（schema_version >= 3）返回 False（幂等）。
+
+    W3 修订后的流程：
+    1. 只读连接校验输入（非 SQLite/缺表/结构异常 → MigrationError）；
+    2. **一致性备份**：SQLite backup API 从只读连接整库复制（读快照
+       包含全部已提交数据，含活跃 WAL 中已提交的事务；不使用
+       checkpoint+复制主库的旧方案）；先写临时文件再原子改名，目标名
+       唯一不覆盖既有备份；备份失败中止，原库不变；
+    3. **单事务变更**：一个 BEGIN IMMEDIATE 内完成加列（v1）、全表
+       identity_key 改写（p:/q: 编码）、source_persona 回填、
+       schema_version=3 写入并提交；任一步失败 ROLLBACK——加列/回填/
+       版本标记要么全部生效要么全部不存在，重试从头完整执行。
     """
 
     import time as _time
 
     db = Path(str(db_path))
-    conn = sqlite3.connect(db, timeout=30.0)
-    conn.row_factory = sqlite3.Row
+    if not db.exists():
+        raise MigrationError(f"账本不存在：{db}")
+    posix = urllib.parse.quote(str(db.resolve()).replace("\\", "/"))
+    ro = None
     try:
+        ro = sqlite3.connect(f"file:{posix}?mode=ro", uri=True, timeout=30.0)
+        ro.row_factory = sqlite3.Row
         tables = {
-            r[0] for r in conn.execute(
+            r[0]
+            for r in ro.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
         if "schema_version" in tables:
-            return False
-        if "turns" not in tables or "meta" not in tables:
-            raise MigrationError("输入不是 0.6.0 账本（缺 turns/meta 表）")
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)").fetchall()}
-        if "mode_generation" in cols or "source_persona" in cols:
-            raise MigrationError("turns 已含 v2 列但缺 schema_version 表，结构异常")
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.close()
+            row = ro.execute("SELECT MAX(version) FROM schema_version").fetchone()
+            source_version = int(row[0]) if row is not None and row[0] is not None else 2
+        else:
+            if "turns" not in tables or "meta" not in tables:
+                raise MigrationError("输入不是 0.6.0 账本（缺 turns/meta 表）")
+            cols = {r[1] for r in ro.execute("PRAGMA table_info(turns)").fetchall()}
+            if "mode_generation" in cols or "source_persona" in cols:
+                raise MigrationError("turns 已含 v2 列但缺 schema_version 表，结构异常")
+            source_version = 1
+
+        # -- 2) 一致性备份（backup API，覆盖 WAL 中已提交数据） -------------
         bdir = Path(backup_dir) if backup_dir else db.parent / "backups"
         bdir.mkdir(parents=True, exist_ok=True)
         stamp = _time.strftime("%Y%m%d-%H%M%S")
-        backup = bdir / f"pre-migrate-v2-{stamp}-{db.name}"
-        shutil.copy2(db, backup)
-        conn = sqlite3.connect(db, timeout=30.0)
+        final = bdir / f"pre-migrate-v3-{stamp}-{db.name}"
+        counter = 1
+        while final.exists():
+            final = bdir / f"pre-migrate-v3-{stamp}-{counter}-{db.name}"
+            counter += 1
+        tmp = final.with_name(final.name + ".tmp")
+        try:
+            dst = sqlite3.connect(str(tmp))
+            try:
+                ro.backup(dst)  # 锁冲突/IO 失败抛 OperationalError，不静默
+            finally:
+                dst.close()
+            os.replace(tmp, final)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except MigrationError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        raise MigrationError(f"迁移失败：备份阶段出错，原库未变更（{exc}）") from exc
+    finally:
+        if ro is not None:
+            try:
+                ro.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # -- 3) 单事务变更 ------------------------------------------------------
+    conn = sqlite3.connect(db, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.isolation_level = None
+    try:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
-                "ALTER TABLE turns ADD COLUMN source_persona TEXT"
-                " NOT NULL DEFAULT '" + UNKNOWN_PERSONA + "'"
-            )
-            conn.execute(
-                "ALTER TABLE turns ADD COLUMN mode_generation INTEGER"
-                " NOT NULL DEFAULT 0"
-            )
+            if source_version == 1:
+                conn.execute(
+                    "ALTER TABLE turns ADD COLUMN source_persona TEXT"
+                    " NOT NULL DEFAULT '" + UNKNOWN_PERSONA + "'"
+                )
+                conn.execute(
+                    "ALTER TABLE turns ADD COLUMN mode_generation INTEGER"
+                    " NOT NULL DEFAULT 0"
+                )
+            # 键改写（v1/v2 都执行；已编码键原样保留）
+            rows = conn.execute(
+                "SELECT id, identity_key FROM turns"
+            ).fetchall()
+            for row in rows:
+                new_key = _migrate_identity_key(row["identity_key"])
+                if new_key != row["identity_key"]:
+                    conn.execute(
+                        "UPDATE turns SET identity_key=? WHERE id=?",
+                        (new_key, row["id"]),
+                    )
+            meta_keys = conn.execute(
+                "SELECT DISTINCT identity_key FROM meta"
+            ).fetchall()
+            for mrow in meta_keys:
+                old = mrow["identity_key"]
+                if len(old.split("\x1f")) != 4:
+                    continue  # 3 段基础键（mode_generation 等）不含 scope
+                new_key = _migrate_identity_key(old)
+                if new_key != old:
+                    conn.execute(
+                        "UPDATE meta SET identity_key=? WHERE identity_key=?",
+                        (new_key, old),
+                    )
+            # source_persona 回填：仅补缺失/未知（v2 已回填不覆盖）
+            rows = conn.execute(
+                "SELECT id, identity_key FROM turns WHERE source_persona IS NULL"
+                " OR source_persona='' OR source_persona='" + UNKNOWN_PERSONA + "'"
+            ).fetchall()
+            for row in rows:
+                persona = UNKNOWN_PERSONA
+                parts = row["identity_key"].split("\x1f")
+                if len(parts) == 4 and parts[2].startswith(_SCOPE_PERSONA_PREFIX):
+                    candidate = parts[2][len(_SCOPE_PERSONA_PREFIX):]
+                    if candidate and not candidate.startswith("__"):
+                        persona = candidate
+                conn.execute(
+                    "UPDATE turns SET source_persona=? WHERE id=?",
+                    (persona, row["id"]),
+                )
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS schema_version ("
                 "version INTEGER PRIMARY KEY, migrated_at REAL NOT NULL)"
@@ -106,34 +265,21 @@ def migrate_from_v1(db_path, *, backup_dir=None):
         except Exception:
             conn.execute("ROLLBACK")
             raise
-        # 从旧 identity_key 第三段还原 source_persona（保守：解析不出保持占位）
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            rows = conn.execute(
-                "SELECT id, identity_key FROM turns"
-                " WHERE source_persona='" + UNKNOWN_PERSONA + "'"
-            ).fetchall()
-            for row in rows:
-                parts = row[1].split("")
-                if len(parts) == 4 and parts[2] and not parts[2].startswith("__"):
-                    conn.execute(
-                        "UPDATE turns SET source_persona=? WHERE id=?",
-                        (parts[2], row[0]),
-                    )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
         return True
-    except MigrationError:
-        raise
     except sqlite3.DatabaseError as exc:
-        raise MigrationError(f"迁移失败（原库未变更）：{exc}") from exc
+        raise MigrationError(f"迁移失败：已回滚，原库未变更（{exc}）") from exc
     finally:
         try:
             conn.close()
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
+
+
+def migrate_from_v1(db_path, *, backup_dir=None):
+    """兼容别名（旧测试/文档引用）：等价 :func:`migrate_ledger`。"""
+
+    return migrate_ledger(db_path, backup_dir=backup_dir)
+
 
 
 _SCHEMA = """
@@ -283,13 +429,27 @@ class TurnLedger:
 
     # -- 生命周期 ---------------------------------------------------------
     def open(self, *, auto_migrate: bool = True) -> None:
+        """打开账本。
+
+        auto_migrate=True（默认）：旧库先迁移再连接（独立工具/测试路径）。
+        auto_migrate=False：连接但**不写 schema**，若为旧库则置
+        ``_legacy_pending``，由 :meth:`ensure_migrated` 在外部时序（如
+        main 先取租约）下补迁移与建 schema——防止 executescript 把 v1
+        库误标成当前版本。
+        """
+
         with self._lock:
             if self._conn is not None:
                 return
             Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-            # v1（0.6.0）旧库先迁移到 v2（幂等；已迁移/新建库跳过）
-            if auto_migrate and Path(self._db_path).exists():
-                migrate_from_v1(self._db_path)
+            legacy_pending = False
+            if Path(self._db_path).exists():
+                version = inspect_schema_version(self._db_path)
+                if version < SCHEMA_VERSION:
+                    if auto_migrate:
+                        migrate_ledger(self._db_path)
+                    else:
+                        legacy_pending = True
             conn = sqlite3.connect(
                 self._db_path,
                 timeout=30.0,
@@ -300,13 +460,40 @@ class TurnLedger:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=30000")
-            conn.executescript(_SCHEMA)
-            conn.execute(
-                "INSERT INTO schema_version (version, migrated_at) "
-                "SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM schema_version)",
-                (SCHEMA_VERSION, time.time()),
-            )
             self._conn = conn
+            self._legacy_pending = legacy_pending
+            if not legacy_pending:
+                self._finish_schema_locked()
+
+    def _finish_schema_locked(self) -> None:
+        """在已连接账本上补建 schema 与版本标记（持锁调用）。"""
+
+        conn = self._require_conn()
+        conn.executescript(_SCHEMA)
+        conn.execute(
+            "INSERT INTO schema_version (version, migrated_at) "
+            "SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM schema_version)",
+            (SCHEMA_VERSION, time.time()),
+        )
+        self._legacy_pending = False
+
+    def ensure_migrated(self) -> None:
+        """补执行旧库迁移与 schema 收尾（main：取租约之后调用，W3）。
+
+        迁移使用独立连接（含一致性备份）；完成后再在本连接上补建
+        schema/版本。已是当前版本时为幂等空操作。
+        """
+
+        with self._lock:
+            pending = getattr(self, "_legacy_pending", False)
+            opened = self._conn is not None
+        if not opened:
+            raise LedgerError("账本未打开（先调用 open()）")
+        if not pending:
+            return
+        migrate_ledger(self._db_path)
+        with self._lock:
+            self._finish_schema_locked()
 
     def close(self) -> None:
         with self._lock:
@@ -388,6 +575,140 @@ class TurnLedger:
             except Exception:
                 self._rollback(conn)
                 raise
+
+    # -- 模式持久化（W1：真实 reload/restart 识别模式变化） ----------------
+    def get_scope_mode(self, base_key: str) -> str | None:
+        """读取基础身份已生效（持久化）的共享模式；未记录返回 None。"""
+
+        with self._lock:
+            row = self._require_conn().execute(
+                "SELECT value FROM meta WHERE identity_key=? AND name='scope_mode'",
+                (base_key,),
+            ).fetchone()
+            return row["value"] if row else None
+
+    def apply_scope_mode(self, base_key: str, mode: str) -> tuple[int, bool]:
+        """记录基础身份的生效模式；显式模式变化时代次 +1。
+
+        单事务完成"读旧 → 判定 → 写 scope_mode + mode_generation"：
+        - 未记录（0.6.0/新基础身份）：写入当前模式，代次**不变**（升级
+          兼容：旧有效历史保持当前）；
+        - 已记录且相同：不写不动（同配置 reload/重启不清空）；
+        - 已记录且不同：代次 +1（该基础身份旧代次记录全部归档）。
+        返回 (生效代次, 是否发生显式切换)。
+        """
+
+        if mode not in ("persona", "user"):
+            raise LedgerError(f"非法共享模式：{mode!r}")
+        with self._lock:
+            conn = self._tx()
+            try:
+                gen_row = conn.execute(
+                    "SELECT value FROM meta WHERE identity_key=?"
+                    " AND name='mode_generation'",
+                    (base_key,),
+                ).fetchone()
+                gen = int(gen_row["value"]) if gen_row else 0
+                mode_row = conn.execute(
+                    "SELECT value FROM meta WHERE identity_key=?"
+                    " AND name='scope_mode'",
+                    (base_key,),
+                ).fetchone()
+                recorded = mode_row["value"] if mode_row else None
+                if recorded == mode:
+                    conn.execute("COMMIT")
+                    return gen, False
+                # 首次记录（recorded is None）只登记模式不改代次——升级兼容，
+                # 不算显式切换；已记录且不同才算切换
+                changed = recorded is not None
+                new_gen = gen + 1 if changed else gen
+                for name, value in (
+                    ("scope_mode", mode),
+                    ("mode_generation", str(new_gen)),
+                ):
+                    conn.execute(
+                        "INSERT INTO meta (identity_key, name, value)"
+                        " VALUES (?, ?, ?)"
+                        " ON CONFLICT(identity_key, name) DO UPDATE"
+                        " SET value=excluded.value",
+                        (base_key, name, value),
+                    )
+                conn.execute("COMMIT")
+                return new_gen, changed
+            except Exception:
+                self._rollback(conn)
+                raise
+
+    def enumerate_base_keys(self) -> list[str]:
+        """全部基础身份键（turns 与 meta 的并集；模式对账/转换枚举用）。"""
+
+        with self._lock:
+            conn = self._require_conn()
+            bases: set[str] = set()
+            for (k,) in conn.execute(
+                "SELECT DISTINCT identity_key FROM turns"
+            ).fetchall():
+                bases.add(self.base_key_of(k))
+            for (k,) in conn.execute(
+                "SELECT DISTINCT identity_key FROM meta"
+            ).fetchall():
+                parts = k.split("\x1f")
+                if len(parts) == 3:
+                    bases.add(k)
+                elif len(parts) == 4:
+                    bases.add(self.base_key_of(k))
+            return sorted(bases)
+
+    def identity_stats(self, identity_key: str) -> dict:
+        """身份维度统计（W5 status 用；与读取同一连接，时点一致）。
+
+        completed_current 按该身份当前 epoch + 当前模式代次的有效口径
+        统计；total_all 为全部 epoch/代次/状态的轮次总数；last_turn_at
+        为最近一轮创建时间（无记录为 None——"尚无接管证据"的依据）。
+        有效口径按有无 epoch 元数据二选一，使用两条固定字面量查询，
+        不做 SQL 文本拼接。
+        """
+
+        with self._lock:
+            conn = self._require_conn()
+            cur_epoch: int | None = None
+            cur_gen = 0
+            for row in conn.execute(
+                "SELECT name, value FROM meta WHERE identity_key=?",
+                (identity_key,),
+            ).fetchall():
+                if row["name"] == "epoch":
+                    cur_epoch = int(row["value"])
+                elif row["name"] == "mode_generation":
+                    cur_gen = int(row["value"])
+            total_row = conn.execute(
+                "SELECT COUNT(*) AS c, MAX(created_at) AS last_at"
+                " FROM turns WHERE identity_key=?",
+                (identity_key,),
+            ).fetchone()
+            if cur_epoch is not None:
+                completed_row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM turns WHERE identity_key=?"
+                    " AND status='completed' AND epoch=? AND mode_generation=?",
+                    (identity_key, cur_epoch, cur_gen),
+                ).fetchone()
+            else:
+                completed_row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM turns WHERE identity_key=?"
+                    " AND status='completed'",
+                    (identity_key,),
+                ).fetchone()
+            return {
+                "completed_current": int(completed_row["c"]),
+                "total_all": int(total_row["c"]),
+                "last_turn_at": (
+                    float(total_row["last_at"])
+                    if total_row["last_at"] is not None
+                    else None
+                ),
+                "current_epoch": cur_epoch,
+                "current_mode_generation": cur_gen,
+            }
 
     # -- epoch / seq ------------------------------------------------------
     def current_epoch(self, identity_key: str) -> int:

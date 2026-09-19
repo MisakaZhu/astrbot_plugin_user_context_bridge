@@ -1,24 +1,24 @@
-"""/uctx 中文管理命令（ADR-006/008）。
+"""/uctx 中文管理命令（ADR-006/008；W2/W5 修订）。
 
 命令组（README 固定）：
     /uctx status  查看本人的共享状态（不显示他人标识与聊天正文）
-    /uctx reset   清空本人的共享历史（epoch 切换；旧慢请求不回写）
-    /uctx off     退出共享（停止读取与新增；不删除已有数据）
-    /uctx on      重新加入共享（不导入停用期间的原生会话）
+    /uctx reset   清空本人的共享历史（persona=当前人格；user=跨人格整份）
+    /uctx off     退出共享（persona=本人格；user=该账号跨人格）
+    /uctx on      重新加入共享（定向解除对应维度的退出）
     /uctx scope   查看管理员配置的共享范围（只读）
 
 本人只能操作自己的共享历史；范围由管理员在插件配置中维护，
-个人命令不能扩大范围。原生 /reset、/new 只作用于宿主窗口会话，
-与共享历史的关系见 README「原生命令语义」。
+个人命令不能扩大范围。退出判定与运行时共用
+MembershipStore.effective_optout 同一语义；status 显示的"共享中"
+必须以实际接管证据为前提，开关开启不等于已接管。
 """
 
 from __future__ import annotations
 
-import sqlite3
-
 from astrbot.api.event import AstrMessageEvent
 
 from .identity import (
+    MODE_USER,
     PersonaResolutionError,
     SharedIdentity,
     build_identity,
@@ -35,13 +35,24 @@ class _FakeConv:
         self.persona_id = persona_id
 
 
-def _identity_of(event: AstrMessageEvent, persona_scope: str | None) -> SharedIdentity:
+def _identity_of(
+    event: AstrMessageEvent, persona_scope: str | None, mode: str = "persona"
+) -> SharedIdentity:
     return build_identity(
         platform_id=str(event.get_platform_id() or ""),
         self_id=str(event.get_self_id() or ""),
         persona_scope=persona_scope,
         sender_id=str(event.get_sender_id() or ""),
+        mode=mode,
     )
+
+
+def _fmt_ts(ts: float | None) -> str:
+    if not ts:
+        return ""
+    from datetime import datetime
+
+    return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
 
 
 class CommandService:
@@ -50,11 +61,12 @@ class CommandService:
         *,
         ledger: TurnLedger,
         resolver: ScopeResolver,
-        membership: MembershipStore,
+        membership: MembershipStore | None,
         persona_manager_getter,
         conversation_manager_getter=None,
         provider_settings_getter=None,
         history_scope: str = "persona",
+        unavailable_reason: str | None = None,
     ) -> None:
         self._ledger = ledger
         self._resolver = resolver
@@ -63,6 +75,7 @@ class CommandService:
         self._get_conversation_manager = conversation_manager_getter
         self._provider_settings_getter = provider_settings_getter
         self._history_scope = history_scope
+        self._unavailable_reason = unavailable_reason
 
     def _provider_settings(self, event: AstrMessageEvent) -> dict:
         """T1：与对话轮同源的 provider_settings（4.26 默认人格读取依赖）。"""
@@ -101,19 +114,28 @@ class CommandService:
         except Exception:  # noqa: BLE001 - 读取失败退回默认人格解析
             return None
 
-    async def _identity(self, event: AstrMessageEvent) -> SharedIdentity:
+    async def _resolved_persona(self, event: AstrMessageEvent) -> str:
+        """解析当前真实生效人格（persona/user 模式都解析；失败抛受控异常）。"""
+
         conversation_persona_id = await self._current_persona_id(event)
-        persona_scope = await resolve_persona_scope(
+        return await resolve_persona_scope(
             self._get_persona_manager(),
             event,
             _FakeConv(conversation_persona_id),
             provider_settings=self._provider_settings(event),
         )
-        # N13/N10：user 模式下命令（status/reset/off/on）作用于跨人格
-        # 合并身份；persona 模式下保持原样。
-        if self._resolver.history_scope == "user":
-            persona_scope = "__mode_user__"
-        return _identity_of(event, persona_scope)
+
+    async def _identity(self, event: AstrMessageEvent) -> tuple[SharedIdentity, str]:
+        """返回 (共享身份, 当前真实人格)。
+
+        persona 模式：共享身份 scope=当前人格；user 模式：共享身份为
+        跨人格令牌（u:），当前人格仅用于显示与 source_persona 记录。
+        """
+
+        persona = await self._resolved_persona(event)
+        if self._resolver.history_scope == MODE_USER:
+            return _identity_of(event, None, mode=MODE_USER), persona
+        return _identity_of(event, persona), persona
 
     def _identity_error_text(self) -> str:
         return (
@@ -121,17 +143,21 @@ class CommandService:
             "本次操作不执行。请检查人格配置后重试。"
         )
 
-    def _turn_stats(self, identity: SharedIdentity) -> dict[str, int]:
-        conn = sqlite3.connect(self._ledger._db_path)
-        try:
-            rows = conn.execute(
-                "SELECT status, COUNT(*) FROM turns WHERE identity_key=?"
-                " GROUP BY status",
-                (identity.key,),
-            ).fetchall()
-            return {status: count for status, count in rows}
-        finally:
-            conn.close()
+    def _unavailable_text(self) -> str:
+        return f"⚠️ 共享功能当前不可用：{self._unavailable_reason or '状态存储不可用'}"
+
+    def _scope_line(self) -> str:
+        cfg = self._resolver.config
+        return (
+            f"启用（模式：{self._resolver.history_scope}·"
+            + (
+                "跨人格共享，每窗口仍用各自人格"
+                if self._resolver.history_scope == MODE_USER
+                else "按人格隔离"
+            )
+            + f"；共享群 {len(cfg.shared_groups)} 个，"
+            f"私聊{'含' if cfg.include_private else '不含'}）"
+        )
 
     def _window_in_scope(self, event: AstrMessageEvent) -> bool:
         """命令场景的窗口范围判定（群白名单/私聊开关；不含对话轮次过滤）。"""
@@ -144,84 +170,128 @@ class CommandService:
             return group_id in cfg.shared_groups
         return cfg.include_private
 
+    def _reset_scope_text(self, identity: SharedIdentity) -> str:
+        if identity.mode == MODE_USER:
+            return "你跨人格的整份共享历史（全部人格）"
+        return f"人格「{identity.persona_scope}」的共享历史"
+
     # -- 子命令 -----------------------------------------------------------
     async def status(self, event: AstrMessageEvent) -> str:
+        if self._unavailable_reason is not None or self._membership is None:
+            return self._unavailable_text()
         try:
-            identity = await self._identity(event)
+            identity, persona = await self._identity(event)
         except PersonaResolutionError:
             return self._identity_error_text()
-        stats = self._turn_stats(identity)
         window = "群聊" if event.get_group_id() else "私聊"
-        enabled = self._resolver.config.enabled
-        scope_desc = (
-            f"启用（共享群 {len(self._resolver.config.shared_groups)} 个，"
-            f"私聊{'含' if self._resolver.config.include_private else '不含'}）"
-            if enabled
-            else "关闭"
-        )
-        if not enabled:
+        cfg = self._resolver.config
+        if not cfg.enabled:
             return (
-                f"📋 跨窗口上下文共享：{scope_desc}\n"
+                "📋 跨窗口上下文共享：关闭\n"
                 "当前不会采集或共享任何消息。范围由管理员在插件配置中开启。"
             )
-        if self._membership.is_opted_out(identity):
-            state = "已退出（off）"
-        elif self._window_in_scope(event):
-            state = "共享中"
+        in_scope = self._window_in_scope(event)
+        # 有效退出：与运行时 evaluate 同一语义（含继承/保护来源说明）
+        opted = self._membership.effective_optout(identity)
+        reason = self._membership.optout_reason(identity) if opted else ""
+        if opted:
+            state = "已退出（off）" if "直接退出" in reason else f"已退出（{reason}）"
+        elif not in_scope:
+            state = f"当前{window}窗口不在管理员允许范围内（不采集）"
         else:
-            state = f"当前{window}窗口不在管理员允许范围内"
-        total = sum(stats.values())
-        completed = stats.get("completed", 0)
+            state = "符合共享条件"
+        stats = self._ledger.identity_stats(identity.key)
+        if stats["last_turn_at"] is None:
+            capture_line = "实际接管：尚无记录（开关开启不等于已实际接管）"
+        else:
+            capture_line = (
+                f"实际接管：最近 {_fmt_ts(stats['last_turn_at'])}"
+                f"（共 {stats['total_all']} 条记录）"
+            )
+        persona_line = (
+            f"当前人格：{persona}（共享身份：该账号跨人格合并）"
+            if identity.mode == MODE_USER
+            else f"当前人格：{persona}"
+        )
         return (
-            f"📋 跨窗口上下文共享：{scope_desc}\n"
-            f"你的状态：{state}（当前窗口：{window}）\n"
-            f"你的共享历史：{completed} 轮已完成 / 共 {total} 条轮次记录\n"
+            f"📋 跨窗口上下文共享：{self._scope_line()}\n"
+            f"当前窗口：{window}（{'在' if in_scope else '不在'}管理员允许范围内）\n"
+            f"{persona_line}\n"
+            f"个人状态：{state}\n"
+            f"{capture_line}\n"
+            f"有效历史：{stats['completed_current']} 轮已完成"
+            f"（当前纪元 {stats['current_epoch']}"
+            f"·代次 {stats['current_mode_generation']}）\n"
             "命令：/uctx off 退出 · /uctx on 加入 · /uctx reset 清空"
+            f"（范围：{self._reset_scope_text(identity)}）"
         )
 
     async def reset(self, event: AstrMessageEvent) -> str:
+        if self._unavailable_reason is not None or self._membership is None:
+            return self._unavailable_text()
         try:
-            identity = await self._identity(event)
+            identity, persona = await self._identity(event)
         except PersonaResolutionError:
             return self._identity_error_text()
         if not self._resolver.config.enabled:
             return "⚠️ 共享未启用，无需清空。"
         new_epoch = self._ledger.bump_epoch(identity.key)
         return (
-            "🧹 已清空你的跨窗口共享历史（epoch 切换，进行中的旧请求不会回写）。\n"
-            f"影响范围仅限你本人（当前纪元 {new_epoch}）；其他用户不受影响。\n"
-            "说明：原生 /reset、/new 在宿主执行成功时也会同步清空你的共享"
-            "历史（等效本命令）。"
+            f"🧹 已清空{self._reset_scope_text(identity)}"
+            f"（epoch 切换，当前纪元 {new_epoch}；进行中的旧请求不会回写，"
+            "旧记录归档可查）。\n"
+            "其他用户不受影响。原生 /reset、/new 在宿主执行成功时也会"
+            "同步清空（等效本命令，范围一致）。"
         )
 
     async def off(self, event: AstrMessageEvent) -> str:
+        if self._unavailable_reason is not None or self._membership is None:
+            return self._unavailable_text()
         try:
-            identity = await self._identity(event)
+            identity, persona = await self._identity(event)
         except PersonaResolutionError:
             return self._identity_error_text()
         self._membership.opt_out(identity)
+        if identity.mode == MODE_USER:
+            return (
+                "🚪 已退出跨人格共享：该账号的全部人格从下一轮起不再读取、"
+                "不再新增共享历史。\n已有数据保留。切换到 persona 模式后"
+                "退出继续生效（保护现有与新增人格），直到你主动 /uctx on。"
+            )
         return (
-            "🚪 已退出跨窗口共享：从下一轮起不再读取、不再新增你的共享历史。\n"
-            "已有数据保留（可用 /uctx on 恢复接续；重新启用不会导入"
-            "停用期间各窗口的原生会话）。"
+            f"🚪 已退出人格「{persona}」的跨窗口共享：从下一轮起不再读取、"
+            "不再新增你的共享历史。\n已有数据保留（/uctx on 恢复）。"
         )
 
     async def on(self, event: AstrMessageEvent) -> str:
+        if self._unavailable_reason is not None or self._membership is None:
+            return self._unavailable_text()
         try:
-            identity = await self._identity(event)
+            identity, persona = await self._identity(event)
         except PersonaResolutionError:
             return self._identity_error_text()
         if not self._resolver.config.enabled:
             return "⚠️ 共享未启用，无法加入。范围由管理员在插件配置中开启。"
-        self._membership.opt_in(identity)
+        if identity.mode == MODE_USER:
+            # user on：解除 user 键退出与基础保护；人格维度显式退出保留
+            self._membership.opt_in_user(identity)
+        else:
+            # persona on：仅解除本人格（基础保护对其他人格继续生效）
+            self._membership.opt_in_persona(identity)
         if not self._window_in_scope(event):
             return (
                 "⚠️ 已取消退出标记，但当前窗口不在管理员允许范围内，"
                 "仍不会共享。个人命令无法扩大管理员配置的范围。"
             )
+        if identity.mode == MODE_USER:
+            return (
+                "✅ 已重新加入跨人格共享：该账号从下一轮起继续接续共享历史"
+                "（停用期间的原生会话不会导入；此前对单个人格的显式退出"
+                "仍然保留，回到 persona 模式时生效）。"
+            )
         return (
-            "✅ 已重新加入跨窗口共享：从下一轮起继续接续你之前的共享历史"
-            "（停用期间的原生会话不会导入）。"
+            f"✅ 已重新加入人格「{persona}」的跨窗口共享：从下一轮起继续"
+            "接续（停用期间的原生会话不会导入）。"
         )
 
     def scope(self) -> str:
@@ -232,6 +302,7 @@ class CommandService:
         private = "包含" if cfg.include_private else "不包含"
         return (
             "🔧 管理员配置的共享范围（只读，修改请前往插件配置）：\n"
+            f"模式：{self._resolver.history_scope}\n"
             f"共享群：{groups}\n私聊：{private}\n"
             "范围外来源保持原生会话行为，不采集、不注入。"
         )
