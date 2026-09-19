@@ -464,7 +464,8 @@ def t1_t5_t6_workers() -> None:
         )
         check(
             f"T1.{tag}.explicit-conversation-persona",
-            out.get("explicit_scope") == "persona_b",
+            out.get("explicit_scope")
+            in ("persona_b", "p:persona_b"),
             f"got={out.get('explicit_scope')}",
         )
         check(

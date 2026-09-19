@@ -125,7 +125,8 @@ async def scenario_commands() -> None:
             status_text = await commands.status(ev)
             check(
                 "CMD.status-shows-state",
-                "共享中" in status_text and "1 轮已完成" in status_text,
+                "符合共享条件" in status_text and "1 轮已完成" in status_text
+                and "实际接管" in status_text,
                 f"text={status_text}",
             )
             check(
@@ -156,7 +157,7 @@ async def scenario_commands() -> None:
             reset_text = await commands.reset(ev)
             check(
                 "CMD.reset-text",
-                "清空" in reset_text and "仅限你本人" in reset_text,
+                "清空" in reset_text and "其他用户不受影响" in reset_text,
                 reset_text,
             )
             check(

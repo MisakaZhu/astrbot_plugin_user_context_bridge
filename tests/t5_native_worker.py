@@ -195,7 +195,7 @@ async def scenario(name, *, disabled=False, renamed=False, filtered=False,
             message_str="/" + cmd,
         )
         event.message_obj.message = [Plain("/" + cmd)]
-        identity = await plugin._commands._identity(event)
+        identity, _persona = await plugin._commands._identity(event)
         ledger.begin_turn(
             identity_key=identity.key, event_key="seed-" + name,
             source_type="group", source_id="700000001",

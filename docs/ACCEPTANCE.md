@@ -109,3 +109,62 @@ main.initialize() 未覆盖该路径，由 N4 全量回归的 S6 暴露。修复
 - N24 朋友演练（跨人格实机、本地工具实操、GUI）：待 MIS-145 扩展执行，本地结果不替代。
 - N18 视觉复核：截图与 DOM 检查为本地 Playwright 产物，Codex 视觉复核待 MIS-170。
 - 迁移实库演练：仅合成库演练；朋友环境真实库升级由用户在备份前提下执行。
+
+
+---
+
+# 0.7.0 W 返工后验收矩阵（N01–N24 v2，2026-09-19）
+
+**上轮口径更正（重要）**：首个候选 219cef2 的 N01–N23 "全 PASS" 结论不被独立验收支持——
+N08（代次推进靠 resolver 属性切换，未走真实 PluginManager/restart，未检查最初 persona 记录）、
+N07（缺 user off→persona 及未来人格证据）、N12（`has_data >= 0` 空断言，未校验结构与可重试）、
+N13（矩阵声称显示模式/有效数但实现仍旧 status）、N22（把源码复制夹具描述为"13 文件 ZIP 生命周期"）、
+N09（放行 A 后仅查完成数，未证明 B 阻塞期间未进入模型）均属证据缺口或行为缺陷。本轮全部修正，
+不再沿用"计数全绿因此完成"的结论。
+
+测试基座（两版各一遍；总数从完整日志加总，不预设）：
+
+```bash
+for t in p0_lifecycle_check p1_identity_scope_check p2_ledger_check        p3_bridge_flow_check p4_concurrency_check p5_commands_check        p6_packaging_check r_rework_check s_rework_check t_rework_check        n0_baseline_check n1_scope_migration_check n2_cross_persona_check        n3_records_check w_rework_check w_lifecycle_check w_zip_lifecycle_check; do
+  PYTHONPATH=. <venv>/Scripts/python.exe -X utf8 tests/$t.py
+done
+# 统计：4.26.0 / 4.28.0 各 561 项断言全 PASS
+# （旧 10 套 298：17+36+27+19+22+16+8+38+46+69；
+#   n 系 4 套 113：10+30+14+59；w 系 3 套 150：34+57+59）
+```
+
+W 返工中发现并修复的新缺陷：`identity_stats` 以 4 段身份键查询 mode_generation（实际存于
+3 段基础键），导致 status 有效数把归档轮计入当前——由 w_lifecycle_worker 真实宿主证据暴露。
+
+| 编号 | 场景 | 落点证据 | 状态 |
+| --- | --- | --- | --- |
+| N01 | 默认升级（保持 persona） | 真实 859f18e 旧库迁移：行数/键改写 p:/source_persona/epoch 逐项对账；旧历史当前可读；幂等 | PASS（w3/n1，双版） |
+| N02 | user 模式跨人格接续 | 群A黑→群B白→私聊→群A，最终请求含前序问答各一次（n2 真实调度链） | PASS（双版；实机待 N24） |
+| N03 | persona 模式原人格隔离 | 升级后 persona 键 p:<id> 行为不变（n0 基线 + T1 真实 PersonaManager） | PASS（双版） |
+| N04 | user 模式当前人格规则 | n2 真实调度链：每轮 system_prompt=当前窗口人格、开场白单次、不持久化旧规则（T1 真实 PersonaManager 证据保留于 t 套件） | PASS（双版） |
+| N05 | 身份与路由 | v3 编码下跨用户/机器人/平台隔离（p1/p3）+ W4 键不碰撞（真实 PersonaManager 创建 __mode_user__ 人格，探针证据 + w4 结构断言） | PASS（双版） |
+| N06 | 来源与退出 | 范围外/退出不采集；user off→写 user 键退出（转换），on 不扩范围（p1/r5/w2） | PASS（双版） |
+| N07 | 退出转换（完整） | 真实转换函数接入：persona off→user 保持退出（运行时+status 双证据）；user off→persona 基础保护覆盖现有人格与未来人格；单人格 on 只解除该人格；显式 off 不被静默清除 | PASS（n1/w_lifecycle 双版真实命令） |
+| N08 | 模式往返（真实宿主） | 真实 PluginManager 四阶段 reload：代次 [0,0,1,2,3] 持久推进；切回 persona 最初 P/S 问答不复活；再切 user BP 问答不复活；同模式 reload 不清空（w_lifecycle_worker，双版） | PASS（双版） |
+| N09 | 跨人格并发 | 屏障证明 A 挂起时 B 未进入模型；释放后 B 最终请求含 A 一次完整问答且仅一次；gather 结果/异常入结论（n2 收紧版） | PASS（双版） |
+| N10 | reset/new 双模式清空范围 | n2（persona=当前人格、user=跨人格整份）+ t5/t6/V1 真实命令分发成功一次联动与拒绝分支 | PASS（双版） |
+| N11 | 切换与取消 | w_lifecycle Phase 7：配置变化时挂起 A（interrupted、无迟到输出）+ 排队 B（真实锁等待 1、stopped、无输出）；S6/T2/T3 继承 | PASS（双版） |
+| N12 | 迁移与恢复（收紧） | 触发器注入失败→回滚后逐项核验（无新列、无 schema_version、行内容原样），去障重试完整完成（键/回填/版本到位）；损坏输入拒绝；备份不覆盖既有（同目录两份共存） | PASS（n1/w3，双版） |
+| N13 | 状态诊断（实测） | w_lifecycle 真实宿主：fresh status="尚无记录（开关开启不等于已实际接管）"；接管后显示"实际接管：最近…/1 轮已完成"；继承退出显示"已退出（…继承）"；reset 文案按模式标明范围；与真实采集/有效数一致 | PASS（双版） |
+| N14 | 只读入口 | mode=ro+单读事务；list 不含正文；无写路径/租约（n3） | PASS（双版） |
+| N15 | 过滤与消歧 | 身份三维/唯一推断/歧义候选拒绝/未知身份报错/时间边界/状态白名单/空结果（n3 真实 CLI） | PASS（双版） |
+| N16 | 归档与异常 | 默认仅当前 epoch+代次 completed；--archives 标注；failed/aborted/interrupted/running 显式选择（n3） | PASS（双版） |
+| N17 | 一致性快照 | meta+turns 同读事务；w3：持读快照期间已提交 WAL 行必入备份与后续读取；ledger 事务约束继承 | PASS（双版） |
+| N18 | HTML（新产物重渲染） | W6/W7 变更后重新生成样例并 Playwright 重渲染：身份行"三维明确"、搜索 white→1/5、0 控制台错误、注入转义、无外链（w-render-full.png / w-render-filtered.png） | PASS（双版产物；Codex 视觉复核待 MIS-170） |
+| N19 | JSON | 信封/记录字段/工具配对/send_state/截断（total 7 返回 2）/resolved_identity 推断标注（n3） | PASS（双版） |
+| N20 | 文件与限额（收紧） | 真实 CLI：拒绝覆盖源库/WAL、**backups/ 整树（大小写/相对/等价路径）且备份字节不变**、backups 目录本身、exports 合法输出保留、坏父路径无半文件、v1 拒绝（n3） | PASS（双版） |
+| N21 | 数据边界 | 工具不读配置/不连网；导出仅 turns 已 sanitize 字段；Git/ZIP 无 exports/备份/库（p6 A18） | PASS（双版） |
+| N22 | ZIP 独立使用（真实包） | 工作区打包 13 文件白名单 ZIP → **双版解包安装**跑真实 PluginManager 完整生命周期（load/reload/turn_off/turn_on/uninstall，w_zip_lifecycle 59 断言）+ ZIP 内工具独立运行（显式断言包含 tools/） | PASS（双版） |
+| N23 | 测试可信度 | w_lifecycle 父断言被故障注入实调：12 关键字段逐个翻假全部判 FAIL（非复制断言）；n3 子进程真实 CLI；S6 故障注入继承 | PASS（双版） |
+| N24 | 朋友演练 | 跨人格实机、本地工具实操、GUI | **待实机（MIS-145）** |
+
+## W 返工后待实机 / 待复核项
+
+- N24 朋友演练（含 user 模式切换演示、本地工具实操）：待 MIS-145。
+- N18 视觉复核：本轮新样例截图待 Codex 复核（上轮通过结论不自动继承）。
+- 迁移实库演练：仅合成/真实实现构造的旧库；朋友真实库升级前先备份。

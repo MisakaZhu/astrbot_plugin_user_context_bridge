@@ -454,7 +454,7 @@ class UserContextBridgePlugin(Star):
                     cid = None
                 if not cid:
                     return
-            identity = await self._commands._identity(event)
+            identity, _persona = await self._commands._identity(event)
             if not self._commands._window_in_scope(event):
                 return
             if self._membership is not None and self._membership.is_opted_out(identity):

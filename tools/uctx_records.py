@@ -38,14 +38,16 @@ import sys
 import tempfile
 import urllib.parse
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 SEP = "\x1f"
 """身份键四段分隔符（与 uctx_bridge.identity 一致）。"""
 
-MODE_USER_SCOPE = "__mode_user__"
-"""user 共享模式在身份键第三段的保留字面量。"""
+# scope 段编码（与 uctx_bridge.identity / ledger 镜像；W4）
+SCOPE_USER_TOKEN = "u:"
+SCOPE_PERSONA_PREFIX = "p:"
+SCOPE_QUARANTINE_PREFIX = "q:"
 
 VALID_STATUSES = ("completed", "failed", "aborted", "interrupted", "running")
 DEFAULT_STATUSES = ("completed",)
@@ -157,16 +159,46 @@ def base_key_of(identity_key: str) -> str:
 
 
 def decode_identity(identity_key: str) -> dict | None:
+    """身份键解码（W4 编码）：scope 段带模式前缀。
+
+    返回 scope_mode：persona / user / quarantine（迁移隔离，不注入）/
+    legacy_persona（迁移前的裸键，正常仅存在于未迁移旧库）。
+    """
+
     parts = identity_key.split(SEP)
     if len(parts) != 4:
         return None
-    platform_id, self_id, persona_scope, sender_id = parts
+    platform_id, self_id, scope_token, sender_id = parts
+    if scope_token == SCOPE_USER_TOKEN:
+        return {
+            "platform_id": platform_id,
+            "self_id": self_id,
+            "persona_scope": "",
+            "sender_id": sender_id,
+            "scope_mode": "user",
+        }
+    if scope_token.startswith(SCOPE_PERSONA_PREFIX):
+        return {
+            "platform_id": platform_id,
+            "self_id": self_id,
+            "persona_scope": scope_token[len(SCOPE_PERSONA_PREFIX):],
+            "sender_id": sender_id,
+            "scope_mode": "persona",
+        }
+    if scope_token.startswith(SCOPE_QUARANTINE_PREFIX):
+        return {
+            "platform_id": platform_id,
+            "self_id": self_id,
+            "persona_scope": scope_token[len(SCOPE_QUARANTINE_PREFIX):],
+            "sender_id": sender_id,
+            "scope_mode": "quarantine",
+        }
     return {
         "platform_id": platform_id,
         "self_id": self_id,
-        "persona_scope": persona_scope,
+        "persona_scope": scope_token,
         "sender_id": sender_id,
-        "scope_mode": "user" if persona_scope == MODE_USER_SCOPE else "persona",
+        "scope_mode": "legacy_persona",
     }
 
 
@@ -180,14 +212,23 @@ def parse_bound(text: str | None, *, which: str) -> float | None:
             f"--{which} 不是合法 ISO8601 时间：{text!r}"
         ) from exc
     if dt.tzinfo is None:
-        return dt.timestamp()  # 无偏移按本地时间解释
+        # 无偏移按本地时间解释。不用 naive.timestamp()：Windows 对 1970
+        # 前的本地时间会抛 OSError[22]，改用当前本地偏移的纯算术换算。
+        local_offset = datetime.now().astimezone().utcoffset()
+        return (dt - local_offset).replace(tzinfo=timezone.utc).timestamp()
     return dt.timestamp()
 
 
 def fmt_time(ts: float | None) -> str:
     if ts is None:
         return ""
-    return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+    try:
+        return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+    except (OSError, OverflowError, ValueError):
+        # Windows 对 1970 前的本地时间戳可能抛 OSError——回退 UTC 显示
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(
+            timespec="seconds"
+        )
 
 
 def is_current(row: dict, current: dict[str, dict[str, int]]) -> bool:
@@ -235,41 +276,129 @@ class Filters:
         }
 
 
-def select_identity_keys(snap: Snapshot, f: Filters) -> set[str] | None:
-    """按平台/机器人/用户解码字段筛选身份键；None 表示不限制。"""
+def _decode_base(base_key: str) -> dict:
+    """3 段基础键 → (platform, self, sender)。"""
 
-    wanted = [f.platform_id, f.self_id, f.sender_id]
-    if not any(wanted):
-        return None
-    hits: set[str] = set()
-    seen_keys = {row["identity_key"] for row in snap.turns}
-    seen_keys.update(snap.current.keys())
-    for key in seen_keys:
-        dec = decode_identity(key)
-        if dec is None:
-            continue
-        if f.platform_id and dec["platform_id"] != f.platform_id:
-            continue
-        if f.self_id and dec["self_id"] != f.self_id:
-            continue
-        if f.sender_id and dec["sender_id"] != f.sender_id:
-            continue
-        hits.add(key)
-    if not hits:
-        raise RecordsError(
-            "未找到匹配身份分区（platform/self/sender 组合在本库无记录）"
+    parts = base_key.split(SEP)
+    if len(parts) != 3:
+        return {}
+    return {
+        "platform_id": parts[0],
+        "self_id": parts[1],
+        "sender_id": parts[2],
+    }
+
+
+def enumerate_bases(snap: Snapshot) -> list[dict]:
+    """全部基础身份（仅管理元数据，不含正文）：三维字段 + 轮次统计。"""
+
+    bases: dict[str, dict] = {}
+
+    def slot(bk: str) -> dict:
+        if bk not in bases:
+            bases[bk] = {
+                **_decode_base(bk),
+                "turns_total": 0,
+                "turns_completed": 0,
+                "first": None,
+                "last": None,
+                "scope_modes": set(),
+            }
+        return bases[bk]
+
+    for row in snap.turns:
+        s = slot(base_key_of(row["identity_key"]))
+        s["turns_total"] += 1
+        if row["status"] == "completed":
+            s["turns_completed"] += 1
+        s["first"] = (
+            row["created_at"] if s["first"] is None else min(s["first"], row["created_at"])
         )
-    return hits
+        s["last"] = (
+            row["created_at"] if s["last"] is None else max(s["last"], row["created_at"])
+        )
+        dec = decode_identity(row["identity_key"])
+        if dec:
+            s["scope_modes"].add(dec["scope_mode"])
+    for key in snap.current:
+        slot(base_key_of(key))
+    out = []
+    for bk in sorted(bases):
+        s = bases[bk]
+        s["base_key"] = bk
+        s["scope_modes"] = sorted(s["scope_modes"])
+        out.append(s)
+    return out
 
 
-def apply_filters(snap: Snapshot, f: Filters) -> tuple[list[dict], bool, int]:
-    """返回 (命中的 turns 行, 是否截断, 截断前总命中数)。按时间升序。"""
+def _candidates_block(bases: list[dict]) -> str:
+    lines = []
+    for b in bases[:20]:
+        lines.append(
+            f"  - {b.get('platform_id') or '?'} / bot={b.get('self_id') or '?'}"
+            f" / 用户={b.get('sender_id') or '?'}"
+            f"（完成 {b.get('turns_completed', 0)}/{b.get('turns_total', 0)} 条）"
+        )
+    if len(bases) > 20:
+        lines.append(f"  ……共 {len(bases)} 个基础身份，仅显示前 20 个")
+    return "\n".join(lines)
 
-    keys = select_identity_keys(snap, f)
+
+def resolve_export_base(snap: Snapshot, f: Filters) -> dict:
+    """W6：导出前解析**唯一**基础身份；歧义/缺失/无匹配均受控报错。
+
+    - 完全未给身份：列出全部候选（不含正文）并报错，不做默认全库导出；
+    - 部分指定：按已给维度过滤，命中多个 → 列出候选要求补全；
+    - 唯一命中：允许推断，但必须在输出（stdout/JSON/HTML）中明示。
+    """
+
+    all_bases = enumerate_bases(snap)
+    given = sum(1 for w in (f.platform_id, f.self_id, f.sender_id) if w)
+    if given == 0:
+        raise RecordsError(
+            "必须先确定导出身份：请用 --platform/--self-id/--sender 指定，"
+            "至少给到可唯一解析（推荐三维完整）。本库可用基础身份：\n"
+            + _candidates_block(all_bases)
+        )
+    matches = [
+        b
+        for b in all_bases
+        if (not f.platform_id or b["platform_id"] == f.platform_id)
+        and (not f.self_id or b["self_id"] == f.self_id)
+        and (not f.sender_id or b["sender_id"] == f.sender_id)
+    ]
+    if not matches:
+        raise RecordsError(
+            "未找到匹配的基础身份分区（platform/self/sender 组合在本库无记录）"
+        )
+    if len(matches) > 1:
+        raise RecordsError(
+            "身份筛选命中多个基础身份，为避免混合导出多用户/多机器人正文，"
+            "请补全到唯一（当前候选：\n" + _candidates_block(matches) + "）"
+        )
+    base = matches[0]
+    return {
+        "base_key": base["base_key"],
+        "platform_id": base["platform_id"],
+        "self_id": base["self_id"],
+        "sender_id": base["sender_id"],
+        "inferred": given < 3,
+    }
+
+
+def apply_filters(
+    snap: Snapshot, f: Filters, base_key: str
+) -> tuple[list[dict], bool, int]:
+    """返回 (命中的 turns 行, 是否截断, 截断前总命中数)。按时间升序。
+
+    身份维度由 resolve_export_base 唯一确定后传入，这里只做基础身份内
+    的来源/人格/时间/状态/归档筛选。
+    """
+
     allowed = set(f.statuses)
     matched: list[dict] = []
     for row in snap.turns:
-        if keys is not None and row["identity_key"] not in keys:
+        if base_key_of(row["identity_key"]) != base_key:
             continue
         if row["status"] not in allowed:
             continue
@@ -342,7 +471,8 @@ def turn_to_record(row: dict, snap: Snapshot) -> dict:
 
 
 def build_export(snap: Snapshot, f: Filters) -> dict:
-    rows, truncated, total = apply_filters(snap, f)
+    resolved = resolve_export_base(snap, f)
+    rows, truncated, total = apply_filters(snap, f, resolved["base_key"])
     return {
         "schema_version": EXPORT_SCHEMA_VERSION,
         "exported_at": fmt_time(datetime.now().timestamp()),
@@ -350,8 +480,19 @@ def build_export(snap: Snapshot, f: Filters) -> dict:
         "ledger_schema_version": snap.schema_version,
         "database": snap.db_path.name,
         "filters": f.echo(),
+        "resolved_identity": {
+            "platform_id": resolved["platform_id"],
+            "self_id": resolved["self_id"],
+            "sender_id": resolved["sender_id"],
+            "inferred": resolved["inferred"],
+            "note": (
+                "由部分参数唯一推断；完整三维以本输出为准"
+                if resolved["inferred"]
+                else "platform/self/sender 三维完整指定"
+            ),
+        },
         "time_convention": "本地时区 ISO8601（含偏移）；起点包含、终点不包含。",
-        "note": "全量快照导出，不是可追加的增量事件流；页面/文件只反映导出时点。",
+        "note": "单一基础身份快照导出，不是可追加的增量事件流；页面/文件只反映导出时点。",
         "total_matched": total,
         "returned": len(rows),
         "truncated": truncated,
@@ -369,6 +510,11 @@ def _normcase(p: Path) -> str:
 
 
 def guard_output_path(out: Path, db_path: Path) -> Path:
+    """输出守卫（W7）：规范化路径后拒绝覆盖源库、WAL/SHM/journal 与
+    **源库关联的备份目录**（<db 目录>/backups/，目录级整树拒绝）；
+    相对/绝对、Windows 大小写、等价路径（./、..）全部归一后比较。
+    """
+
     out = out.resolve()
     db = db_path.resolve()
     protected = {
@@ -379,8 +525,19 @@ def guard_output_path(out: Path, db_path: Path) -> Path:
     }
     if _normcase(out) in protected:
         raise RecordsError("输出路径不能覆盖源数据库及其 WAL/SHM/journal 文件")
-    if db.parent.name == "backups" and out.is_relative_to(db.parent):
-        raise RecordsError("输出路径不能写入备份目录 backups/")
+    backups_dir_norm = _normcase(db.parent / "backups")
+    out_norm = _normcase(out)
+    if out_norm == backups_dir_norm or out_norm.startswith(
+        backups_dir_norm + os.sep
+    ):
+        raise RecordsError(
+            "输出路径不能写入源库关联的备份目录 backups/（迁移备份受保护）"
+        )
+    if os.path.normcase(db.parent.name) == "backups" and out_norm.startswith(
+        _normcase(db.parent) + os.sep
+    ):
+        # 源库本身就在某个 backups 目录里：该目录整体亦视为备份目录
+        raise RecordsError("输出路径不能写入备份目录（源库位于备份目录内）")
     if out.is_dir():
         raise RecordsError(f"输出路径已是目录：{out}")
     return out
@@ -574,9 +731,17 @@ def render_record_card(index: int, record: dict) -> str:
 def render_html(export: dict) -> str:
     records = export["records"]
     f = export["filters"]
+    rid = export.get("resolved_identity") or {}
     cond_bits = []
+    if rid:
+        cond_bits.append(
+            "身份=" + _esc(
+                f"{rid.get('platform_id') or '?'}/bot={rid.get('self_id') or '?'}"
+                f"/用户={rid.get('sender_id') or '?'}"
+                + ("（唯一推断）" if rid.get("inferred") else "（三维明确）")
+            )
+        )
     for label, key in [
-        ("平台", "platform_id"), ("机器人", "self_id"), ("用户", "sender_id"),
         ("来源类型", "source_type"), ("来源 ID", "source_id"),
         ("人格", "source_persona"), ("起", "time_from"), ("止", "time_to"),
     ]:
@@ -766,11 +931,19 @@ def main(argv: list[str] | None = None) -> int:
                     f"　身份分区：{len(rows)} 个"
                 )
                 for i, r in enumerate(rows, 1):
-                    mode = "user(跨人格)" if r["scope_mode"] == "user" else "persona"
+                    sm = r["scope_mode"]
+                    if sm == "user":
+                        mode = "user(跨人格)"
+                    elif sm == "quarantine":
+                        mode = "quarantine(隔离,不注入)"
+                    elif sm == "legacy_persona":
+                        mode = "legacy(未迁移裸键)"
+                    else:
+                        mode = "persona"
                     print(
                         f"[{i}] {r['platform_id']} / bot={r['self_id']}"
                         f" / 模式={mode}"
-                        + (f"(scope={r['persona_scope']})" if r["scope_mode"] == "persona" else "")
+                        + (f"(scope={r['persona_scope']})" if sm in ("persona", "legacy_persona", "quarantine") else "")
                         + f" / 用户={r['sender_id']}"
                         + f" / epoch={r['current_epoch']}"
                         + f" 代次={r['current_mode_generation']}"

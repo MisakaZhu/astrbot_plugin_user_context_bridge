@@ -284,6 +284,13 @@ class MembershipStore:
         with self._lock:
             return identity.key in self._persona_on
 
+    def is_opted_out(self, identity: SharedIdentity) -> bool:
+        """直接退出标记查询（仅查键，不含继承/保护推导；有效判定用
+        :meth:`effective_optout`）。"""
+
+        with self._lock:
+            return identity.key in self._optout
+
     def effective_optout(self, identity: SharedIdentity) -> bool:
         """有效退出判定（evaluate/status/命令唯一语义，W2/W5）。
 

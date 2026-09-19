@@ -1,5 +1,34 @@
 # HANDOFF（交接说明）
 
+## 0.7.0 W1–W8 返工交付（2026-09-19，待 Codex 复验）
+
+**分支 `feat/0.7.0-persona-records`；返工基线 219cef2（首个候选，Codex 判未通过）。本次修复 W1–W8 全部阻断项；未 push、未发布、实机未验证。**
+
+### 修复与证据（对应独立验收报告 23 号 W1–W8 编号）
+
+| 项 | 根因 | 修复 | 证据 |
+| --- | --- | --- | --- |
+| W1 模式变化不被 reload 识别 | 构造器把新配置当"上一生效模式"，无持久化 | 生效模式持久化 meta.scope_mode（基础身份维度），apply_scope_mode 单事务判定（未记录=登记不改代次；不同=代次+1）；真实 reload/停机改配置/同配置不清空/黑白轮换不误清全覆盖 | w_lifecycle_worker 双版：四阶段代次 [0,0,1,2,3]、不回灌不复活、reset 后切换不复活 |
+| W2 退出继承未接入 | protect_base/release_base 无生产调用 | 真实转换函数 _convert_exit_for_mode_change（加法、幂等）接入 initialize 对账；off/on 分维度命令；effective_optout 唯一语义；损坏/写失败受控 | w_lifecycle Phase 6 退出矩阵 + n1 + w2 场景（双版） |
+| W3 迁移非原子/备份丢行 | DDL/回填分事务提交；checkpoint busy 忽略+仅拷主库 | migrate_ledger：单 IMMEDIATE 事务（失败真回滚、重试完整）+ backup API 一致性快照（WAL 已提交不丢）+ 备份唯一名不覆盖 + 迁移移入租约序列 | w3（真实 859f18e 旧库：对账/WAL/故障重试/备份共存）+ n1 N12 收紧 |
+| W4 user 键与真实人格碰撞 | __mode_user__ 保留字可被真实人格占用 | 结构化编码 p:/u:/q:；0.6.0 裸键迁移改写 p:；不可辨认旧候选键 q: 隔离不注入；membership scheme3 同步（不可辨认证安全方向转基础保护） | w4 编码断言 + 探针证据（persona_probe）；ADR-016 |
+| W5 status 旧实现 | 仅查精确 optout、忽略接管证据与代次 | status 重写：模式/当前真实人格/范围/有效退出（同源）/实际接管证据/有效数（当前 epoch+代次）/reset 范围 | w_lifecycle status 断言 + n2；修复 identity_stats 代次读错键 |
+| W6 导出身份不消歧 | 无参/部分参导出多基础身份 | 导出先解析唯一基础身份；缺失/歧义→候选列表（不含正文）+rc2 不写文件；唯一推断输出明示；文档示例修正 | n3 真实 CLI 矩阵 |
+| W7 backups 不受保护 | 仅判断"DB 父目录名为 backups" | 规范化路径保护 <库目录>/backups/ 整树（大小写/相对/等价），真实 CLI 校验备份字节不变 | n3 N20 场景 |
+| W8 测试/矩阵缺口 | 关键断言空泛/未覆盖真实路径 | 新增 w 三套（150 断言）；N12 逐项核验回滚+重试；N07/N08/N09/N13/N22 收紧；故障注入实调父断言（12 字段翻假全检出）；N18 新产物重渲染 | local_evidence/w_logs/、n3_html/w-render-*.png |
+
+### 版本与包
+
+- 全量回归：17 套 × 4.26.0/4.28.0 各 **561 项全 PASS**（298+113+150）；日志 local_evidence/w_logs/（34 份）。
+- 候选包：release/astrbot_plugin_user_context_bridge-<sha>.zip（13 文件白名单含 tools/）+ SHA-256，见交付报告；旧 0.6.0 包未触碰。
+- 边界：未 push、未建 Release、未部署；真实 QQ/模型未用；迁移仅合成/真实实现构造旧库；N24 实机待 MIS-145。
+
+### 历史
+
+<details>
+<summary>0.7.0 首个候选（219cef2，未通过）与 0.6.0 交接（历史）</summary>
+
+
 ## ⚠️ 暂停断点（2026-09-19，W1–W8 返工中途，用户升级 ZCode）
 
 **基线 219cef2（W 返工起点，工作区干净）。返工依据：`上下文共享-规划交接-20260917\24_ZCode_GLM53_0.7.0_W1-W8返工提示词.md` + `23_Codex独立验收_0.7.0_219cef2.md` + 证据目录 `上下文共享-独立验收-219cef2-20260919`。Linear MIS-165~169 已置 In Progress。**

@@ -541,7 +541,8 @@ async def r5_command_identity() -> None:
                 )
 
                 # 命令身份 == 对话身份
-                cmd_key = (await service._identity(e)).key
+                cmd_ident, _persona = await service._identity(e)
+                cmd_key = cmd_ident.key
                 check("R5.command-identity-matches", cmd_key == real_key,
                       f"cmd={cmd_key!r} real={real_key!r}")
 

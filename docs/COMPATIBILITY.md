@@ -30,17 +30,18 @@ PYTHONPATH=. <venv426>/Scripts/python.exe tests/p0_lifecycle_check.py
 
 本地验证环境不变：AstrBot 4.26.0 / 4.28.0，Python 3.12.10（两 venv 实测），QQ OneBot v11 / aiocqhttp，普通内置 Agent。
 
-## 升级（0.6.0 → 0.7.0）
+## 升级（0.6.0 → 0.7.0 W 返工版）
 
-- 首次以新版启动时自动把账本从 schema v1 迁移到 v2：`backups/pre-migrate-v2-<时间戳>-<库名>` 先行备份（含 WAL checkpoint），变更在单个 IMMEDIATE 事务内，失败回滚、原库与备份不变；重复启动幂等跳过。
-- 保持 `history_scope=persona`（默认）升级：旧有效问答、epoch、个人退出状态全部保留——升级不是隐式清空，不需要任何数据操作。
+- 首次以新版启动时自动把账本从 schema v1（0.6.0）或 v2（0.7.0 首个候选）迁移到 v3：`backups/pre-migrate-v2-<时间戳>-<库名>` 先行备份（含 WAL checkpoint），变更在单个 IMMEDIATE 事务内，失败回滚、原库与备份不变；重复启动幂等跳过。
+- 保持 `history_scope=persona`（默认）升级：旧有效问答、epoch、个人退出状态全部保留——升级不是隐式清空。迁移同时把身份键改写为 v3 编码（`p:<人格>`），membership.json 退出键同步改写（自动备份 `.pre-scheme3.bak`）。
+- 0.7.0 首个候选库中的 `__mode_user__` 键无法区分真实同名人格与 user 模式记录：迁移统一改写为 `q:` 隔离段，保留原数据但不再注入任何模式的有效历史（可用工具显式查询）。membership 中不可辨认退出键按安全方向转为基础身份保护。
 - 切换 `history_scope`（persona↔user）：该基础身份开启新代次，从空历史开始；旧记录归档可查（工具 `--archives`）不自动合并；仅 reload 同配置、重启或人格轮换不清空。
 - 0.6.0 旧库在未迁移前不可用旧版工具直接查看：`tools/uctx_records.py` 检测 v1 会明确拒绝并提示先运行新版插件完成迁移；工具自身不升级数据库。
 
-## 回滚（0.7.0 → 0.6.0 旧包）
+## 回滚（0.7.0 W 返工版 → 0.6.0 旧包）
 
-- 未证明旧版代码可直接读取 v2 结构：**回滚前必须先停用新版并保留升级前备份**（`backups/pre-migrate-v2-*` 或用户自备副本）。把数据目录中的账本恢复为备份后，再装回 0.6.0 包，方可保证历史无损。直接换回旧代码而不恢复备份，0.6.0 会把 v2 库当作旧库再次"迁移"，产生列冲突错误——这是受保护行为，不损坏数据，但不构成回滚路径。
-- membership.json v2 新增键（base_protected / persona_on）在 0.6.0 中被忽略（按空集合兼容读取），退出状态不丢失。
+- 未证明旧版代码可直接读取 v3 结构：**回滚前必须先停用新版并保留升级前备份**（`backups/pre-migrate-v2-*` 或用户自备副本）。把数据目录中的账本恢复为备份后，再装回 0.6.0 包，方可保证历史无损。直接换回旧代码而不恢复备份，0.6.0 会把 v2 库当作旧库再次"迁移"，产生列冲突错误——这是受保护行为，不损坏数据，但不构成回滚路径。
+- membership.json v3 键（p:/u: 前缀、base_protected / persona_on）在 0.6.0 中按旧语义读取时可能无法匹配（前缀键不等于裸键）——因此回滚前若曾在新版下运行过，建议同时从 `.pre-scheme3.bak` 恢复退出文件。未在新版下运行过（仅安装未启用）则无影响。
 
 ## 0.7.0 新增配置与命令面
 
@@ -48,12 +49,12 @@ PYTHONPATH=. <venv426>/Scripts/python.exe tests/p0_lifecycle_check.py
 - 个人命令语义按模式区分（reset/off 的清空与退出范围），详见 README；原生命令 /reset /new 联动语义与 0.6.0 一致。
 - 新增 `tools/uctx_records.py`（纯标准库、只读），随安装包交付；Windows / Linux / 容器挂载数据目录均可独立运行，不启动 AstrBot、不需要凭据与网络。
 
-## 0.7.0 双版回归
+## 0.7.0 W 返工版双版回归
 
-14 套测试 × 两版各 381 项断言全 PASS（逐项计数见 docs/ACCEPTANCE.md）；复现命令同上节，n 系列为：
+17 套测试 × 两版各 561 项断言全 PASS（旧 10 套 298 + n 系 4 套 113 + w 系 3 套 150；逐项计数见 docs/ACCEPTANCE.md）：
 
 ```bash
-for t in n0_baseline_check n1_scope_migration_check n2_cross_persona_check n3_records_check; do
-  PYTHONPATH=. <venv>/Scripts/python.exe tests/$t.py
+for t in p0_lifecycle_check p1_identity_scope_check p2_ledger_check \n         p3_bridge_flow_check p4_concurrency_check p5_commands_check \n         p6_packaging_check r_rework_check s_rework_check t_rework_check \n         n0_baseline_check n1_scope_migration_check n2_cross_persona_check \n         n3_records_check w_rework_check w_lifecycle_check w_zip_lifecycle_check; do
+  PYTHONPATH=. <venv>/Scripts/python.exe -X utf8 tests/$t.py
 done
 ```

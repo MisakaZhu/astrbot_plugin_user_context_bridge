@@ -2,15 +2,17 @@
 
 维护规则：每阶段记录当前提交、实际改动、验证命令与结果、失败项、下一步。证据必须对应提交。
 
-## 当前：0.7.0 候选完成（N0-N4 本地开发与自测闭环，待 Codex 独立验收 MIS-170）
+## 当前：0.7.0 W1–W8 返工完成（待 Codex 复验 MIS-170）
 
-- 分支：`feat/0.7.0-persona-records`（基于 main/859f18e）；交付提交 `27aadae`，候选包 `astrbot_plugin_user_context_bridge-27aadae.zip`（SHA-256 `fb53a72d692b589b22b5b8402f7f07d72f5d0c485b3444b4121c957643f46497`）。
-- 提交链：a560856(N0 基线/ADR-015) → 4ced8a8(N1 迁移/代次/退出继承) → 75b0a26(N2 跨人格请求链/命令/生命周期) → 3d2dbd7(暂停断点文档) → b22f99f(N3 只读记录工具 + 清理 _tmp_m.json 误跟踪) → 27aadae(N4 回归修复/文档/候选包)。
-- 全量回归：14 套 × 4.26.0/4.28.0 各 **381 项断言全 PASS**（旧 10 套 298 + 新 4 套 83），日志 local_evidence/n4_logs/。
-- N4 修复回归：main.py 给 CommandService 传不存在的 `stats_getter` 导致真实 PluginManager 加载失败（S6 暴露，实例丢弃后租约残留）；修复后 S6 双版 46/46。
-- N3 交付 tools/uctx_records.py（list/export-json/export-html，只读快照）+ tests/n3_records_check.py 50 断言双版全过；HTML 经 Playwright 真实浏览器渲染与搜索交互验证（截图 local_evidence/n3_html/）。
-- 候选包：release/ 下 13 文件白名单 ZIP（含 tools/uctx_records.py）；旧 0.6.0 包与哈希保持原样未触碰。
-- Linear：MIS-165~169 置 In Review（附证据评论）；MIS-170 待 Codex；MIS-145 实机继续。
+- 分支 `feat/0.7.0-persona-records`；返工基线 219cef2；提交链见 HANDOFF.md 顶部。
+- 修复独立验收确认的 W1–W8 全部阻断项：模式持久化（scope_mode/meta）、键结构性编码（p:/u:/q:）、
+  退出继承接入真实命令与转换、迁移原子化+backup API 一致性备份、status 重写（接管证据/有效数）、
+  导出唯一基础身份消歧、backups 守卫、测试与矩阵收紧（含故障注入实调父断言）。
+- 顺带修复：main.py stats_getter 死参数（真实加载失败）、identity_stats 代次读错键（有效数失真）。
+- 全量回归：17 套 × 4.26.0/4.28.0 各 **561** 项断言全 PASS（旧 10 套 298 + n 系 113 + w 系 150），
+  日志 local_evidence/w_logs/。
+- N18 新产物重渲染：local_evidence/n3_html/w-render-*.png（身份行/搜索交互/0 控制台错误）。
+- Linear：MIS-165~169 待本轮完成置 In Review；MIS-170 In Progress 等 Codex 复验；MIS-145 实机不变。
 
 ---
 

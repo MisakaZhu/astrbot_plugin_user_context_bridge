@@ -71,10 +71,10 @@ async def n0_1_persona_isolation_baseline():
                 keys = [r[0] for r in db.execute(
                     "SELECT DISTINCT identity_key FROM turns").fetchall()]
             scopes = {k.split("\x1f")[2] for k in keys}
-            check("N0.no-user-mode-key-yet",
+            check("N0.persona-mode-keys-encoded",
                   len(keys) == 2
-                  and all("__mode_user__" not in k for k in keys)
-                  and scopes == {"black", "white"},
+                  and scopes == {"p:black", "p:white"}
+                  and all(k.split("\x1f")[2] != "u:" for k in keys),
                   f"keys={keys} scopes={scopes}")
         finally:
             bridge.shutdown()
@@ -111,7 +111,13 @@ def n0_data_contract_snapshot():
     key = build_identity(platform_id="aiocqhttp", self_id="bot_001",
                          persona_scope="maid", sender_id="10001").key
     check("N0.contract-key-format",
-          key == "aiocqhttp\x1fbot_001\x1fmaid\x1f10001", f"key={key!r}")
+          key == "aiocqhttp\x1fbot_001\x1fp:maid\x1f10001", f"key={key!r}")
+    from uctx_bridge.identity import MODE_USER
+    ukey = build_identity(platform_id="aiocqhttp", self_id="bot_001",
+                          persona_scope=None, sender_id="10001",
+                          mode=MODE_USER).key
+    check("N0.contract-user-key-format",
+          ukey == "aiocqhttp\x1fbot_001\x1fu:\x1f10001", f"ukey={ukey!r}")
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         led = TurnLedger(Path(td) / "l.db")

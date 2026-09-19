@@ -204,3 +204,39 @@ membership.json 增加 `base_protected`（基础身份键 platformselfsender �
 - 默认只出当前代次 completed；归档/failed/aborted/interrupted 需显式选择并标注状态。有界结果+显式截断标记；时间边界起点含、终点不含，时区必须显式。
 - 原文按不可信 HTML 转义，无外部资源/CDN/脚本执行聊天内容；工具调用保持配对，媒体只显示占位。JSON 顶层 schema_version/exported_at/筛选/截断/records，每轮含 record_id/身份/源人格/来源/时间/代次/状态/消息/工具配对。
 - 输出先写临时文件再原子 rename；拒绝输出路径指向源库/WAL/SHM/备份；默认导出到插件数据目录 exports/，不入 Git/ZIP。
+
+## ADR-016：W1–W8 返工修订（取代 ADR-015 与批准计划相冲突的部分）
+
+日期：2026-09-19。背景：Codex 独立验收 219cef2 判未通过（报告 23 号），确认四个 P1 产品缺陷与两组测试/矩阵缺口。本 ADR 记录修订后的决策；ADR-015 中与本 ADR 冲突的表述以本 ADR 为准。
+
+### A16-1 键编码（取代 A15-1 的 `__mode_user__` 保留字方案）
+
+独立验收证实真实 PersonaManager 可以创建 ID=`__mode_user__` 的人格，其身份键与 user 模式键完全相同——"保留字 + 管理员别这么配"不成立。修订为 scope 段结构化编码：
+
+- persona 模式：`p:<persona_id>`；user 模式：`u:`（定长，无 payload）；`q:<原值>`：迁移隔离段。
+- 三个前缀首字符互异且必带冒号，user 令牌仅两字符；任何 persona 编码都以 `p:` 开头——与宿主允许的任意人格 ID（含 `__mode_user__`、`u:x`、`p:x` 等特殊值）**结构性**不相交，不是"更罕见的普通字符串"。
+- 0.6.0 裸键在迁移（v1→v3，或首个候选 v2→v3）中统一改写：裸 scope → `p:<scope>`；裸 `__mode_user__` 无法区分"真实同名人格"与"user 模式记录"（两处来源字节相同）——按恢复规则整体改写为 `q:` **隔离保留**，永不注入任何模式的有效历史，可用工具显式查询。
+- membership.json 同步升 key_scheme=3：裸键加 `p:`；不可辨认键按安全方向处理（保留为 p: 退出**并**追加基础身份保护——宁可过度保护不可误采集）；迁移前自动写 `.pre-scheme3.bak`，幂等。
+
+### A16-2 模式持久化与切换协议（修订 A15-2）
+
+- 生效模式持久化于 meta（基础身份键，name='scope_mode'），与 mode_generation 同事务写。`apply_scope_mode`：未记录（0.6.0 升级/全新身份）→ 登记当前模式、**代次不变**（升级不是清空）；已记录且不同 → 代次 +1；相同 → 不动（同配置 reload/重启/人格黑白轮换不清空）。
+- main.initialize 顺序修订：连接（不迁移）→ 取写租约 → membership 迁移/校验 → **租约内迁移** → 恢复扫描 → 模式对账（枚举账本+membership 双侧基础身份）。迁移只在租约持有序列内执行，排除与另一实例并发写交错。
+- 切换的退出转换只做**加法**（→user 有任何退出则写 user 键退出；→persona user 键退出则追加基础保护），先于模式提交；中途崩溃重启后重放幂等，不会出现"一半新模式一半旧退出状态"，也不会多次清空。
+
+### A16-3 迁移原子性（修订 A15-2 的迁移段）
+
+- 结构变更、键改写、source_persona 回填、schema_version 写入全部在一个 BEGIN IMMEDIATE 事务内完成；任一步失败 ROLLBACK，"原库未变更"成为真话；去障后重试从头完整执行。
+- 备份弃用 checkpoint+copy：改用 SQLite backup API 从只读连接整库复制（读快照包含全部已提交数据，含活跃 WAL 中已提交事务）；先写临时文件再原子改名；目标名唯一递增，**绝不覆盖既有备份**；备份失败中止迁移。
+- 旧别名 `migrate_from_v1` 保留等价转发。
+
+### A16-4 退出判定单一语义（细化 A15-3）
+
+- `MembershipStore.effective_optout` 是运行时 evaluate、status、命令共用的唯一判定：persona 模式=本人格键退出，或（基础保护且本人格未显式 on）；user 模式=user 键退出或基础保护。user 模式**不**按 persona 退出直接阻断——persona→user 转换负责把退出写成 user 键，否则 user on 后永远无法恢复。
+- `/uctx on` 分维度：persona on=解除本人格退出并记 persona_on（从基础保护中仅释放本人格）；user on=解除 user 键退出与基础保护，人格维度显式退出保留。
+- membership 文件损坏/写入失败抛 MembershipError：initialize 禁用共享并给出可见诊断，绝不按空退出集合继续采集。
+
+### A16-5 status 与导出（细化 A15-4）
+
+- status 必须区分：配置允许 / 个人有效退出（含来源：本人格退出、user 退出继承、基础保护）/ **实际接管证据**（无接管记录时明确"开关开启不等于已实际接管"）/ 有效 completed 数（按当前 epoch+当前模式代次统计）；reset/new 文案按模式说明清空范围。
+- 导出先解析**唯一基础身份**：三维全给精确匹配；部分给定且唯一命中允许推断（输出中标注"唯一推断"）；缺失或歧义 → 列出不含正文的基础身份候选并报错退出，不写任何正文文件。输出守卫按规范化路径保护源库、WAL/SHM/journal 及 `<库目录>/backups/` 整树（大小写/相对/等价路径均覆盖）。

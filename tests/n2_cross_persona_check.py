@@ -31,7 +31,7 @@ FAIL = []
 
 def user_identity(sender, platform="aiocqhttp", self_id="bot_001"):
     return build_identity(platform_id=platform, self_id=self_id,
-                          persona_scope="__mode_user__", sender_id=sender).key
+                          persona_scope=None, sender_id=sender, mode="user").key
 
 
 def check(name, cond, detail=""):
@@ -40,7 +40,7 @@ def check(name, cond, detail=""):
 
 
 def user_key(sender, platform="aiocqhttp", self_id="bot_001"):
-    return f"{platform}\x1f{self_id}\x1f__mode_user__\x1f{sender}"
+    return f"{platform}\x1f{self_id}\x1fu:\x1f{sender}"
 
 
 class PerWindowPersona(FakePersonaManager):
@@ -159,7 +159,8 @@ async def n04_persona_preserved():
 
 
 async def n09_concurrency_cross_persona():
-    """N09：同基础身份跨人格互斥至终态，不同基础身份并行。"""
+    """N09（W8 收紧）：屏障证明 A 挂起时 B 未进入模型；释放后 B 的最终
+    真实请求含 A 一次完整问答；gather 每个结果/异常都进入失败结论。"""
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         bridge, resolver, membership, ledger, metas = make(td)
         try:
@@ -175,17 +176,38 @@ async def n09_concurrency_cross_persona():
 
             class FastB(FakeProvider):
                 async def text_chat(self, **kwargs):
-                    self.call_log.append({"contexts": []})
-                    entered_b.set()
+                    entered_b.set()  # 屏障观测点：B 一进入模型即置位
+                    self.call_log.append({
+                        "contexts": [dict(m) for m in (kwargs.get("contexts") or [])]
+                    })
                     return await super().text_chat(**kwargs)
 
+            prov_a, prov_b = SlowA(["A答"]), FastB(["B答"])
             ev_a = FakeEvent(sender_id="10001", group_id="700000001", message_str="A黑问")
             ev_b = FakeEvent(sender_id="10001", group_id="700000002", message_str="B白问")
-            ta = asyncio.create_task(drive_pipeline(bridge, ev_a, SlowA(["A答"]), prompt="A黑问"))
+            ta = asyncio.create_task(
+                drive_pipeline(bridge, ev_a, prov_a, prompt="A黑问"))
             await asyncio.wait_for(entered_a.wait(), 3)
-            tb = asyncio.create_task(drive_pipeline(bridge, ev_b, FastB(["B答"]), prompt="B白问"))
+            tb = asyncio.create_task(
+                drive_pipeline(bridge, ev_b, prov_b, prompt="B白问"))
+            # 屏障：给 B 0.6s 尝试——互斥要求 B 完全不进入模型
+            try:
+                await asyncio.wait_for(entered_b.wait(), 0.6)
+            except asyncio.TimeoutError:
+                pass
+            check("N09.b-not-in-model-while-a-pending",
+                  not entered_b.is_set(),
+                  f"entered_b={entered_b.is_set()}")
             release_a.set()
-            await asyncio.gather(ta, tb)
+            results = await asyncio.gather(ta, tb, return_exceptions=True)
+            check("N09.gather-no-exceptions",
+                  all(not isinstance(r, BaseException) for r in results),
+                  f"results={results!r}")
+            # B 的最终真实请求含 A 一次完整问答（且仅一次）
+            b_ctx = str(prov_b.call_log[0].get("contexts") or [])
+            check("N09.b-sees-a-full-qa-once",
+                  "A黑问" in b_ctx and b_ctx.count("A答") == 1,
+                  f"b_ctx={b_ctx[:200]}")
             with sqlite3.connect(ledger._db_path) as db:
                 n = db.execute(
                     "SELECT COUNT(*) FROM turns WHERE identity_key=? AND status='completed'",
@@ -244,7 +266,7 @@ async def n10_reset_scope():
 
 
 def identity_of(sender, scope):
-    return f"aiocqhttp\x1fbot_001\x1f{scope}\x1f{sender}"
+    return f"aiocqhttp\x1fbot_001\x1fp:{scope}\x1f{sender}"
 
 
 async def main():

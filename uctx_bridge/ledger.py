@@ -153,6 +153,8 @@ def migrate_ledger(db_path, *, backup_dir=None):
         }
         if "schema_version" in tables:
             row = ro.execute("SELECT MAX(version) FROM schema_version").fetchone()
+            if row is not None and row[0] is not None and int(row[0]) >= SCHEMA_VERSION:
+                return False  # 已迁移，幂等跳过
             source_version = int(row[0]) if row is not None and row[0] is not None else 2
         else:
             if "turns" not in tables or "meta" not in tables:
@@ -679,8 +681,14 @@ class TurnLedger:
             ).fetchall():
                 if row["name"] == "epoch":
                     cur_epoch = int(row["value"])
-                elif row["name"] == "mode_generation":
-                    cur_gen = int(row["value"])
+            # 当前模式代次按基础身份（3 段键）存储，与 TurnLedger 写侧一致
+            gen_row = conn.execute(
+                "SELECT value FROM meta WHERE identity_key=?"
+                " AND name='mode_generation'",
+                (self.base_key_of(identity_key),),
+            ).fetchone()
+            if gen_row is not None:
+                cur_gen = int(gen_row["value"])
             total_row = conn.execute(
                 "SELECT COUNT(*) AS c, MAX(created_at) AS last_at"
                 " FROM turns WHERE identity_key=?",
