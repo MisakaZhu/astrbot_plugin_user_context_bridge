@@ -655,10 +655,12 @@ async def s5_native_reset() -> None:
 def _run_s6_worker(venv, td, *, observer=None, fault="none", zip_arg=None):
     """运行 S6 worker 并返回解析结果（__error__ 表示失败）。可被测试替身替换。
 
-    Y1：非零退出码与缺失/损坏 JSON 必须转 __error__；observer 传入
-    y_fault_observer.py 时在真实 wait_for 边界注入 fault（task:type 格式）；
-    zip_arg 为交付 ZIP 路径（N22 安装链）。
+    Z1a：统一走 tests/worker_result 判定（rc/缺行/坏 JSON/非对象）；
+    observer 传入 y_fault_observer.py 时在真实 wait_for 边界注入 fault
+    （task:type 格式）；zip_arg 为交付 ZIP 路径（N22 安装链）。
     """
+
+    from tests import worker_result
 
     tests_dir = Path(__file__).resolve().parent
     repo = tests_dir.parent
@@ -673,30 +675,8 @@ def _run_s6_worker(venv, td, *, observer=None, fault="none", zip_arg=None):
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONPATH"] = str(repo)
-    r = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(repo),
-        timeout=240,
-    )
-    # Y1：非零退出码进入判定（rc=19 + 合法 JSON 也不得视为成功）
-    if r.returncode != 0:
-        return {"__error__": f"s6 worker rc={r.returncode}: "
-                + (r.stderr or r.stdout)[-400:]}
-    line = next(
-        (l for l in r.stdout.splitlines() if l.startswith("@@RESULT@@")),
-        None,
-    )
-    if line is None:
-        return {"__error__": "s6 worker 输出缺少 @@RESULT@@ 行："
-                + (r.stderr or r.stdout)[-400:]}
-    try:
-        return json.loads(line[len("@@RESULT@@") :])
-    except json.JSONDecodeError as exc:
-        return {"__error__": f"s6 worker 结果 JSON 损坏：{exc}："
-                + line[len("@@RESULT@@"):][:200]}
+    r = worker_result.safe_run(cmd, env=env, cwd=str(repo), timeout=240)
+    return worker_result.read_worker_result(r)
 
 
 def assert_s6_fields(tag: str, out: dict, *, check=check) -> None:
@@ -936,8 +916,10 @@ def s6_fault_injection_real_paths() -> None:
         "no-result-line": FakeResult(0, "no marker here\n", ""),
         "bad-json": FakeResult(0, "@@RESULT@@{oops", ""),
     }
+    from tests import worker_result as _wr
+
     for name, result in entry_cases.items():
-        with patch.object(subprocess, "run", return_value=result):
+        with patch.object(_wr, "safe_run", return_value=result):
             read = _run_s6_worker("synthetic-venv", "synthetic-td")
         entry_lf: list = []
 

@@ -27,35 +27,21 @@ def check(name, cond, detail=""):
 
 
 def _run_worker(venv: str, td: str) -> dict:
+    from tests import worker_result
+
     tests_dir = Path(__file__).resolve().parent
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONPATH"] = str(REPO)
-    r = subprocess.run(
+    r = worker_result.safe_run(
         [venv + r"\Scripts\python.exe",
          str(tests_dir / "y2_command_first_use_worker.py"), td],
-        capture_output=True,
-        text=True,
         env=env,
         cwd=str(REPO),
         timeout=300,
     )
-    line = next(
-        (l for l in r.stdout.splitlines() if l.startswith("@@RESULT@@")),
-        None,
-    )
-    # Y1 同口径：非零退出码与缺失/损坏 JSON 进入判定
-    if r.returncode != 0:
-        return {"__error__": f"worker rc={r.returncode}: "
-                + (r.stderr or r.stdout)[-400:]}
-    if line is None:
-        return {"__error__": "worker 输出缺少 @@RESULT@@ 行："
-                + (r.stderr or r.stdout)[-400:]}
-    try:
-        return json.loads(line[len("@@RESULT@@"):])
-    except json.JSONDecodeError as exc:
-        return {"__error__": f"worker 结果 JSON 损坏：{exc}"}
+    return worker_result.read_worker_result(r)
 
 
 def assert_y2_fields(tag: str, out: dict, *, check=check) -> None:
@@ -144,29 +130,53 @@ def assert_y2_fields(tag: str, out: dict, *, check=check) -> None:
           and out.get("C_gen_after_switch") == 1)
     check(f"Y2.{tag}.on-captured-user-mode",
           out.get("C_captured_user_mode") == 1)
-    # Phase 4：登记失败 → 受控文案/退出不失/重载补登记/重试不多推进
-    check(f"Y2.{tag}.register-failure-controlled",
+    # Phase 4（Z2）：真实 SQLite 失败协议——语句级失败（TEMP TRIGGER）
+    # 与第二连接写锁（BEGIN IMMEDIATE 冲突）；登记先行，失败即整体未生效
+    check(f"Z2.{tag}.A-failed-off-controlled",
           out.get("off5_controlled_text") is True,
           f"text={str(out.get('off5_controlled_text'))}")
-    check(f"Y2.{tag}.register-failure-no-record",
-          out.get("E_scope_after_failed_reg") is None)
-    check(f"Y2.{tag}.exit-survives-failed-registration",
-          out.get("E_exit_survives_failed_reg") is True)
-    check(f"Y2.{tag}.reload-reconciles-once",
-          out.get("E_scope_after_reload") == "user"
-          and out.get("E_gen_after_reload") == 0,
-          f"scope={out.get('E_scope_after_reload')!r} "
-          f"gen={out.get('E_gen_after_reload')!r}")
-    check(f"Y2.{tag}.exit-survives-reload",
-          out.get("E_exit_survives_reload") is True)
-    check(f"Y2.{tag}.retry-no-extra-bump",
-          out.get("off5_retry_ok") is True
-          and out.get("E_gen_after_retry") == 0)
-    check(f"Y2.{tag}.retry-then-switch-bumps-once",
-          out.get("E_scope_final") == "persona"
-          and out.get("E_gen_final") == 1)
-    check(f"Y2.{tag}.user-off-protects-persona",
-          out.get("E_user_off_protects_persona") is True)
+    check(f"Z2.{tag}.A-nothing-saved",
+          out.get("Z2A_scope_after_failed_off") is None
+          and out.get("Z2A_exit_not_saved") is True,
+          f"scope={out.get('Z2A_scope_after_failed_off')!r} "
+          f"exit={out.get('Z2A_exit_not_saved')!r}")
+    check(f"Z2.{tag}.A-retry-registers",
+          out.get("Z2A_retry_ok") is True
+          and out.get("Z2A_scope_after_retry") == "user"
+          and out.get("Z2A_gen_after_retry") == 0)
+    check(f"Z2.{tag}.B-pre-off-ok",
+          out.get("Z2B_pre_off_ok") is True
+          and out.get("Z2B_scope_pre") == "user")
+    check(f"Z2.{tag}.B-locked-on-controlled",
+          out.get("Z2B_on_locked_controlled") is True,
+          f"text={str(out.get('Z2B_on_locked_controlled'))}")
+    check(f"Z2.{tag}.B-failed-on-keeps-exit",
+          out.get("Z2B_exit_retained_memory") is True
+          and out.get("Z2B_exit_retained_disk") is True,
+          f"mem={out.get('Z2B_exit_retained_memory')!r} "
+          f"disk={out.get('Z2B_exit_retained_disk')!r}")
+    check(f"Z2.{tag}.B-exit-blocks-after-failed-on",
+          out.get("Z2B_exit_blocks_capture_after_failed_on") is True)
+    check(f"Z2.{tag}.B-retry-on-captures",
+          out.get("Z2B_retry_on_ok") is True
+          and out.get("Z2B_captured_after_successful_on") == 1)
+    check(f"Z2.{tag}.C-failed-off-controlled",
+          out.get("Z2C_off_controlled") is True)
+    check(f"Z2.{tag}.C-nothing-saved",
+          out.get("Z2C_scope_none") is True
+          and out.get("Z2C_exit_not_saved") is True)
+    check(f"Z2.{tag}.C-direct-switch-no-ghost",
+          out.get("Z2C_scope_after_switch") is None
+          and out.get("Z2C_gen_after_switch") == 0,
+          f"scope={out.get('Z2C_scope_after_switch')!r} "
+          f"gen={out.get('Z2C_gen_after_switch')!r}")
+    check(f"Z2.{tag}.C-retry-registers-current-mode",
+          out.get("Z2C_retry_ok") is True
+          and out.get("Z2C_scope_after_retry") == "persona"
+          and out.get("Z2C_gen_after_retry") == 0)
+    check(f"Z2.{tag}.C-switch-then-bumps-once",
+          out.get("Z2C_gen_after_switch_back") == 1
+          and out.get("Z2C_exit_blocks_capture") is True)
     # Phase 5：已生效身份配置切换推进一次；同模式重载不动
     check(f"Y2.{tag}.effective-identity-switch-once",
           out.get("A_gen_final_after_switch")

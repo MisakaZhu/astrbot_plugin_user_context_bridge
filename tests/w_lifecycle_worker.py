@@ -448,6 +448,9 @@ async def main() -> int:
     prov_b = FakeProvider(["QUEUED-SWITCH"])
     t_b = asyncio.create_task(drive(ev_b, prov_b, "切换期排队"))
     await asyncio.sleep(0.3)
+    # Z1b：A/B 排队在**切换前旧实例**的身份锁上——先抓住旧 bridge 引用，
+    # 等待者/挂起清理必须同时覆盖旧实例与新实例，不得只看新 bridge。
+    pre_switch_bridge = plugin._bridge
     plugin = await reload_with("user")
     release_a.set()
     import traceback
@@ -527,9 +530,20 @@ async def main() -> int:
     out["switch_queued_ledger_no_completed"] = not any(
         r[0] == "completed" for r in queued_rows
     )
-    out["switch_queued_lock_waiters_after"] = sum(
-        len(lock._waiters or [])
-        for lock in plugin._bridge._identity_locks.values()
+
+    def _bridge_lock_waiters(bridge) -> int:
+        return sum(
+            len(lock._waiters or []) for lock in bridge._identity_locks.values()
+        )
+
+    # Z1b：旧实例（A/B 真正排队处）与新实例的锁等待者、未终态挂起任务
+    # 全部落 JSON，父断言逐项 == 0
+    out["switch_lock_waiters_pre_bridge"] = _bridge_lock_waiters(
+        pre_switch_bridge)
+    out["switch_queued_lock_waiters_after"] = _bridge_lock_waiters(
+        plugin._bridge)
+    out["switch_pending_uncommitted"] = (
+        pre_switch_bridge.pending_count + plugin._bridge.pending_count
     )
     done, ctx, _ev, cap_new = await ask(plugin, "700000001", "NEW-问", "NEW-答")
     out["switch_new_config_turn_done"] = done

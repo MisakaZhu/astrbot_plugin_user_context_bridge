@@ -66,7 +66,8 @@ def write_config(root: Path, scope: str) -> None:
                 "enabled": True,
                 "history_scope": scope,
                 "shared_groups": ["810000001", "810000002", "810000003",
-                    "810000005", "810000006", "810000102"],
+                    "810000005", "810000006", "810000007", "810000008",
+                    "810000102"],
                 "include_private": True,
                 "max_history_turns": 40,
             },
@@ -102,6 +103,8 @@ async def main() -> int:
             "810000003": "third",
             "810000005": "fifth",
             "810000006": "maid",
+            "810000007": "seventh",
+            "810000008": "eighth",
             "810000102": "grey",
         }
 
@@ -262,6 +265,8 @@ async def main() -> int:
         "810000003": "20003",
         "810000005": "20005",
         "810000006": "20006",
+        "810000007": "20007",
+        "810000008": "20008",
         "810000102": "20001",  # 20001 的另一人格窗口（grey）
     }
 
@@ -374,48 +379,101 @@ async def main() -> int:
     done, cap = await ask(plugin, "810000003", "C2-问", "C2-答")
     out["C_captured_user_mode"] = cap
 
-    # -- Phase 4：登记边界失败 → 受控文案/退出不失/重载补登记/重试不推进 ----
-    # 注意：实例目录与 REPO 各有一份 uctx_bridge，异常类必须取自插件自身
-    # 模块，保证与 commands.py 捕获的是同一个类。
-    plugin_ledger_error = sys.modules[
-        type(plugin._commands).__module__
-    ].LedgerError
-    ledger_obj = plugin._ledger
-    original_apply = ledger_obj.apply_scope_mode
+    # -- Phase 4（Z2）：真实 SQLite 失败协议 --------------------------------
+    # 用真实语句级失败（TEMP TRIGGER RAISE(ABORT)）与真实第二连接写锁
+    # （BEGIN IMMEDIATE 冲突），不用异常类替身冒充 SQLite 边界。
+    _TRIGGER_SQL = (
+        "CREATE TEMP TRIGGER z2_block_scope_mode BEFORE INSERT ON meta "
+        "WHEN NEW.name='scope_mode' "
+        "BEGIN SELECT RAISE(ABORT, 'injected scope_mode write failure'); END;"
+    )
+    ledger_conn = plugin._ledger._conn
 
-    def _raising_apply(*a, **kw):
-        raise plugin_ledger_error("注入：模式登记写失败")
+    def exit_effective(sender: str, persona: str, mode: str) -> bool:
+        ident = SimpleNamespace(
+            platform_id="aiocqhttp", self_id="bot_001",
+            persona_scope=persona, sender_id=sender, mode=mode,
+            key=BASE_SEP.join(("aiocqhttp", "bot_001",
+                               ("u:" if mode == "user" else "p:" + persona),
+                               sender)),
+        )
+        return plugin._membership.effective_optout(ident)
 
-    ledger_obj.apply_scope_mode = _raising_apply  # type: ignore[method-assign]
+    # 4A：首次 off + 真实 scope_mode 写失败 → 受控文案、整体未生效
+    ledger_conn.execute(_TRIGGER_SQL)
     off5 = await command(plugin, "20005", "810000005", "off")
     out["off5_controlled_text"] = (
-        "⚠️" in off5 and "重试" in off5 and "已退出" not in off5
+        "⚠️" in off5 and "未生效" in off5 and "已退出" not in off5
     )
-    out["E_scope_after_failed_reg"] = meta_of("20005", "scope_mode")
-    del ledger_obj.apply_scope_mode  # 恢复真实方法
-    assert ledger_obj.apply_scope_mode.__func__ is original_apply.__func__
-    done, cap = await ask(plugin, "810000005", "E1-问", "E1-答")
-    out["E_exit_survives_failed_reg"] = cap == 0
-
-    plugin = await reload_with("user")  # 重载（重启模拟）：对账补登记
-    out["E_scope_after_reload"] = meta_of("20005", "scope_mode")
-    out["E_gen_after_reload"] = gen_of("20005")
-    done, cap = await ask(plugin, "810000005", "E2-问", "E2-答")
-    out["E_exit_survives_reload"] = cap == 0
+    out["Z2A_scope_after_failed_off"] = meta_of("20005", "scope_mode")
+    out["Z2A_exit_not_saved"] = not exit_effective("20005", "fifth", "user")
+    ledger_conn.execute("DROP TRIGGER z2_block_scope_mode")
     off5b = await command(plugin, "20005", "810000005", "off")
-    out["off5_retry_ok"] = "已退出" in off5b and "⚠️" not in off5b
-    out["E_gen_after_retry"] = gen_of("20005")
-    plugin = await reload_with("persona")
-    out["E_scope_final"] = meta_of("20005", "scope_mode")
-    out["E_gen_final"] = gen_of("20005")
-    done, cap = await ask(plugin, "810000005", "E3-问", "E3-答")
-    out["E_user_off_protects_persona"] = cap == 0
+    out["Z2A_retry_ok"] = "已退出" in off5b and "⚠️" not in off5b
+    out["Z2A_scope_after_retry"] = meta_of("20005", "scope_mode")
+    out["Z2A_gen_after_retry"] = gen_of("20005")
+
+    # 4B：已 off 用户 on + 第二连接持真实写锁 → 失败 on 不解除退出
+    off7 = await command(plugin, "20007", "810000007", "off")
+    out["Z2B_pre_off_ok"] = "已退出" in off7 and "⚠️" not in off7
+    out["Z2B_scope_pre"] = meta_of("20007", "scope_mode")
+    import sqlite3 as _sq
+
+    db_path = (
+        instance_root / "data" / "plugin_data" / PLUGIN_DIR_NAME
+        / "uctx_ledger.db"
+    )
+    holder = _sq.connect(db_path, timeout=5)
+    holder.execute("PRAGMA busy_timeout=5000")
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("CREATE TABLE IF NOT EXISTS z2_lock_holder (x)")
+    ledger_conn.execute("PRAGMA busy_timeout=200")
+    on7 = await command(plugin, "20007", "810000007", "on")
+    out["Z2B_on_locked_controlled"] = (
+        "⚠️" in on7 and "未生效" in on7 and "已重新加入" not in on7
+    )
+    ledger_conn.execute("PRAGMA busy_timeout=30000")
+    out["Z2B_exit_retained_memory"] = exit_effective("20007", "seventh",
+                                                     "user")
+    holder.rollback()
+    holder.close()
+    out["Z2B_exit_retained_disk"] = exit_effective("20007", "seventh",
+                                                   "user")
+    done, cap = await ask(plugin, "810000007", "Z2B1-问", "Z2B1-答")
+    out["Z2B_exit_blocks_capture_after_failed_on"] = cap == 0
+    on7b = await command(plugin, "20007", "810000007", "on")
+    out["Z2B_retry_on_ok"] = "已重新加入" in on7b and "⚠️" not in on7b
+    done, cap = await ask(plugin, "810000007", "Z2B2-问", "Z2B2-答")
+    out["Z2B_captured_after_successful_on"] = cap
+
+    # 4C：首次 off 整体失败 → 直接切另一模式（无同模式预热）→ 重试恢复
+    ledger_conn.execute(_TRIGGER_SQL)
+    off8 = await command(plugin, "20008", "810000008", "off")
+    out["Z2C_off_controlled"] = (
+        "⚠️" in off8 and "未生效" in off8 and "已退出" not in off8
+    )
+    out["Z2C_scope_none"] = meta_of("20008", "scope_mode") is None
+    out["Z2C_exit_not_saved"] = not exit_effective("20008", "eighth", "user")
+    ledger_conn.execute("DROP TRIGGER z2_block_scope_mode")
+    plugin = await reload_with("persona")  # 直接切，无同模式预热
+    out["Z2C_scope_after_switch"] = meta_of("20008", "scope_mode")
+    out["Z2C_gen_after_switch"] = gen_of("20008")
+    off8b = await command(plugin, "20008", "810000008", "off")
+    out["Z2C_retry_ok"] = "已退出" in off8b and "⚠️" not in off8b
+    out["Z2C_scope_after_retry"] = meta_of("20008", "scope_mode")
+    out["Z2C_gen_after_retry"] = gen_of("20008")
+    plugin = await reload_with("user")
+    out["Z2C_gen_after_switch_back"] = gen_of("20008")
+    done, cap = await ask(plugin, "810000008", "Z2C1-问", "Z2C1-答")
+    out["Z2C_exit_blocks_capture"] = cap == 0
 
     # -- Phase 5：已生效身份的配置切换只推进一次 ----------------------------
+    # 4C 结束于 user 模式：此处 persona reload 为显式切换，随后再次
+    # persona reload 为同模式（不推进）
     out["A_gen_final"] = gen_of("20001")
-    plugin = await reload_with("user")
+    plugin = await reload_with("persona")
     out["A_gen_final_after_switch"] = gen_of("20001")
-    plugin = await reload_with("user")  # 同模式 reload 不推进
+    plugin = await reload_with("persona")  # 同模式 reload 不推进
     out["A_gen_same_mode_reload"] = gen_of("20001")
 
     print("@@RESULT@@" + json.dumps(out, ensure_ascii=False))

@@ -15,6 +15,8 @@ MembershipStore.effective_optout 同一语义；status 显示的"共享中"
 
 from __future__ import annotations
 
+import sqlite3
+
 from astrbot.api.event import AstrMessageEvent
 
 from .identity import (
@@ -156,23 +158,27 @@ class CommandService:
         )
 
     def _register_mode_fact(self, identity: SharedIdentity) -> str | None:
-        """Y2：仅执行命令的身份也登记当前生效模式（X1 合同的命令入口）。
+        """Z2：命令入口的模式事实登记，**先于** membership 写入执行。
 
         - 未记录（0.6.0 升级/新身份首次命令）：登记当前模式，代次不变；
         - 已记录且相同：幂等 no-op（同模式重复命令/重载不清代次）；
         - 已记录且不同：代次 +1（显式切换合同，与 initialize 对账一致）。
-        登记失败返回受控文案（此时退出/加入本身已持久化，状态安全），
-        不得假报整条命令成功。
+
+        登记失败（含真实 sqlite3.Error——BEGIN IMMEDIATE 锁冲突、语句
+        约束失败等，不只 LedgerError）返回受控文案；因登记在前，此时
+        退出/加入尚未写入，不存在"已退出但模式事实缺失"的不可恢复
+        分裂。后一写（membership）失败只会留下"已登记未退出"状态：
+        登记本身不改代次、与 initialize 对账结果等价，重试即自愈。
         """
 
         try:
             self._ledger.apply_scope_mode(
                 self._ledger.base_key_of(identity.key), identity.mode
             )
-        except LedgerError:
+        except (LedgerError, sqlite3.Error):
             return (
-                "⚠️ 本次操作已保存，但共享模式记录更新失败；"
-                "请在确认共享状态后重试一次本命令。"
+                "⚠️ 共享状态保存失败，本次操作未生效"
+                "（退出/加入状态保持不变）。请稍后重试一次本命令。"
             )
         return None
 
@@ -281,14 +287,15 @@ class CommandService:
             identity, persona = await self._identity(event)
         except PersonaResolutionError:
             return self._identity_error_text()
+        # Z2：登记先行（见 _register_mode_fact）；登记失败即整体失败，
+        # 退出尚未写入，不会出现"退出已保存、模式事实缺失"的分裂
+        reg_err = self._register_mode_fact(identity)
+        if reg_err is not None:
+            return reg_err
         try:
             self._membership.opt_out(identity)
         except MembershipError:
             return self._persist_failure_text()
-        # Y2：首次 off（或已生效身份）登记模式事实，失败不假报成功
-        reg_err = self._register_mode_fact(identity)
-        if reg_err is not None:
-            return reg_err
         if identity.mode == MODE_USER:
             return (
                 "🚪 已退出跨人格共享：该账号的全部人格从下一轮起不再读取、"
@@ -309,6 +316,11 @@ class CommandService:
             return self._identity_error_text()
         if not self._resolver.config.enabled:
             return "⚠️ 共享未启用，无法加入。范围由管理员在插件配置中开启。"
+        # Z2：登记先行——登记失败（如数据库锁冲突）时直接受控返回，
+        # 退出**尚未解除**；不得出现"命令报错但退出已被解除"的分裂
+        reg_err = self._register_mode_fact(identity)
+        if reg_err is not None:
+            return reg_err
         try:
             if identity.mode == MODE_USER:
                 # user on：解除 user 键退出与基础保护；人格维度显式退出保留
@@ -318,10 +330,6 @@ class CommandService:
                 self._membership.opt_in_persona(identity)
         except MembershipError:
             return self._persist_failure_text()
-        # Y2：首次 on（或已生效身份）登记模式事实，失败不假报成功
-        reg_err = self._register_mode_fact(identity)
-        if reg_err is not None:
-            return reg_err
         if not self._window_in_scope(event):
             return (
                 "⚠️ 已取消退出标记，但当前窗口不在管理员允许范围内，"

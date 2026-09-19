@@ -18,7 +18,7 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from tests.fakes import FakeEvent, FakeProvider
 from tests.harness import drive_pipeline, make_bridge_stack
@@ -400,6 +400,11 @@ async def t4_buffer_suppression() -> None:
 # 真实宿主组件 worker（T1/T5/T6）
 # ---------------------------------------------------------------------------
 def _run_worker(script: str, extra_args: list[str] | None = None):
+    """Z1a：统一走 tests/worker_result 判定（rc/缺行/坏 JSON/非对象/
+    超时/启动失败），不再只看 RESULT 行。"""
+
+    from tests import worker_result
+
     repo = Path(__file__).resolve().parent.parent
     results = {}
     for venv in (r"D:\第三方插件完善\.venv", r"D:\第三方插件完善\.venv426"):
@@ -412,7 +417,7 @@ def _run_worker(script: str, extra_args: list[str] | None = None):
                     "PYTHONPATH": str(repo),
                 }
             )
-            r = subprocess.run(
+            r = worker_result.safe_run(
                 [
                     venv + r"\Scripts\python.exe",
                     "-X",
@@ -421,22 +426,156 @@ def _run_worker(script: str, extra_args: list[str] | None = None):
                     td,
                 ]
                 + (extra_args or []),
-                capture_output=True,
-                text=True,
                 env=env,
                 cwd=str(repo),
                 timeout=300,
             )
             tag = Path(venv).name
-            line = next(
-                (l for l in r.stdout.splitlines() if l.startswith("@@RESULT@@")),
+            results[tag] = worker_result.read_worker_result(r)
+    return results
+
+
+def worker_entry_fault_injection() -> None:
+    """Z1a/N23：故障注入经**正式 t1_t5_t6_workers** 及其实际 subprocess
+    处理路径（patch tests.worker_result.safe_run——入口真实使用的执行
+    函数）；正常对照必须过，rc19/缺 RESULT/坏 JSON/JSON 非对象/必要
+    字段缺失逐个必须判 FAIL。对照 stdout 取自本函数先前对同一 worker
+    的真实运行结果（重新序列化 @@RESULT@@ 行），不复制校验逻辑。"""
+
+    from unittest.mock import patch
+
+    from tests import worker_result as wr
+
+    real = {
+        script: _run_worker(script)
+        for script in ("t1_persona_worker.py", "t5_native_worker.py")
+    }
+    for script, by_tag in real.items():
+        if any("__error__" in o for o in by_tag.values()):
+            check("Z1.t-entry-baseline", False,
+                  f"真实基线运行失败：{script} {by_tag}")
+            return
+    check("Z1.t-entry-baseline", True)
+
+    class FakeResult:
+        def __init__(self, rc, stdout, stderr=""):
+            self.returncode = rc
+            self.stdout = stdout
+            self.stderr = stderr
+
+    # (script, tag) -> doctored FakeResult；venv 由 cmd[0] 区分
+    def build_results(make):
+        table = {}
+        for script, by_tag in real.items():
+            for tag, out in by_tag.items():
+                py = (r"D:\第三方插件完善\.venv" if tag == ".venv"
+                      else r"D:\第三方插件完善\.venv426") + r"\Scripts\python.exe"
+                table[(script, py)] = make(out)
+        return table
+
+    def patched_call(table):
+        def _fake(cmd, **kwargs):
+            key = next(
+                ((s, cmd[0]) for (s, py) in table if s in " ".join(cmd)
+                 and cmd[0] == py),
                 None,
             )
-            if line is None:
-                results[tag] = {"__error__": (r.stderr or r.stdout)[-400:]}
-            else:
-                results[tag] = json.loads(line[len("@@RESULT@@") :])
-    return results
+            if key is None:
+                return FakeResult(1, "", f"unmatched cmd: {' '.join(cmd)[:120]}")
+            return table[key]
+        return _fake
+
+    def run_case(name, make, *, expect_fail: bool) -> None:
+        before_pass, before_fail = len(PASS), len(FAIL)
+        table = build_results(make)
+        with patch.object(wr, "safe_run", new=patched_call(table)):
+            t1_t5_t6_workers()
+        detected = len(FAIL) > before_fail
+        # 判定已由本 check 记录；回滚本轮新增的全局 PASS/FAIL（属注入
+        # 数据而非真实运行），保持套件级 0 FAIL 语义
+        del PASS[before_pass:]
+        del FAIL[before_fail:]
+        check(
+            f"Z1.t-entry-{name}",
+            detected if expect_fail else not detected,
+            f"expect_fail={expect_fail} detected={detected}",
+        )
+
+    run_case("normal-passes",
+             lambda out: FakeResult(
+                 0, "@@RESULT@@" + json.dumps(out, ensure_ascii=False) + "\n"),
+             expect_fail=False)
+    run_case("rc19-detected",
+             lambda out: FakeResult(
+                 19, "@@RESULT@@" + json.dumps(out, ensure_ascii=False) + "\n",
+                 "injected nonzero exit"),
+             expect_fail=True)
+    run_case("no-result-line-detected",
+             lambda out: FakeResult(0, "no marker here\n"),
+             expect_fail=True)
+    run_case("bad-json-detected",
+             lambda out: FakeResult(0, "@@RESULT@@{oops\n"),
+             expect_fail=True)
+    run_case("json-array-detected",
+             lambda out: FakeResult(0, "@@RESULT@@[1,2]\n"),
+             expect_fail=True)
+    run_case("missing-field-detected",
+             lambda out: FakeResult(0, "@@RESULT@@{}\n"),
+             expect_fail=True)
+
+
+def n04_tools_fault_injection() -> None:
+    """Z3a/N23：在真实 Runner 的 _func_tool_for_provider 边界丢弃工具
+    （tests/z3_tools_fault_observer.py，真实子进程），正式父函数
+    t1_t5_t6_workers 原样消费其输出，终模型工具缺失必须判 FAIL。"""
+
+    real_run_worker = _run_worker
+
+    def observer_run_worker(script: str, extra_args=None):
+        if script != "t1_persona_worker.py":
+            return real_run_worker(script, extra_args)
+        results = {}
+        repo = Path(__file__).resolve().parent.parent
+        observer = str(
+            Path(__file__).resolve().parent / "z3_tools_fault_observer.py")
+        for venv in (r"D:\第三方插件完善\.venv",
+                     r"D:\第三方插件完善\.venv426"):
+            tag = Path(venv).name
+            with tempfile.TemporaryDirectory(
+                    ignore_cleanup_errors=True) as td:
+                env = dict(os.environ)
+                env.update({
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                    "PYTHONPATH": str(repo),
+                })
+                r = subprocess.run(
+                    [venv + r"\Scripts\python.exe", "-X", "utf8",
+                     observer, td],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", env=env, cwd=str(repo), timeout=300,
+                )
+                line = next(
+                    (l for l in r.stdout.splitlines()
+                     if l.startswith("@@RESULT@@")), None)
+                if r.returncode != 0 or line is None:
+                    results[tag] = {
+                        "__error__": "observer rc=%s: %s" % (
+                            r.returncode, (r.stderr or r.stdout)[-300:])
+                    }
+                else:
+                    results[tag] = json.loads(line[len("@@RESULT@@"):])
+        return results
+
+    before_pass, before_fail = len(PASS), len(FAIL)
+    with patch.object(sys.modules[__name__], "_run_worker",
+                      observer_run_worker):
+        t1_t5_t6_workers()
+    detected = len(FAIL) > before_fail
+    del PASS[before_pass:]
+    del FAIL[before_fail:]
+    check("Z3.n04-tools-drop-detected", detected,
+          "expect_fail=True detected=%s" % detected)
 
 
 def t1_t5_t6_workers() -> None:
@@ -514,6 +653,23 @@ def t1_t5_t6_workers() -> None:
         check(
             f"N04.{tag}.tool-preserved",
             out.get("n04_tool_preserved") is True,
+            f"ft={out.get('n04_final_tool_names')}",
+        )
+        # Z3a：终模型实参中的工具集合——真实 ToolSet 类型、当前人格专属
+        # 工具、无跨人格串入、schema 可序列化（负例见 n04 工具丢弃注入）
+        check(
+            f"N04.{tag}.final-tools-current-persona",
+            out.get("n04_final_tools_current_persona") is True,
+            f"names={out.get('n04_final_tool_names')}",
+        )
+        check(
+            f"N04.{tag}.final-tools-no-cross-persona",
+            out.get("n04_final_tools_no_cross_persona") is True,
+            f"names={out.get('n04_final_tool_names')}",
+        )
+        check(
+            f"N04.{tag}.final-tool-schema-serializable",
+            out.get("n04_final_tool_schema_serializable") is True,
             "",
         )
         check(
@@ -678,6 +834,25 @@ def t1_t5_t6_workers() -> None:
                 and _ufo.get("observer_key_scope") == "u:",
                 f"fo={ {k: v for k, v in _ufo.items() if k != 'new_turn_result'} }",
             )
+            # Z3b：命令与 follower 为确实不同的人格（实际解析链证据），
+            # 同平台/机器人/发送者，新轮写入同一 u: 共享键
+            _cmd_persona = _uscen.get("command_resolved_persona")
+            _cmd_base = _uscen.get("command_base") or []
+            _new_persona = _ufo.get("new_turn_source_persona")
+            _new_key = _ufo.get("new_turn_identity_key") or ""
+            _key_parts = _new_key.split(chr(31))
+            check(
+                f"N10.{tag}.user-{_ulabel}-distinct-personas-same-ukey",
+                _cmd_persona == "maid"
+                and _new_persona == "second"
+                and _cmd_persona != _new_persona
+                and len(_key_parts) == 4
+                and _key_parts[2] == "u:"
+                and [_key_parts[0], _key_parts[1], _key_parts[3]]
+                == list(_cmd_base),
+                f"cmd_persona={_cmd_persona!r} new_persona={_new_persona!r} "
+                f"key={_new_key!r} base={_cmd_base}",
+            )
         check(
             f"T5.{tag}.no-provider-no-clear",
             out.get("no-provider", {}).get("history_after") == 2
@@ -788,6 +963,8 @@ async def main() -> int:
     await t2_cancel_window()
     await t4_buffer_suppression()
     t1_t5_t6_workers()
+    worker_entry_fault_injection()
+    n04_tools_fault_injection()
     print(f"\n=== T1~T6 返工回归：PASS={len(PASS)} FAIL={len(FAIL)} ===")
     if FAIL:
         print("失败项：", FAIL)

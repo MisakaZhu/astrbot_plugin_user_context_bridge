@@ -33,7 +33,9 @@ def _run_worker(venv: str, td: str, *, observer: str | None = None,
                 fault: str = "none") -> dict:
     """运行 W worker 并解析结果（__error__ 表示失败）。observer 传入
     y_fault_observer.py 时在真实 wait_for 边界注入 fault（task:type）；
-    非观测路径命令行与原直跑完全一致。"""
+    非观测路径命令行与原直跑完全一致。Z1a：统一走 worker_result 判定。"""
+
+    from tests import worker_result
 
     tests_dir = Path(__file__).resolve().parent
     py = venv + r"\Scripts\python.exe"
@@ -46,30 +48,10 @@ def _run_worker(venv: str, td: str, *, observer: str | None = None,
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONPATH"] = str(REPO)
-    r = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(REPO),
-        timeout=300,
+    r = worker_result.safe_run(
+        cmd, env=env, cwd=str(REPO), timeout=300,
     )
-    line = next(
-        (l for l in r.stdout.splitlines() if l.startswith("@@RESULT@@")),
-        None,
-    )
-    # X6：非零退出码与缺失/损坏 JSON 进入判定
-    if r.returncode != 0:
-        return {"__error__": f"worker rc={r.returncode}: "
-                + (r.stderr or r.stdout)[-400:]}
-    if line is None:
-        return {"__error__": "worker 输出缺少 @@RESULT@@ 行："
-                + (r.stderr or r.stdout)[-400:]}
-    try:
-        return json.loads(line[len("@@RESULT@@"):])
-    except json.JSONDecodeError as exc:
-        return {"__error__": f"worker 结果 JSON 损坏：{exc}："
-                + line[len("@@RESULT@@"):][:200]}
+    return worker_result.read_worker_result(r)
 
 
 def _validate_worker_output(result, td: Path) -> dict:
@@ -131,6 +113,17 @@ def assert_worker_fields(tag: str, out: dict, *, check=check) -> None:
         f"ledger_no_completed={out.get('switch_queued_ledger_no_completed')!r} "
         f"no_output={out.get('switch_queued_no_output')!r} "
         f"stopped={out.get('switch_queued_stopped')!r}",
+    )
+    # Z1b：受控让出/返回后，旧实例（排队实际发生处）与新实例的锁等待者
+    # 与未终态挂起任务必须全部清零——字段缺失/非零都判 FAIL
+    check(
+        f"Z1.{tag}.lock-and-task-cleanup",
+        out.get("switch_lock_waiters_pre_bridge") == 0
+        and out.get("switch_queued_lock_waiters_after") == 0
+        and out.get("switch_pending_uncommitted") == 0,
+        f"pre_waiters={out.get('switch_lock_waiters_pre_bridge')!r} "
+        f"new_waiters={out.get('switch_queued_lock_waiters_after')!r} "
+        f"pending={out.get('switch_pending_uncommitted')!r}",
     )
     # 加载与 Phase 0（status 无接管证据不得宣称共享）
     check(f"W1.{tag}.load", out.get("load_ok") is True
@@ -336,9 +329,12 @@ def fault_injection_real_paths() -> None:
         "rc19": FakeResult(19, good_line, "injected nonzero exit"),
         "no-result-line": FakeResult(0, "no marker here\n", ""),
         "bad-json": FakeResult(0, "@@RESULT@@{oops", ""),
+        "json-array": FakeResult(0, "@@RESULT@@[1,2]\n", ""),
     }
+    from tests import worker_result as _wr
+
     for name, result in entry_cases.items():
-        with patch.object(subprocess, "run", return_value=result):
+        with patch.object(_wr, "safe_run", return_value=result):
             read = _run_worker("synthetic-venv", "synthetic-td")
         entry_lf: list = []
 

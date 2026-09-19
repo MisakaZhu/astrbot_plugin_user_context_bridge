@@ -16,6 +16,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from unittest.mock import patch
+
 from tests.w_lifecycle_check import _run_worker, assert_worker_fields, check, PASS, FAIL
 
 REPO = Path(__file__).resolve().parent.parent
@@ -116,6 +118,81 @@ def zip_tool_standalone(zip_path: Path, td: Path) -> bool:
     return r.returncode == 0 and "身份分区" in r.stdout
 
 
+def _run_zip_worker(venv: str, inst: Path, zip_path) -> dict:
+    """N22 双版安装链 worker 入口（Z1a：统一 worker_result 判定——
+    rc/缺行/坏 JSON/非对象/超时/启动失败，正式安装链唯一执行路径）。"""
+
+    from tests import worker_result
+
+    worker = str(REPO / "tests" / "w_lifecycle_worker.py")
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONPATH"] = str(REPO)
+    r = worker_result.safe_run(
+        [venv + r"\Scripts\python.exe", worker, str(inst), str(zip_path)],
+        env=env, cwd=str(REPO), timeout=240,
+    )
+    return worker_result.read_worker_result(r)
+
+
+def zip_entry_fault_injection(zip_path) -> None:
+    """Z1a/N23：故障注入经正式 N22 安装链入口 _run_zip_worker 及其实际
+    subprocess 处理路径（patch tests.worker_result.safe_run）；正常对照
+    必须过，rc19/缺 RESULT/坏 JSON/JSON 非对象/必要字段缺失逐个必须判
+    FAIL。对照 stdout 取自本函数先前对同一 ZIP 的真实运行结果。"""
+
+    from tests import worker_result as wr
+
+    venv = r"D:\第三方插件完善\.venv"
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        good = _run_zip_worker(venv, Path(td) / "inst-genuine", zip_path)
+    if "__error__" in good:
+        check("Z1.zip-entry-baseline", False, good["__error__"])
+        return
+    check("Z1.zip-entry-baseline", True)
+
+    class FakeResult:
+        def __init__(self, rc, stdout, stderr=""):
+            self.returncode = rc
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def run_case(name, result, *, expect_fail: bool) -> None:
+        before_pass, before_fail = len(PASS), len(FAIL)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            with patch.object(wr, "safe_run", return_value=result):
+                out = _run_zip_worker(
+                    venv, Path(td) / "inst-fault", zip_path)
+        assert_worker_fields("Z1ZIP", out)
+        detected = len(FAIL) > before_fail
+        del PASS[before_pass:]
+        del FAIL[before_fail:]
+        check(
+            f"Z1.zip-entry-{name}",
+            detected if expect_fail else not detected,
+            f"expect_fail={expect_fail} detected={detected}",
+        )
+
+    good_line = "@@RESULT@@" + json.dumps(good, ensure_ascii=False) + "\n"
+    run_case("normal-passes", FakeResult(0, good_line), expect_fail=False)
+    run_case("rc19-detected",
+             FakeResult(19, good_line, "injected nonzero exit"),
+             expect_fail=True)
+    run_case("no-result-line-detected",
+             FakeResult(0, "no marker here\n"), expect_fail=True)
+    run_case("bad-json-detected",
+             FakeResult(0, "@@RESULT@@{oops\n"), expect_fail=True)
+    run_case("json-array-detected",
+             FakeResult(0, "@@RESULT@@[1,2]\n"), expect_fail=True)
+    run_case("missing-field-detected",
+             FakeResult(0, "@@RESULT@@"
+                        + json.dumps(
+                            {k: v for k, v in good.items() if k != "load_ok"},
+                            ensure_ascii=False) + "\n"),
+             expect_fail=True)
+
+
 def main() -> int:
     import argparse
 
@@ -139,7 +216,7 @@ def main() -> int:
         ok_tool = zip_tool_standalone(zip_path, tdp / "toolcheck")
         check("N22.zip-tool-standalone", ok_tool)
 
-        # 双版：从 ZIP 安装 → 完整生命周期
+        # 双版：从 ZIP 安装 → 完整生命周期（正式入口 _run_zip_worker）
         for venv in (
             r"D:\第三方插件完善\.venv",
             r"D:\第三方插件完善\.venv426",
@@ -147,30 +224,15 @@ def main() -> int:
             tag = Path(venv).name
             inst = tdp / f"inst-{tag}"
             inst.mkdir()
-            worker = str(REPO / "tests" / "w_lifecycle_worker.py")
-            env = dict(os.environ)
-            env["PYTHONDONTWRITEBYTECODE"] = "1"
-            env["PYTHONIOENCODING"] = "utf-8"
-            env["PYTHONPATH"] = str(REPO)
-            r = subprocess.run(
-                [venv + r"\Scripts\python.exe", worker, str(inst), str(zip_path)],
-                capture_output=True, text=True, env=env, cwd=str(REPO),
-                timeout=240,
-            )
-            line = next(
-                (l for l in r.stdout.splitlines()
-                 if l.startswith("@@RESULT@@")), None)
-            if line is None:
-                check(f"N22.{tag}.zip-lifecycle", False,
-                      (r.stderr or r.stdout)[-400:])
-                continue
-            out = json.loads(line[len("@@RESULT@@"):])
+            out = _run_zip_worker(venv, inst, zip_path)
             assert_worker_fields(f"N22.{tag}", out)
             # ZIP 安装链额外核验：卸载后目录与注册表清理
             check(f"N22.{tag}.zip-lifecycle-complete",
                   out.get("load_ok") is True
                   and (out.get("bound_handlers") or 0) >= 5,
                   f"load={out.get('load_ok')}")
+
+    zip_entry_fault_injection(zip_path)
 
     print(f"\n=== N22 ZIP 安装链：PASS={len(PASS)} FAIL={len(FAIL)} ===")
     if FAIL:

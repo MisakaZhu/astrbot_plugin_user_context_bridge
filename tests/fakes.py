@@ -172,6 +172,7 @@ class FakeProvider(Provider):
                     m if isinstance(m, dict) else m.model_dump() for m in (contexts or [])
                 ],
                 "system_prompt": system_prompt,
+                "func_tool": self._tool_repr(func_tool),
             }
         )
         if self.error_script:
@@ -183,6 +184,26 @@ class FakeProvider(Provider):
         else:
             reply = self.reply_script[0]
         return LLMResponse(role="assistant", completion_text=reply)
+
+    @staticmethod
+    def _tool_repr(func_tool) -> dict | None:
+        """终模型实参中的工具集合摘要（Z3a）：类型、工具名与可序列化
+        OpenAI schema，供父断言检查"当前人格工具到达最终模型"。"""
+
+        if func_tool is None:
+            return None
+        names = None
+        try:
+            names = sorted(func_tool.names())
+        except Exception:  # noqa: BLE001 - 非法工具对象也要留证据
+            names = None
+        schema = None
+        try:
+            schema = func_tool.get_func_desc_openai_style()
+        except Exception as exc:  # noqa: BLE001
+            schema = {"repr_error": f"{type(exc).__name__}: {exc}"[:120]}
+        return {"type": type(func_tool).__name__, "names": names,
+                "openai_schema": schema}
 
     async def text_chat_stream(self, **kwargs):
         resp = await self.text_chat(**kwargs)

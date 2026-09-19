@@ -59,11 +59,11 @@ async def main() -> int:
     await pm.initialize()
     await pm.create_persona(
         "persona_a", "PERSONA-A-SYSTEM",
-        ["A-BEGIN-Q", "A-BEGIN-A"], tools=[], skills=[],
+        ["A-BEGIN-Q", "A-BEGIN-A"], tools=["n04_tool_a"], skills=[],
     )
     await pm.create_persona(
         "persona_b", "PERSONA-B-SYSTEM",
-        ["B-BEGIN-Q", "B-BEGIN-A"], tools=[], skills=[],
+        ["B-BEGIN-Q", "B-BEGIN-A"], tools=["n04_tool_b"], skills=[],
     )
     cm = ConversationManager(db_helper)
 
@@ -200,12 +200,80 @@ async def main() -> int:
             "persona_u", "PERSONA-U-SYSTEM",
             ["U-BEGIN-Q", "U-BEGIN-A"], tools=[], skills=[],
         )
+        # Z3a：真实 FunctionTool/ToolSet + 宿主人格工具选择链——三个人格
+        # 各配专属工具，工具经 _ensure_persona_and_skills 的 ToolSet 路径
+        # 装配，最终模型实参按 FakeProvider._tool_repr 断言。
+        from astrbot.core.agent.tool import FunctionTool, ToolSet
+
+        async def _noop_tool_handler(*args, **kwargs):
+            return None
+
+        def _make_tool(name: str) -> FunctionTool:
+            return FunctionTool(
+                name=name,
+                description=f"{name} for n04",
+                parameters={"type": "object", "properties": {}},
+                handler=_noop_tool_handler,
+                active=True,
+            )
+
+        persona_tools = {
+            "persona_a": "n04_tool_a",
+            "persona_b": "n04_tool_b",
+            "persona_c": "n04_tool_c",
+        }
+        all_tools = ToolSet()
+        for _pn, _tn in persona_tools.items():
+            all_tools.add_tool(_make_tool(_tn))
+
+        class _N04ToolManager:
+            """最小宿主工具管理器：真实 ToolSet 语义（get_full_tool_set/
+            get_func），供 _ensure_persona_and_skills 的人格工具选择。"""
+
+            def get_full_tool_set(self) -> ToolSet:
+                return all_tools
+
+            def get_func(self, name: str):
+                return all_tools.get_tool(name)
+
+            def get_builtin_tool(self, t):
+                return None
+
+        tool_mgr = _N04ToolManager()
         await pm.create_persona(
             "persona_c", "PERSONA-C-SYSTEM",
-            ["C-BEGIN-Q", "C-BEGIN-A"], tools=[], skills=[],
+            ["C-BEGIN-Q", "C-BEGIN-A"],
+            tools=[persona_tools["persona_c"]], skills=[],
         )
-        tool_marker = {"type": "function", "function": {"name": "u_tool"}}
         dyn_marker = "DYNAMIC-INJECTION-MARKER"
+
+        # Z3a：动态注入注册为**真实 OnLLMRequestEvent 钩子**（等价另一
+        # 插件在请求阶段的注入），不再预先手拼 system_prompt。
+        from astrbot.core.star.star_handler import (
+            StarHandlerMetadata,
+            star_handlers_registry,
+        )
+        from astrbot.core.star.star import StarMetadata, star_map
+
+        dyn_module = "uctx_t1_dyn_inject"
+        star_map[dyn_module] = StarMetadata(
+            name=dyn_module, activated=True)
+
+        async def _dyn_inject(ev, req):
+            req.system_prompt = (req.system_prompt or "") + chr(10) + dyn_marker
+
+        dyn_meta = StarHandlerMetadata(
+            event_type=EventType.OnLLMRequestEvent,
+            handler_full_name=dyn_module + "_inject",
+            handler_name="inject",
+            handler_module_path=dyn_module,
+            handler=_dyn_inject,
+            event_filters=[],
+            extras_configs={"priority": 5},
+        )
+        star_handlers_registry._handlers.append(dyn_meta)
+        star_handlers_registry.star_handlers_map[dyn_meta.handler_full_name] = (
+            dyn_meta)
 
         async def _drive_real_chain(ev, provider, req) -> dict:
             """宿主装配后的同一 req 走完整宿主链：注册请求钩子 →
@@ -277,7 +345,12 @@ async def main() -> int:
             scheduler = PipelineScheduler.__new__(PipelineScheduler)
             scheduler.ctx = stage_ctx
             scheduler.stages = [AgentStage(), decorator, Transport()]
-            await scheduler._process_stages(ev)
+            try:
+                await scheduler._process_stages(ev)
+            except BaseException as exc:  # noqa: BLE001 - 留诊断证据
+                info["pipeline_error"] = (
+                    f"{type(exc).__name__}: {exc}"[:300]
+                )
             info["model_calls"] = len(provider.call_log)
             return info
 
@@ -315,10 +388,7 @@ async def main() -> int:
 
             host_ctx = SimpleNamespace(
                 persona_manager=pm,
-                get_llm_tool_manager=lambda: SimpleNamespace(
-                    get_full_tool_set=lambda: {},
-                    get_builtin_tool=lambda t: None,
-                ),
+                get_llm_tool_manager=lambda: tool_mgr,
                 get_using_provider=lambda umo: None,
                 get_config=lambda: config_for(None),
                 subagent_orchestrator=None,
@@ -326,10 +396,8 @@ async def main() -> int:
             cfg_ps = provider_settings_for(ev.unified_msg_origin)
             await _ensure_persona_and_skills(
                 req, cfg_ps, host_ctx, ev)
-            # 宿主工具集合 + 请求阶段动态注入（等价另一插件在
-            # OnLLMRequestEvent 时点的注入，随请求存在、不落共享历史）
-            req.func_tool = [tool_marker]
-            req.system_prompt = (req.system_prompt or "") + chr(10) + dyn_marker
+            # 动态注入由注册的真实 OnLLMRequestEvent 钩子在链上追加；
+            # 工具全部由宿主人格选择链装配（Z3a），不再手填。
             provider = FakeProvider([answer])
             info = await _drive_real_chain(ev, provider, req)
             return ev, req, provider, info
@@ -378,13 +446,19 @@ async def main() -> int:
                     parts.append(str(m.get("content") or ""))
             return "\n".join(parts)
 
-        log_a = prov_a.call_log[0]
-        log_b = prov_b.call_log[0]
-        log_c = prov_c.call_log[0]
+        # 偶发无模型调用时不得崩溃——让字段断言失败并保留诊断信息
+        log_a = prov_a.call_log[0] if prov_a.call_log else {}
+        log_b = prov_b.call_log[0] if prov_b.call_log else {}
+        log_c = prov_c.call_log[0] if prov_c.call_log else {}
+        observed["n04_pipeline_errors"] = [
+            info_a.get("pipeline_error"), info_b.get("pipeline_error"),
+            info_c.get("pipeline_error")]
         view_b = _model_view(log_b)
         view_c = _model_view(log_c)
-        ctx_b = json.dumps(log_b["contexts"], ensure_ascii=False, default=str)
-        ctx_c = json.dumps(log_c["contexts"], ensure_ascii=False, default=str)
+        ctx_b = json.dumps(log_b.get("contexts") or [],
+                           ensure_ascii=False, default=str)
+        ctx_c = json.dumps(log_c.get("contexts") or [],
+                           ensure_ascii=False, default=str)
         observed["n04_system_current_persona"] = (
             "PERSONA-B-SYSTEM" in view_b
             and "PERSONA-A-SYSTEM" not in view_b
@@ -396,11 +470,30 @@ async def main() -> int:
             and "A-BEGIN-Q" not in ctx_b
             and ctx_c.count("C-BEGIN-Q") == 1
         )
+        # Z3a：终模型实参（假模型 call_log）的工具集合——真实 ToolSet
+        # 类型、当前人格专属工具存在、旧/他人格工具不串入、schema 可序列化
+        ft_a = log_a.get("func_tool") or {}
+        ft_b = log_b.get("func_tool") or {}
+        ft_c = log_c.get("func_tool") or {}
         observed["n04_tool_preserved"] = (
-            json.dumps(tool_marker, ensure_ascii=False)
-            in json.dumps(getattr(req_b, "func_tool", []) or [],
-                          ensure_ascii=False, default=str)
+            ft_b.get("type") == "ToolSet" and ft_c.get("type") == "ToolSet"
         )
+        observed["n04_final_tool_names"] = {
+            "A": ft_a.get("names"), "B": ft_b.get("names"),
+            "C": ft_c.get("names")}
+        observed["n04_final_tools_current_persona"] = (
+            ft_a.get("names") == ["n04_tool_a"]
+            and ft_b.get("names") == ["n04_tool_b"]
+            and ft_c.get("names") == ["n04_tool_c"]
+        )
+        observed["n04_final_tools_no_cross_persona"] = (
+            "n04_tool_a" not in (ft_b.get("names") or [])
+            and "n04_tool_c" not in (ft_b.get("names") or [])
+            and "n04_tool_b" not in (ft_c.get("names") or [])
+            and "n04_tool_a" not in (ft_c.get("names") or [])
+        )
+        observed["n04_final_tool_schema_serializable"] = bool(
+            ft_b.get("openai_schema")) and bool(ft_c.get("openai_schema"))
         observed["n04_dynamic_injection_preserved"] = (
             dyn_marker in view_b and dyn_marker in view_c
         )
@@ -423,6 +516,13 @@ async def main() -> int:
 
         print("@@RESULT@@" + json.dumps(observed, ensure_ascii=False))
     finally:
+        try:
+            star_handlers_registry._handlers.remove(dyn_meta)
+            star_handlers_registry.star_handlers_map.pop(
+                dyn_meta.handler_full_name, None)
+            star_map.pop(dyn_module, None)
+        except Exception:  # noqa: BLE001 - 清理尽力而为
+            pass
         bridge.shutdown()
         cleanup(metas)
         ledger.close()

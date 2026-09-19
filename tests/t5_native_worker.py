@@ -12,6 +12,7 @@ import importlib
 import json
 import os
 import shutil
+import sqlite3
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -90,10 +91,44 @@ def user_ident_of(identity):
 async def scenario(name, *, mode="persona", disabled=False, renamed=False,
                    filtered=False, cmd="reset", provider=True, prefix=False,
                    follower=False, recover=False, inherit_protected=False,
-                   group="700000001", role="admin", sender="10001"):
+                   group="700000001", role="admin", sender="10001",
+                   follower_persona: str | None = None):
     state_dir = ROOT / ("s-" + name)
     state_dir.mkdir(parents=True, exist_ok=True)
-    bridge, resolver, membership, ledger = make_bridge_stack(str(state_dir))
+    # Z3b：follower_persona 给定时，命令窗口（700000001）解析为 maid、
+    # follower 新轮窗口（700000002）解析为另一人格——经真实
+    # resolve_selected_persona/provider_settings 链，替换默认单人格替身。
+    per_window_pm = None
+    ps_getter = None
+
+    if follower_persona:
+
+        class _PerWindowPM(FakePersonaManager):
+            async def resolve_selected_persona(
+                self, *, umo, conversation_persona_id, platform_name, **kw
+            ):
+                scope = (follower_persona
+                         if "700000002" in str(umo) else "maid")
+                persona = {
+                    "name": scope,
+                    "prompt": "T5-PERSONA-" + scope,
+                    "_begin_dialogs_processed": [],
+                }
+                return (scope, persona, None, False)
+
+        def ps_getter(umo):  # noqa: ANN001 - 闭包局部
+            persona = (follower_persona
+                       if "700000002" in str(umo) else "maid")
+            return {"provider_settings": {"default_personality": persona}}
+
+        per_window_pm = _PerWindowPM()
+
+    pmgr = per_window_pm if per_window_pm is not None else FakePersonaManager()
+    bridge, resolver, membership, ledger = make_bridge_stack(
+        str(state_dir),
+        persona_manager_getter=lambda: pmgr,
+        provider_settings_getter=ps_getter,
+    )
     resolver.set_history_scope(mode)
     metas = register_bridge(bridge)
     try:
@@ -120,7 +155,7 @@ async def scenario(name, *, mode="persona", disabled=False, renamed=False,
             provider_manager=provider_manager,
             platform_manager=None, conversation_manager=conv,
             message_history_manager=None,
-            persona_manager=FakePersonaManager(),
+            persona_manager=pmgr,
             astrbot_config_mgr=SimpleNamespace(get_conf=lambda umo: cfg),
             knowledge_base_manager=None, cron_manager=None,
         )
@@ -135,7 +170,8 @@ async def scenario(name, *, mode="persona", disabled=False, renamed=False,
         plugin._resolver = resolver
         plugin._commands = CommandService(
             ledger=ledger, resolver=resolver, membership=membership,
-            persona_manager_getter=lambda: FakePersonaManager(),
+            persona_manager_getter=lambda: pmgr,
+            provider_settings_getter=ps_getter,
             conversation_manager_getter=lambda: conv,
         )
         builtin_instance = native.Main.__new__(native.Main)
@@ -366,6 +402,18 @@ async def scenario(name, *, mode="persona", disabled=False, renamed=False,
                         follow_obs["history_before_notice"] = len(
                             ledger.load_history(identity.key)
                         )
+                        # Z3b：新轮真实人格与共享键证据（读账本，非推断）
+                        with sqlite3.connect(ledger._db_path) as db:
+                            row = db.execute(
+                                "SELECT source_persona, identity_key"
+                                " FROM turns WHERE user_message LIKE"
+                                " '%AFTER-RESET-QUESTION%'"
+                                " ORDER BY id DESC LIMIT 1"
+                            ).fetchone()
+                        follow_obs["new_turn_source_persona"] = (
+                            row[0] if row else None)
+                        follow_obs["new_turn_identity_key"] = (
+                            row[1] if row else None)
                     finally:
                         for meta in metas:
                             meta.enabled = False
@@ -419,7 +467,25 @@ async def scenario(name, *, mode="persona", disabled=False, renamed=False,
                         meta.handler_full_name, None
                     )
                 smap_local.pop(module_name, None)
+        _cmd_parts = identity.key.split(chr(31))
+        # Z3b：命令窗口人格经真实解析链记录（user 模式 identity 不携带
+        # 人格，须用与 build 阶段同参的 resolve_persona_scope）
+        command_resolved_persona = None
+        try:
+            from uctx_bridge.identity import resolve_persona_scope
+
+            command_resolved_persona = await resolve_persona_scope(
+                pmgr, event, None,
+                provider_settings=(
+                    ps_getter(event.unified_msg_origin) if ps_getter else {}
+                ),
+            )
+        except Exception:  # noqa: BLE001 - 记录失败即证据缺失
+            command_resolved_persona = None
         OUT[name] = dict(
+            command_persona_scope=_cmd_parts[2],
+            command_resolved_persona=command_resolved_persona,
+            command_base=[_cmd_parts[0], _cmd_parts[1], _cmd_parts[3]],
             builtin_activated=active,
             follow_observations=follow_obs,
             epoch_delta=ledger.current_epoch(identity.key) - old_epoch,
@@ -494,10 +560,11 @@ async def main() -> int:
     await scenario(
         "user-permission-denied", mode="user", role="member",
         sender="30003")
-    # N10/Y3：user 模式 once-only follower 屏障
-    await scenario("user-reset-two-handlers", mode="user", follower=True)
-    await scenario(
-        "user-new-two-handlers", mode="user", cmd="new", follower=True)
+    # N10/Z3b：user 模式 once-only follower 屏障（follower 为另一个人格）
+    await scenario("user-reset-two-handlers", mode="user", follower=True,
+                   follower_persona="second")
+    await scenario("user-new-two-handlers", mode="user", cmd="new",
+                   follower=True, follower_persona="second")
     # X5：继承保护（user off→persona）下原生 new 不得联动/误提示
     await scenario(
         "persona-inherit-protected-new", mode="persona", cmd="new",
