@@ -1,4 +1,30 @@
-## 当前：0.7.0 Y1–Y4 返工完成（待 Codex 复验 MIS-170）
+## 当前：0.7.0 Z1–Z3 返工完成（待 Codex 复验 MIS-170）
+
+- 分支 `feat/0.7.0-persona-records`；Y 轮基线 ebf0144；Z 轮交付提交
+  **acabbf7**；候选包 `astrbot_plugin_user_context_bridge-acabbf7.zip`
+  （SHA-256 `c21956febfda41e3baeb0b611734c9b907ea060fc8583aeb1ad3491e18aad728`，
+  13 文件，以 --delivered-zip/--delivered-sha256 显式指定跑 N22）。
+- 修复独立复验确认的 Z1–Z3：Z1a 全部实际 worker 入口收敛到
+  tests/worker_result.py 唯一判定（w_zip 与 T1/T5 入口此前 rc=19 仍
+  69/98 PASS），故障注入经正式父函数+真实 subprocess 路径（正常对照
+  过、逐故障 FAIL）；Z1b 旧实例+新实例锁等待者与挂起清理进入父断言；
+  Z2 命令保存/登记"登记先行"协议（真实 SQLite 语句失败/锁冲突受控、
+  失败 on 不解除退出、登记失败直接切模式无 ghost，真实故障基线双版
+  留存 z2_baseline_426|428.log）；Z3a N04 工具经真实 FunctionTool/
+  ToolSet+宿主人格选择链到终模型（类型/工具名/schema 断言+丢弃负例），
+  动态注入挂真实请求钩子；Z3b N10 user follower 双人格（maid/second，
+  账本 source_persona 证据、同 u: 键）；回滚探针改含旧记录副本并加
+  verified_silent_key_split 断言。
+- 全量回归：19 套 × 4.26.0/4.28.0 各 **854** 项断言全 PASS（0 FAIL，
+  38 次 rc=0），日志 local_evidence/y_logs/（分套：p0–p6
+  17/36/27/19/22/16/8 + r/s/t 38/84/143 + n0–n3 10/30/14/59 +
+  w 78/37/78 + x 64 + y2 74）。
+- Linear：MIS-165/166/167/169 完成→In Review（附脱敏证据）；MIS-168
+  保持 In Review；MIS-170 In Progress 等 Codex；MIS-145 实机不变。
+
+---
+
+## 前轮：0.7.0 Y1–Y4 返工（基线 4d73c7a，交付 1efc0d2/ebf0144；历史记录，"全部入口拒绝 rc/工具到最终模型/另一人格 follower"表述已被 Z 轮复验更正）
 
 - 分支 `feat/0.7.0-persona-records`；X 轮基线 4d73c7a；Y 轮交付提交 **1efc0d2**；
   候选包 `astrbot_plugin_user_context_bridge-1efc0d2.zip`

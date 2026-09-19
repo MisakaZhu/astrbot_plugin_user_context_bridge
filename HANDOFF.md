@@ -17,6 +17,31 @@
 
 ### 版本与包
 
+- **本轮（Z1–Z3）交付提交 acabbf7**；候选包
+  `astrbot_plugin_user_context_bridge-acabbf7.zip`（13 文件），
+  SHA-256 `c21956febfda41e3baeb0b611734c9b907ea060fc8583aeb1ad3491e18aad728`；
+  全量回归 19 套 × 双版各 **854** 项全 PASS（0 FAIL，38 次 rc=0；
+  日志 local_evidence/y_logs/ + regression_summary.json）。N22 复现命令：
+  `PYTHONPATH=. <venv>/Scripts/python.exe -X utf8 tests/s_rework_check.py --delivered-zip release/astrbot_plugin_user_context_bridge-acabbf7.zip --delivered-sha256 c21956febfda41e3baeb0b611734c9b907ea060fc8583aeb1ad3491e18aad728`
+  及同参 `tests/w_zip_lifecycle_check.py`。
+- 修复范围：Z1a 统一 worker 入口判定（tests/worker_result.py：safe_run
+  捕获超时/启动失败，read_worker_result 判定 rc/缺行/坏 JSON/非对象；
+  w_zip 与 T1/T5 入口收敛；正式父函数+真实 subprocess 路径注入 6 类
+  故障）；Z1b 旧实例+新实例锁等待者/挂起清理入父断言（==0 硬不变量）；
+  Z2 命令登记先行协议（真实 SQLite TEMP TRIGGER 语句失败与第二连接
+  持锁双版基线 → 登记失败=整条未生效、失败 on 不解除退出、直接切模式
+  无 ghost，正式回归在 y2 套件 Z2.*）；Z3a N04 真实 FunctionTool/
+  ToolSet+人格工具选择链到终模型（类型/名称/schema/无串入断言+丢弃
+  负例 z3_tools_fault_observer）、动态注入挂真实请求钩子；Z3b user
+  follower 双人格（命令=maid 经 resolve_persona_scope 实链、新轮=
+  second 账本 source_persona、同 u: 键）；y4_rollback_verify 改含旧
+  记录副本+verified_silent_key_split 断言（双版 true）。
+- 断点恢复：工作区干净（文档收尾提交后）；旧包
+  ac51bde/27aadae/ce8b75c/4cee8cf/1efc0d2 均保留原字节。
+- 已知限制：426 t1 worker 曾两次在套件内偶发 N04 三窗模型未调用
+  （直跑与复跑不可复现）；已加 n04_pipeline_errors 诊断字段，最终
+  全量回归未复现。若复验再遇，请依据该字段定位。
+
 - **本轮（Y1–Y4）交付提交 1efc0d2**；候选包
   `astrbot_plugin_user_context_bridge-1efc0d2.zip`（13 文件），
   SHA-256 `9f6299eab0bab7b6fb6547418880d71ede1597b166c64a7f4a03c2d64842ec57`；

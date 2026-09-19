@@ -1,6 +1,46 @@
 # 更新日志
 
-## 0.7.0（Y1–Y4 返工候选；X 轮候选 4d73c7a 整体验收未通过，本版修复剩余项）
+## 0.7.0（Z1–Z3 返工候选；Y 轮候选 ebf0144 尚未通过独立验收，本版修复剩余项）
+
+依据独立复验（报告 29 号，基线 ebf0144）修复：
+
+- **Z1a 全部实际入口的失败判定**：新增 tests/worker_result.py 作为唯一
+  共用判定（safe_run 捕获超时/启动失败；read_worker_result 判定非零
+  退出码、缺 RESULT 行、JSON 损坏、JSON 非对象，错误保留可定位信息）；
+  w_zip_lifecycle_check 的 ZIP 安装链与 t_rework_check 的 T1/T5 worker
+  入口此前只看 RESULT 行（rc=19 仍 69/98 PASS）——已全部收敛到该判定；
+  故障注入分别经正式 t1_t5_t6_workers / 正式 N22 安装链入口及其真实
+  subprocess 处理路径（正常对照过，rc19/缺行/坏 JSON/JSON 数组/必要
+  字段缺失逐个 FAIL）。
+- **Z1b 锁与任务清理进入父断言**：W worker 现同时记录切换前**旧实例**
+  （排队实际发生处）与新实例的身份锁等待者及未终态挂起任务数，
+  assert_worker_fields 逐项 ==0（缺字段/非零均 FAIL）；本轮无真实锁
+  残留，系把既有证据缺口补成硬不变量而非修复产品泄漏。
+- **Z2 命令保存/登记可恢复协议**：`/uctx off|on` 改为**模式登记先行**
+  ——登记失败（真实 SQLite 语句失败或锁冲突，含 sqlite3.Error）即整条
+  命令受控失败，退出/加入尚未写入，不再出现"退出已保存、模式事实
+  缺失"的不可恢复分裂（该分裂曾使登记失败后直接切另一模式 0→0 漏
+  推进）；失败 on 不解除既有退出（磁盘/内存/status/后继 captured 一致）；
+  后一写失败只留下"已登记未退出"的可重试状态。真实故障基线（TEMP
+  TRIGGER 语句失败 / 第二连接 BEGIN IMMEDIATE 持锁）双版留存于
+  local_evidence/y_logs/z2_baseline_426|428.log；正式回归入 y2 套件。
+- **Z3a 工具到最终模型**：N04 三窗改用真实 FunctionTool/ToolSet 与
+  宿主人格工具选择链（每人格配专属工具，经 _ensure_persona_and_skills
+  装配），FakeProvider 记录终模型 func_tool 的类型/工具名/可序列化
+  OpenAI schema；断言当前人格工具存在、旧/他人格工具不串入；动态注入
+  改挂真实 OnLLMRequestEvent 钩子（不再预拼 system_prompt）；新增工具
+  丢弃负例（真实 Runner._func_tool_for_provider 边界置 None）——正式
+  父断言必须 FAIL。
+- **Z3b N10 user follower 双人格**：命令窗口解析 maid、follower 新轮
+  解析 second（真实 resolve_selected_persona/provider_settings 链），
+  父断言检查两者确实不同、同平台/机器人/发送者、新轮写入同一 u: 键、
+  once-only 屏障与新问答保留不变。
+- **回滚探针更正**：y4_rollback_verify 的"直接换旧代码"段改为在**含
+  旧记录的迁移库副本**上验证（裸键 0 条、编码键 1 条、写入后两套键
+  并存），关键结果加 verified_silent_key_split 失败断言；COMPATIBILITY
+  明确恢复的是升级前快照、升级后新增数据不在备份内。
+
+## 0.7.0（Y1–Y4 返工候选；X 轮候选 4d73c7a 整体验收未通过，本版修复剩余项；本节为历史记录）
 
 依据独立复验（报告 27 号，基线 4d73c7a）修复：
 

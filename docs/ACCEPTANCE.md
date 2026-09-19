@@ -172,7 +172,45 @@ W 返工中发现并修复的新缺陷：`identity_stats` 以 4 段身份键查�
 
 ---
 
-# 0.7.0 Y1–Y4 返工后矩阵（N01–N24 v4，2026-09-20）
+# 0.7.0 Z1–Z3 返工后矩阵（N01–N24 v5，2026-09-20）
+
+**对 v4 的更正**：Codex 对 ebf0144 的独立复验（报告 29 号）确认——
+w_zip 安装链与 T1/T5 worker 入口只看 RESULT 行（rc=19 仍 69/98 PASS）；
+W 的 `switch_queued_lock_waiters_after` 已输出但父断言未使用（翻成 17
+仍 32 PASS）；命令保存/登记缺失败协议（真实 SQLite 语句失败原样抛
+IntegrityError、失败 on 解除退出、登记失败后直接切模式 0→0）；N04 工具
+仍是手填 list 且只查 req 对象（真实边界丢弃工具后模型三次 None 仍宣称
+保留）；N10 user follower 命令与新轮同为 maid；"所有入口拒绝 rc""工具
+到最终模型""另一人格 follower"此前声称超出证据。全量回归与 Y 轮 814
+计数本身准确，予以保留。
+
+全量回归（实现提交 **acabbf7**；候选包
+`astrbot_plugin_user_context_bridge-acabbf7.zip`，SHA-256
+`c21956febfda41e3baeb0b611734c9b907ea060fc8583aeb1ad3491e18aad728`；
+日志 local_evidence/y_logs/，逐套 rc/PASS/FAIL 见
+regression_summary.json）：**19 套 × 4.26.0/4.28.0，每版 854 项
+断言全 PASS（0 FAIL，38 次运行 rc 全 0）**。分套：p0–p6
+17/36/27/19/22/16/8 + r/s/t 38/84/143 +
+n0–n3 10/30/14/59 + w_lifecycle/w_rework/w_zip
+78/37/78 + x 64 + y2 74。计数口径同 v4（父套件内部跨
+双版 spawn worker，同一条 PASS 只计一次；故障注入用例注入的是 doctored
+子进程结果，其 PASS/FAIL 已回滚不入总数，检测结论由 Z1./Z3. 前缀检查
+行承载）。
+
+v4 表逐行状态以本轮证据继续成立，以下仅列 Z 轮实质变化行：
+
+| 编号 | Z 轮变化 | 本轮证据 | 状态 |
+| --- | --- | --- | --- |
+| N22 | ZIP 安装链入口收敛到 tests/worker_result.py（rc/缺行/坏 JSON/JSON 非对象/超时/启动失败）；正式入口注入经 patch worker_result.safe_run 后调真实安装链函数：正常对照过，rc19/缺行/坏 JSON/数组/缺字段逐个 FAIL（w_zip 78→含 Z1 行） | PASS（双版） |
+| N23 | 故障注入扩展到 T1/T5 正式入口（t1_t5_t6_workers + patch safe_run，基线取同进程先前真实运行结果）；N04 新增工具丢弃负例（真实 Runner._func_tool_for_provider 边界置 None，正式父断言 FAIL）；Z1b 锁/挂起清理（旧实例+新实例）翻成 17 必 FAIL | PASS（双版） |
+| N02/N07 | Z2 失败协议：登记先行；真实 TEMP TRIGGER 语句失败 → 受控文案+整体未生效（退出未保存、scope=None）→ 去障重试登记成功；第二连接 BEGIN IMMEDIATE 持锁 → 失败 on 受控且退出保留（磁盘/内存/captured=0）→ 去障重试成功（captured=1）；登记失败后**直接**切另一模式无 ghost（scope=None/gen=0）→ 重试登记当前模式 → 再切恰好 +1（y2 套件 Z2.* 断言，双版） | PASS（双版） |
+| N04 | 工具经真实 FunctionTool/ToolSet+宿主人格选择链装配；终模型实参断言 类型=ToolSet、A/B/C 各自专属工具、无跨人格串入、OpenAI schema 可序列化；动态注入挂真实 OnLLMRequestEvent 钩子（抵达模型、不落账本）；负例=真实边界丢工具 → 父断言 FAIL | PASS（双版） |
+| N10 | user follower 双人格：命令窗口真实解析 maid、follower 新轮解析 second（账本 source_persona 证据）、同平台/机器人/发送者、同一 u: 键；once-only（epoch+1、提示 1 次、新问答不被二次清掉）与权限/禁用/改名/无 provider/范围外矩阵保留 | PASS（双版） |
+| 回滚 | y4_rollback_verify"直接换旧代码"段改在含旧记录的迁移库副本上验证：裸键 0 条/编码键 1 条/写入后 2 条并存，verified_silent_key_split 双版 true | PASS（双版） |
+
+---
+
+# 0.7.0 Y1–Y4 返工后矩阵（N01–N24 v4，2026-09-20；历史记录，其中"工具到最终模型/另一人格 follower/全部入口拒绝 rc"的表述已被 v5 更正）
 
 **对 v3 矩阵与 X 轮统计的更正**：Codex 对 4d73c7a 的独立复验（报告 27 号）
 确认——S6 卸载等待吞异常且父断言 8 PASS、`_run_s6_worker` 不检查 rc
