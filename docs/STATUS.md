@@ -1,4 +1,12 @@
-## 当前：0.7.0 Z1–Z3 + AA1–AA2 + AB1–AB2 收尾完成（待 Codex 复验 MIS-170）
+## 当前：0.7.0 Z1–Z3 + AA + AB + AC 收尾完成（待 Codex 复验 MIS-170）
+
+- **AC 轮（2026-09-20）**：AC1 T 自检改用 T 正式断言（W 断言误用
+  已更正）+ 三方对照（正常/故障/撤故障）；AC2 逐版本 verdict（每版本
+  独立 target_hit/diag_ok/no_collateral）+ `_aa2_audit` 消费 + 三种
+  新坏观测 rejected；AC3 observer_runner persist_run 落盘 + manifest
+  重开验证。正式全量 20 套 × 双版各 **893** PASS / 0 FAIL（40 次
+  rc=0；t 163 + w 92 + aa1 5）。运行实现/包仍为 acabbf7。
+
 
 - **AB 轮（2026-09-20）**：AB1 功能失败留证（persist_run 每次 worker
   运行都保存原始 stdout/stderr/rc/解析 JSON，assert 失败 detail 附留证

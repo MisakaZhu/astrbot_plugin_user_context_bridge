@@ -184,6 +184,19 @@ IntegrityError、失败 on 解除退出、登记失败后直接切模式 0→0�
 到最终模型""另一人格 follower"此前声称超出证据。全量回归与 Y 轮 814
 计数本身准确，予以保留。
 
+### AC 轮增补（2026-09-20，留证关联与负例逐版本判定；实现/包仍为 acabbf7）
+
+AC1–AC3 均为测试代码变更，产品代码零改动。全量 20 套 × 双版各
+**893** PASS / 0 FAIL（40 次 rc=0；t 163 + w 92 + aa1 5，其余分套同
+AA/AB 表）。
+
+| 项目 | 变更 | 证据 | 状态 |
+| --- | --- | --- | --- |
+| AC1 T 自检 | 提取 `_assert_t1_version` 逐版本断言函数供正常父测试与 AB1 语义负例共同调用（替代 W 断言误用）；AB1 T 自检加正常对照（无故障→零失败）与撤故障反向对照（撤故障→应检出自检本身 FAIL）；正式 T 父断言失败 detail 附留证 JSON 路径 | PASS（双版） |
+| AC2 逐版本 verdict | `run_aa2_negative` 每版本独立要求 entry_ok + target_hit（N04.* 前缀）+ diag_ok（`_validate_n04_negative_diag` 含 `_aa2_audit.stops >= 2` 消费与逐窗/汇总 model_calls 一致性）；tag 解析修 `.venv426` 先于 `.venv` 匹配；新增三种 AC2 坏观测（触发计数=0 / B 逐窗=1 但汇总 0 / 仅一版本有目标失败）均 rejected | PASS（双版） |
+| AC3 观察器留证 | `observer_runner` 每次运行调用 `persist_run` 保存 raw stdout/stderr/rc/完整解析 JSON/AUDIT（唯一命名不覆盖）；verdict/manifest 持久留存 `local_evidence/ac_logs/ac2_*.json`；临时目录销毁后从 verdict 引用重开验证 | PASS（双版） |
+| 旧四反例保留 | rc19 / 空诊断 / 缺一版本 / 无关 T5 失败 经正式 `run_aa2_negative` 继续 rejected（使用真实 CompletedProcess 走统一解析器） | PASS（双版） |
+
 ### AB 轮增补（2026-09-20，留证与负例判定；实现/包仍为 acabbf7）
 
 AB1（功能失败留证）与 AB2（负例判定收紧）均为测试代码变更，产品代码

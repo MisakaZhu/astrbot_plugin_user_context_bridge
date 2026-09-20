@@ -17,6 +17,14 @@
 
 ### 版本与包
 
+- **AC 轮（2026-09-20）**：AC1 T 自检改用 `_assert_t1_version` 正式
+  断言（W 断言误用已更正）+ 正常对照/撤故障反向对照 + 正式 T 失败
+  detail 附留证路径；AC2 `run_aa2_negative` 逐版本独立 verdict
+  （target_hit/diag_ok/no_collateral 均按 .venv/.venv426 独立判定）+
+  `_aa2_audit` 消费 + 逐窗/汇总一致性 + 三种新坏观测反向检验均
+  rejected；AC3 observer_runner persist_run 落盘 + verdict manifest
+  + 重开验证。正式全量 20 套 × 双版各 **893** PASS / 0 FAIL。
+  HEAD 见 git log；
 - **AB 轮（2026-09-20）**：AB1 功能失败留证（persist_run 每次运行
   都保存 + assert 失败 detail 附留证路径 + AB1 验证覆盖 语义/缺失/
   rc19/正常对照）+ AB2 负例判定收紧（run_aa2_negative 要求 target_hit
