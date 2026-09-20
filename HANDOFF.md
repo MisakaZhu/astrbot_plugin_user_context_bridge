@@ -17,6 +17,11 @@
 
 ### 版本与包
 
+- **AB 轮（2026-09-20）**：AB1 功能失败留证（persist_run 每次运行
+  都保存 + assert 失败 detail 附留证路径 + AB1 验证覆盖 语义/缺失/
+  rc19/正常对照）+ AB2 负例判定收紧（run_aa2_negative 要求 target_hit
+  + no_collateral + diag_ok；四种坏观测反向检验均 rejected）。HEAD 见
+  git log；
 - **AA 轮（2026-09-20）**：测试稳定性与留证收尾。HEAD 见 git log；
   **运行实现/包仍为 acabbf7**（ZIP 原字节保持，SHA-256
   `c21956febfda41e3baeb0b611734c9b907ea060fc8583aeb1ad3491e18aad728`
@@ -41,7 +46,7 @@
 - 稳定性（事先固定次数，全结果保留
   `local_evidence/aa_logs/stability/`）：T1 worker 与 W 套件各双版 3 次
   独立目录，12/12 正常（T1 n04_model_calls 均 [1,1,1]；W 均 78/0）。
-- 正式全量：20 套 × 双版各 **863** PASS / 0 FAIL（40 次 rc=0；新增
+- 正式全量：20 套 × 双版各 **882** PASS / 0 FAIL（40 次 rc=0；AB 后含 t 152 + w 92 + aa1 5；
   aa1_event_key_check 5 项/版），日志 local_evidence/y_logs/。
 
 - **本轮（Z1–Z3）交付提交 acabbf7**；候选包

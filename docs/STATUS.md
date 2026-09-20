@@ -1,4 +1,12 @@
-## 当前：0.7.0 Z1–Z3 + AA1–AA2 收尾完成（待 Codex 复验 MIS-170）
+## 当前：0.7.0 Z1–Z3 + AA1–AA2 + AB1–AB2 收尾完成（待 Codex 复验 MIS-170）
+
+- **AB 轮（2026-09-20）**：AB1 功能失败留证（persist_run 每次 worker
+  运行都保存原始 stdout/stderr/rc/解析 JSON，assert 失败 detail 附留证
+  路径，AB1 验证覆盖正常对照/功能翻假/字段缺失/rc19 不倒退）+ AB2
+  负例判定收紧（run_aa2_negative 要求 detected+target_hit+no_collateral
+  +diag_ok；四种 Codex 坏观测反向检验均 rejected；真实 stop/
+  provider-raise 负例 accepted）。产品代码零改动。
+
 
 - **AA 轮（2026-09-20）**：测试稳定性与留证收尾，运行实现/包仍为
   acabbf7（ZIP 原字节，SHA 复核一致）。消除夹具消息 ID 地址复用缺陷

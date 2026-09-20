@@ -677,14 +677,26 @@ def _run_s6_worker(venv, td, *, observer=None, fault="none", zip_arg=None):
     env["PYTHONPATH"] = str(repo)
     r = worker_result.safe_run(cmd, env=env, cwd=str(repo), timeout=240)
     out = worker_result.read_worker_result(r)
+    ev = worker_result.persist_run("s6_plugin_lifecycle_worker",
+                                   Path(venv).name, r, out)
+    out["_evidence_log"] = ev["log"]
+    out["_evidence_json"] = ev["json"]
     if "__error__" in out:
-        out["__error__"] += "（失败留证：" + worker_result.persist_failure(
-            "s6_plugin_lifecycle_worker", r, out) + "）"
+        out["__error__"] += "（留证：" + ev["json"] + "）"
     return out
 
 
 def assert_s6_fields(tag: str, out: dict, *, check=check) -> None:
-    """S6 字段断言（X6：故障注入直接调用本函数，不复制断言）。"""
+    """S6 字段断言（X6：故障注入直接调用本函数，不复制断言）。
+
+    AB1：失败 detail 自动附留证 JSON 路径。
+    """
+    _impl = check
+
+    def check(name, cond, detail=""):  # 屏蔽参数名：本地留证包装
+        if not cond and out.get("_evidence_json"):
+            detail = f"{detail} [留证:{out['_evidence_json']}]".strip()
+        _impl(name, cond, detail)
 
     if "__error__" in out:
         check(f"S6.{tag}.lifecycle", False, out["__error__"])

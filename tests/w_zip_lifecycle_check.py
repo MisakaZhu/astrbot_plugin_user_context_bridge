@@ -134,9 +134,12 @@ def _run_zip_worker(venv: str, inst: Path, zip_path) -> dict:
         env=env, cwd=str(REPO), timeout=240,
     )
     out = worker_result.read_worker_result(r)
+    ev = worker_result.persist_run("w_zip_lifecycle_worker",
+                                   Path(venv).name, r, out)
+    out["_evidence_log"] = ev["log"]
+    out["_evidence_json"] = ev["json"]
     if "__error__" in out:
-        out["__error__"] += "（失败留证：" + worker_result.persist_failure(
-            "w_zip_lifecycle_worker", r, out) + "）"
+        out["__error__"] += "（留证：" + ev["json"] + "）"
     return out
 
 

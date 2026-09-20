@@ -77,8 +77,11 @@ def main() -> int:
         class AA2RaisingProvider(fakes_mod.FakeProvider):
             async def text_chat(self, *args, **kwargs):
                 # 仅对 N04 USER-MODE 窗口抛真实异常（Runner 以 contexts
-                # 传参、无 prompt kwarg）；前面 persona 场景保持原语义
+                # 传参、无 prompt kwarg）；先记 call_log 再抛——模型调用
+                # 计数即"异常边界确实到达"的证据；前面 persona 场景
+                # 保持原语义
                 if "USER-MODE-" in str(kwargs.get("contexts") or ""):
+                    self.call_log.append({"aa2_boundary": "provider-raise"})
                     raise RuntimeError("aa2 注入模型调用真实异常")
                 return await super().text_chat(*args, **kwargs)
 

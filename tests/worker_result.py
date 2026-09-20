@@ -95,30 +95,34 @@ def read_worker_result(completed) -> dict:
     return parsed
 
 
-def persist_failure(where: str, completed, parsed) -> str:
-    """AA2：失败 worker 留证——把原始 stdout/stderr、返回码与解析后的
-    结果 JSON 写入 local_evidence/worker_failures/（临时目录清理后仍可
-    追溯），返回证据文件路径。调用方把路径并入 __error__ 信息。"""
+_PERSIST_SEQ = __import__("itertools").count(1)
+
+
+def persist_run(where: str, tag: str, completed, parsed) -> dict:
+    """AB1：**每次** worker 运行都保存原始 stdout/stderr、rc 与解析后
+    的结果 JSON 到 local_evidence/worker_evidence/<time>_<where>_<tag>/
+    （唯一命名不互相覆盖；临时目录清理后仍可追溯）。返回
+    {"log": 路径, "json": 路径}。功能字段失败与入口错误同样留证。"""
 
     from datetime import datetime
 
     out_dir = Path(__file__).resolve().parent.parent / "local_evidence" / (
-        "worker_failures")
+        "worker_evidence")
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%H%M%S%f")
-    base = out_dir / f"{stamp}_{Path(where).stem}"
+    sub = out_dir / f"{stamp}-{next(_PERSIST_SEQ):04d}-{Path(where).stem}-{tag}"
     stdout = getattr(completed, "stdout", "") or ""
     stderr = getattr(completed, "stderr", "") or ""
     rc = getattr(completed, "returncode", None)
-    log_path = base.with_suffix(".log")
+    log_path = sub.with_suffix(".log")
     log_path.write_text(
         f"returncode={rc}\n===STDOUT===\n{stdout}\n===STDERR===\n{stderr}\n",
         encoding="utf-8",
         errors="replace",
     )
-    json_path = base.with_suffix(".json")
+    json_path = sub.with_suffix(".json")
     json_path.write_text(
         json.dumps(parsed, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
-    return str(json_path.name)
+    return {"log": str(log_path), "json": str(json_path)}

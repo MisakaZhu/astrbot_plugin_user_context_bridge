@@ -52,9 +52,13 @@ def _run_worker(venv: str, td: str, *, observer: str | None = None,
         cmd, env=env, cwd=str(REPO), timeout=300,
     )
     out = worker_result.read_worker_result(r)
+    ev = worker_result.persist_run("w_lifecycle_worker",
+                                   Path(venv).name,
+                                   r, out)
+    out["_evidence_log"] = ev["log"]
+    out["_evidence_json"] = ev["json"]
     if "__error__" in out:
-        out["__error__"] += "（失败留证：" + worker_result.persist_failure(
-            "w_lifecycle_worker", r, out) + "）"
+        out["__error__"] += "（留证：" + ev["json"] + "）"
     return out
 
 
@@ -79,7 +83,17 @@ def _validate_worker_output(result, td: Path) -> dict:
 
 
 def assert_worker_fields(tag: str, out: dict, *, check=check) -> None:
-    """对 worker 结果逐字段断言。check 参数可替换（故障注入用）。"""
+    """对 worker 结果逐字段断言。check 参数可替换（故障注入用）。
+
+    AB1：失败 detail 自动附留证 JSON 路径（含 RA/RF 分项、原始
+    stdout/stderr 的持久副本），可据路径重开核验。
+    """
+    _impl = check
+
+    def check(name, cond, detail=""):  # 屏蔽参数名：本地留证包装
+        if not cond and out.get("_evidence_json"):
+            detail = f"{detail} [留证:{out['_evidence_json']}]".strip()
+        _impl(name, cond, detail)
 
     if "__error__" in out:
         check(f"W1.{tag}.worker-runs", False, out["__error__"])
@@ -354,6 +368,144 @@ def fault_injection_real_paths() -> None:
         )
 
 
+class _FakeCompleted:
+    def __init__(self, rc, stdout, stderr=""):
+        self.returncode = rc
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def ab1_semantic_doctor(good: dict, doctor, label: str, need: tuple) -> None:
+    """AB1：经正式 _run_worker（safe_run 边界注入合法但语义错误的结果）
+    与正式 assert_worker_fields 验证：FAIL 且留证 JSON 重开可定位分项。"""
+
+    import json as _json
+
+    from tests import worker_result as wr
+
+    venv = r"D:\第三方插件完善\.venv"
+    doctored = doctor(dict(good))
+    line = "@@RESULT@@" + _json.dumps(doctored, ensure_ascii=False) + "\n"
+    with patch.object(wr, "safe_run",
+                      return_value=_FakeCompleted(0, line)):
+        read = _run_worker(venv, "synthetic-td-" + label)
+    lf: list = []
+    located = False
+    detail_hit = ""
+
+    def lc(n, cond, detail=""):
+        nonlocal located, detail_hit
+        if not cond:
+            lf.append((n, detail))
+
+    assert_worker_fields("AB1", read, check=lc)
+    check(f"{label}-detected", bool(lf), f"lf={lf[:3]}")
+    ev_json = read.get("_evidence_json")
+    reopened_ok = False
+    if ev_json and Path(ev_json).is_file():
+        reopened = _json.loads(Path(ev_json).read_text(encoding="utf-8"))
+        reopened_ok = isinstance(reopened, dict)
+        for f in need:
+            if f in reopened:
+                located = True
+                detail_hit += f" {f}={str(reopened[f])[:60]}"
+    check(f"{label}-evidence-locates-fields",
+          located or (need == () and reopened_ok),
+          f"ev_json={ev_json} need={need} hit={detail_hit}")
+
+
+def ab1_evidence_persistence_check() -> None:
+    """AB1：功能断言失败/必要字段缺失/rc19 的留证完整性。
+
+    经正式 _run_worker（真实运行或其真实 safe_run 边界注入）与正式
+    assert_worker_fields 验证：正常对照通过且证据存在可重开；功能字段
+    翻假与必要字段缺失均 FAIL 且留证 JSON 重开可定位 RA/RF 分项；rc19
+    留证不倒退。唯一命名不互相覆盖。
+    """
+
+    import json as _json
+
+    from tests import worker_result as wr
+
+    venv = r"D:\第三方插件完善\.venv"
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        good = _run_worker(venv, td)
+    if "__error__" in good:
+        check("AB1.baseline", False, good["__error__"])
+        return
+    check("AB1.baseline", True)
+
+    def verify_evidence(out: dict, need_fields: tuple) -> None:
+        ev_log = out.get("_evidence_log")
+        ev_json = out.get("_evidence_json")
+        files_ok = (bool(ev_log) and bool(ev_json)
+                    and Path(ev_log).is_file() and Path(ev_json).is_file())
+        check("AB1.evidence-files-exist", files_ok,
+              f"log={ev_log} json={ev_json}")
+        if not files_ok:
+            return
+        raw = Path(ev_log).read_text(encoding="utf-8", errors="replace")
+        check("AB1.evidence-raw-kept",
+              "returncode=" in raw and "@@RESULT@@" in raw,
+              f"raw-head={raw[:100]}")
+        reopened = _json.loads(Path(ev_json).read_text(encoding="utf-8"))
+        check("AB1.evidence-json-reopenable",
+              isinstance(reopened, dict) and len(reopened) >= 5,
+              f"keys={list(reopened)[:8]}")
+        for f in need_fields:
+            check(f"AB1.evidence-keeps-{f}", f in reopened, f"missing={f}")
+
+    # 1) 正常对照：通过且证据齐全（含 RA/RF 分项）
+    lf: list = []
+
+    def lc(n, cond, detail=""):
+        if not cond:
+            lf.append((n, detail))
+
+    assert_worker_fields("AB1", good, check=lc)
+    check("AB1.normal-control-passes", not lf, f"lf={lf[:3]}")
+    verify_evidence(good, ("single_on_RA", "single_on_RF",
+                           "single_on_cmd_head"))
+
+    # 2) 功能字段翻假（保留 RA/RF 详情）
+    def flip(d):
+        d["single_on_releases_only_that"] = False
+        return d
+
+    ab1_semantic_doctor(good, flip, "AB1.semantic-flip",
+                        ("single_on_RA", "single_on_RF",
+                         "single_on_cmd_head"))
+
+    # 3) 必要字段缺失
+    def drop(d):
+        d.pop("load_ok", None)
+        return d
+
+    ab1_semantic_doctor(good, drop, "AB1.missing-field", ())
+
+    # 4) rc19 留证不倒退
+    good_line = "@@RESULT@@" + _json.dumps(good, ensure_ascii=False) + "\n"
+    with patch.object(wr, "safe_run",
+                      return_value=_FakeCompleted(19, good_line,
+                                                  "injected")):
+        read = _run_worker(venv, "synthetic-td-rc19")
+    lf2: list = []
+
+    def lc2(n, cond, detail=""):
+        if not cond:
+            lf2.append((n, detail))
+
+    assert_worker_fields("AB1", read, check=lc2)
+    check("AB1.rc19-detected", "__error__" in read and bool(lf2),
+          f"read={str(read)[:120]}")
+    ev_log = read.get("_evidence_log")
+    check("AB1.rc19-evidence-kept-rc",
+          bool(ev_log) and Path(ev_log).is_file()
+          and "returncode=19" in Path(ev_log).read_text(
+              encoding="utf-8", errors="replace"),
+          f"log={ev_log}")
+
+
 def main() -> int:
     for venv in (
         r"D:\第三方插件完善\.venv",
@@ -365,6 +517,7 @@ def main() -> int:
             assert_worker_fields(tag, out)
     fault_injection_calls_parent()
     fault_injection_real_paths()
+    ab1_evidence_persistence_check()
     print(f"\n=== W 生命周期回归：PASS={len(PASS)} FAIL={len(FAIL)} ===")
     if FAIL:
         print("失败项：", FAIL)

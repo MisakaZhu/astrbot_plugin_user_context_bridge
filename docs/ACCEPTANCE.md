@@ -184,6 +184,18 @@ IntegrityError、失败 on 解除退出、登记失败后直接切模式 0→0�
 到最终模型""另一人格 follower"此前声称超出证据。全量回归与 Y 轮 814
 计数本身准确，予以保留。
 
+### AB 轮增补（2026-09-20，留证与负例判定；实现/包仍为 acabbf7）
+
+AB1（功能失败留证）与 AB2（负例判定收紧）均为测试代码变更，产品代码
+（uctx_bridge/）零改动。全部 20 套 × 双版各 **882** PASS / 0 FAIL
+（40 次 rc=0；t 152 + w 92 + aa1 5，其余分套同 AA 表）。
+
+| 项目 | 变更 | 证据 | 状态 |
+| --- | --- | --- | --- |
+| AB1 留证 | `worker_result.persist_run` 每次 worker 运行都保存原始 stdout/stderr/rc 与解析 JSON（唯一命名不覆盖）；三个 assert 函数失败 detail 自动附留证 JSON 路径；AB1 验证（W 套件 ab1_* 断言 + T 套件 AB1.t-semantic-*）覆盖 正常对照 / 功能字段翻假 / 必要字段缺失 / rc19 不倒退 | PASS（双版） |
+| AB2 负例判定 | `run_aa2_negative` 正式判定要求 detected + target_hit（仅 N04.* 前缀失败）+ no_collateral（无无关 T5/入口失败）+ diag_ok（双版 `_validate_n04_negative_diag` 每窗有意义校验）；正常对照通过；两种真实负例（stop / provider-raise） accepted；四种坏观测（rc19 合法负例 / 空数组诊断 / 缺一版本 / N04 正常但无关 T5 失败）反向检验均 rejected | PASS（双版） |
+| AB2 反向 | Codex 四种坏观测在新判定下全部 rejected（local_evidence/ab_logs/ab2_bad*.json），真实负例对照 accepted（ab2_stop-good / ab2_provider-raise-good） | PASS（双版） |
+
 ### AA 轮增补（2026-09-20，测试稳定性与留证；实现/包仍为 acabbf7）
 
 夹具缺陷与修复（AA1）：
