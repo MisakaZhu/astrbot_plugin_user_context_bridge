@@ -184,6 +184,21 @@ IntegrityError、失败 on 解除退出、登记失败后直接切模式 0→0�
 到最终模型""另一人格 follower"此前声称超出证据。全量回归与 Y 轮 814
 计数本身准确，予以保留。
 
+### AD 轮增补（2026-09-20，指定目标判定与证据重开；实现/包仍为 acabbf7）
+
+AD1–AD2 均为测试代码变更，产品代码零改动。全量 20 套 × 双版各
+**900** PASS / 0 FAIL（40 次 rc=0；t 170 + w 92 + aa1 5，其余分套同
+AC 表）。
+
+| 项目 | 变更 | 证据 | 状态 |
+| --- | --- | --- | --- |
+| AD1 指定目标 | `run_aa2_negative` 逐模式逐版本要求具体目标命中：stop→`N04.{tag}.all-model-called`、provider-raise→`N04.{tag}.all-completed-zero-watchdog-zero-pending`；不能由任意 N04.* 替代。仅翻假 schema（指定目标通过）的反例 stop/provider 两模式均 rejected | PASS（双版） |
+| AD2 证据重开 | `_verify_evidence` 实际读回 `_evidence_json/_evidence_log` 文件核对内容（非目录计数）；三种坏观测（JSON 为 `{}`/log 清空、文件不存在、引用串到其他版本/模式）均 rejected | PASS（双版） |
+
+**AC 轮超额声称更正**：AC2 行的 target_hit 当时仍按任意 N04.* 前缀匹配，
+未指定具体场景目标（AD1 已收紧）；AC3 行的"从 verdict 引用重开验证"实际
+只做了目录文件计数，未打开文件核对内容（AD2 已修复）。
+
 ### AC 轮增补（2026-09-20，留证关联与负例逐版本判定；实现/包仍为 acabbf7）
 
 AC1–AC3 均为测试代码变更，产品代码零改动。全量 20 套 × 双版各

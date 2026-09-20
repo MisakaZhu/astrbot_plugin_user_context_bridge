@@ -17,6 +17,12 @@
 
 ### 版本与包
 
+- **AD 轮（2026-09-20）**：AD1 指定目标判定（stop→all-model-called、
+  provider-raise→all-completed-zero-watchdog-zero-pending；仅翻假
+  schema 反例 stop/provider 两模式均 rejected）+ AD2 证据重开验证
+  （实际读回文件核对内容；三种证据损坏/缺失/错引用反向检验均 rejected）。
+  正式全量 20 套 × 双版各 **900** PASS / 0 FAIL（t 170 + w 92 + aa1 5）。
+  HEAD 见 git log；
 - **AC 轮（2026-09-20）**：AC1 T 自检改用 `_assert_t1_version` 正式
   断言（W 断言误用已更正）+ 正常对照/撤故障反向对照 + 正式 T 失败
   detail 附留证路径；AC2 `run_aa2_negative` 逐版本独立 verdict

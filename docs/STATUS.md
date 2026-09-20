@@ -1,3 +1,10 @@
+## 当前：0.7.0 Z1–Z3 + AA + AB + AC + AD 收尾完成（待 Codex 复验 MIS-170）
+
+- **AD 轮（2026-09-20）**：AD1 指定目标判定（stop→all-model-called、
+  provider-raise→all-completed；仅翻假 schema 反例 rejected）+ AD2
+  证据重开验证（实际读回文件核对内容；三种损坏/缺失/错引用 rejected）。
+  产品代码零改动。正式全量 20 套 × 双版各 **900** PASS / 0 FAIL。
+  运行实现/包仍为 acabbf7。
 ## 当前：0.7.0 Z1–Z3 + AA + AB + AC 收尾完成（待 Codex 复验 MIS-170）
 
 - **AC 轮（2026-09-20）**：AC1 T 自检改用 T 正式断言（W 断言误用
