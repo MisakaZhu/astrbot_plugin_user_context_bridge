@@ -133,7 +133,11 @@ def _run_zip_worker(venv: str, inst: Path, zip_path) -> dict:
         [venv + r"\Scripts\python.exe", worker, str(inst), str(zip_path)],
         env=env, cwd=str(REPO), timeout=240,
     )
-    return worker_result.read_worker_result(r)
+    out = worker_result.read_worker_result(r)
+    if "__error__" in out:
+        out["__error__"] += "（失败留证：" + worker_result.persist_failure(
+            "w_zip_lifecycle_worker", r, out) + "）"
+    return out
 
 
 def zip_entry_fault_injection(zip_path) -> None:

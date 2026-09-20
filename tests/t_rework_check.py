@@ -431,7 +431,11 @@ def _run_worker(script: str, extra_args: list[str] | None = None):
                 timeout=300,
             )
             tag = Path(venv).name
-            results[tag] = worker_result.read_worker_result(r)
+            parsed = worker_result.read_worker_result(r)
+            if "__error__" in parsed:
+                parsed["__error__"] += "（失败留证：" + (
+                    worker_result.persist_failure(script, r, parsed) + "）")
+            results[tag] = parsed
     return results
 
 
@@ -576,6 +580,99 @@ def n04_tools_fault_injection() -> None:
     del FAIL[before_fail:]
     check("Z3.n04-tools-drop-detected", detected,
           "expect_fail=True detected=%s" % detected)
+
+
+def n04_diag_negative_injection() -> None:
+    """AA2：受控无调用（真实请求钩子停止）与真实异常（provider 抛错）
+    两种负例经正式 t1_t5_t6_workers 必须 FAIL；worker 输出含每窗机器
+    可读诊断（不虚 PASS、不二次 KeyError），完整输出留存证据目录。"""
+
+    real_run_worker = _run_worker
+    evidence_dir = Path(__file__).resolve().parent.parent / (
+        "local_evidence") / "aa_logs"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+
+    def observer_run_worker(script: str, extra_args=None):
+        if script != "t1_persona_worker.py":
+            return real_run_worker(script, extra_args)
+        raise AssertionError("mode must be bound via make_runner")
+
+    def make_runner(mode: str):
+        collected: dict = {}
+
+        def runner(script: str, extra_args=None):
+            if script != "t1_persona_worker.py":
+                return real_run_worker(script, extra_args)
+            results = {}
+            repo = Path(__file__).resolve().parent.parent
+            observer = str(Path(__file__).resolve().parent / (
+                "aa2_n04_diag_observer.py"))
+            for venv in (r"D:\第三方插件完善\.venv",
+                         r"D:\第三方插件完善\.venv426"):
+                tag = Path(venv).name
+                with tempfile.TemporaryDirectory(
+                        ignore_cleanup_errors=True) as td:
+                    env = dict(os.environ)
+                    env.update({
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                        "PYTHONIOENCODING": "utf-8",
+                        "PYTHONPATH": str(repo),
+                    })
+                    r = subprocess.run(
+                        [venv + r"\Scripts\python.exe", "-X", "utf8",
+                         observer, td, mode],
+                        capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", env=env, cwd=str(repo),
+                        timeout=300,
+                    )
+                    line = next(
+                        (l for l in r.stdout.splitlines()
+                         if l.startswith("@@RESULT@@")), None)
+                    parsed = (json.loads(line[len("@@RESULT@@"):])
+                              if line else None)
+                    # AA2.4：完整 worker 输出持久留存（含诊断字段值）
+                    (evidence_dir / (
+                        f"aa2_{mode}_{tag}.log")).write_text(
+                        r.stdout + "\n===STDERR===\n" + r.stderr,
+                        encoding="utf-8", errors="replace")
+                    if parsed is not None:
+                        collected[tag] = parsed
+                        (evidence_dir / (
+                            f"aa2_{mode}_{tag}.json")).write_text(
+                            json.dumps(parsed, ensure_ascii=False,
+                                       indent=2, default=str),
+                            encoding="utf-8")
+                    results[tag] = parsed if parsed is not None else {
+                        "__error__": f"observer rc={r.returncode}: "
+                        + (r.stderr or r.stdout)[-300:]
+                    }
+            return results
+        return runner, collected
+
+    for mode in ("stop", "provider-raise"):
+        before_pass, before_fail = len(PASS), len(FAIL)
+        runner, outs = make_runner(mode)
+        with patch.object(sys.modules[__name__], "_run_worker", runner):
+            t1_t5_t6_workers()
+        detected = len(FAIL) > before_fail
+        # 诊断字段完整性：负例 worker 必须输出窗口诊断而非二次崩溃
+        diag_ok = bool(outs) and all(
+            isinstance(o, dict) and "n04_window_diagnostics" in o
+            and "n04_model_calls" in o
+            for o in outs.values()
+        )
+        del PASS[before_pass:]
+        del FAIL[before_fail:]
+        check(
+            f"AA2.{mode}-negative-detected",
+            detected,
+            f"expect_fail=True detected={detected}",
+        )
+        check(
+            f"AA2.{mode}-diagnostics-preserved",
+            diag_ok,
+            f"diag_ok={diag_ok} tags={sorted(outs)}",
+        )
 
 
 def t1_t5_t6_workers() -> None:
@@ -965,6 +1062,7 @@ async def main() -> int:
     t1_t5_t6_workers()
     worker_entry_fault_injection()
     n04_tools_fault_injection()
+    n04_diag_negative_injection()
     print(f"\n=== T1~T6 返工回归：PASS={len(PASS)} FAIL={len(FAIL)} ===")
     if FAIL:
         print("失败项：", FAIL)

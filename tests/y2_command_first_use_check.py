@@ -41,7 +41,11 @@ def _run_worker(venv: str, td: str) -> dict:
         cwd=str(REPO),
         timeout=300,
     )
-    return worker_result.read_worker_result(r)
+    out = worker_result.read_worker_result(r)
+    if "__error__" in out:
+        out["__error__"] += "（失败留证：" + worker_result.persist_failure(
+            "y2_command_first_use_worker", r, out) + "）"
+    return out
 
 
 def assert_y2_fields(tag: str, out: dict, *, check=check) -> None:

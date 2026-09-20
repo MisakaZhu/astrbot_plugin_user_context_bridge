@@ -51,7 +51,11 @@ def _run_worker(venv: str, td: str, *, observer: str | None = None,
     r = worker_result.safe_run(
         cmd, env=env, cwd=str(REPO), timeout=300,
     )
-    return worker_result.read_worker_result(r)
+    out = worker_result.read_worker_result(r)
+    if "__error__" in out:
+        out["__error__"] += "（失败留证：" + worker_result.persist_failure(
+            "w_lifecycle_worker", r, out) + "）"
+    return out
 
 
 def _validate_worker_output(result, td: Path) -> dict:

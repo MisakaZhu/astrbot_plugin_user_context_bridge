@@ -293,13 +293,34 @@ async def main() -> int:
             )
             from astrbot.core.pipeline.scheduler import PipelineScheduler
 
-            stopped = await call_event_hook(
-                ev, EventType.OnLLMRequestEvent, req
-            )
-            info = {"hook_stopped": bool(stopped or ev.is_stopped())}
+            # AA2：请求钩子真实异常也要留完整栈——不得让报告生成阶段
+            # 二次抛错吞掉原始证据
+            import traceback as _tb
+
+            info: dict = {}
+            try:
+                stopped = await call_event_hook(
+                    ev, EventType.OnLLMRequestEvent, req
+                )
+            except BaseException as exc:  # noqa: BLE001
+                info["hook_error"] = {
+                    "type": type(exc).__name__,
+                    "message": str(exc)[:200],
+                    "traceback": _tb.format_exc(),
+                }
+                info["hook_stopped"] = False
+                info["outcome"] = "hook-exception"
+                info["model_calls"] = 0
+                info["event_stopped"] = ev.is_stopped()
+                return info
+            info["hook_stopped"] = bool(stopped or ev.is_stopped())
+            info["event_stopped"] = ev.is_stopped()
             if info["hook_stopped"]:
+                # 如实记"停止"：无异常的主动停止不虚构 pipeline_error
+                info["outcome"] = "hook-stopped"
                 info["model_calls"] = 0
                 return info
+            info["outcome"] = "ran"
             runner = ToolLoopAgentRunner()
             await runner.reset(
                 provider=provider,
@@ -352,6 +373,12 @@ async def main() -> int:
                     f"{type(exc).__name__}: {exc}"[:300]
                 )
             info["model_calls"] = len(provider.call_log)
+            # Runner 会把 provider 异常内部消化为错误响应（不在边界抛出）
+            # ——记录每窗最终响应文本，保证错误可见（AA2）
+            _resp = runner.get_final_llm_resp()
+            info["final_text_head"] = (
+                (_resp.completion_text or "")[:160] if _resp is not None
+                else "")
             return info
 
         async def drive_user_window(label, answer, persona_default,
@@ -440,8 +467,9 @@ async def main() -> int:
         # 恰好一次、动态注入到达模型；不含旧人格 system/开场白；后继窗口
         # 含前一窗口完整问答；动态临时内容不落共享账本。
         def _model_view(log):
+            # AA2：空调用/停止时 log 为 {}——不得因生成报告再抛 KeyError
             parts = [log.get("system_prompt") or ""]
-            for m in log["contexts"]:
+            for m in (log.get("contexts") or []):
                 if isinstance(m, dict) and m.get("role") == "system":
                     parts.append(str(m.get("content") or ""))
             return "\n".join(parts)
@@ -453,6 +481,11 @@ async def main() -> int:
         observed["n04_pipeline_errors"] = [
             info_a.get("pipeline_error"), info_b.get("pipeline_error"),
             info_c.get("pipeline_error")]
+        # AA2：每窗机器可读诊断（含受控停止与真实异常的完整栈）
+        observed["n04_window_diagnostics"] = [info_a, info_b, info_c]
+        for _w, _i in (("A", info_a), ("B", info_b), ("C", info_c)):
+            if _i.get("hook_error"):
+                observed[f"n04_hook_error_{_w}"] = _i["hook_error"]
         view_b = _model_view(log_b)
         view_c = _model_view(log_c)
         ctx_b = json.dumps(log_b.get("contexts") or [],

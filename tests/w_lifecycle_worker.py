@@ -413,12 +413,46 @@ async def main() -> int:
     # 原因才是继承——继承语义必须落实到 status 文本
     out["status_persona_inherited"] = "已退出" in st and "继承" in st
     # 单人格 on 只解除该人格
-    await command(plugin, FakeEvent(
+    on_text = await command(plugin, FakeEvent(
         sender_id="10001", group_id="700000001",
         message_str="/uctx on"), "on")
-    done, _ctx, _ev, cap_ra = await ask(plugin, "700000001", "RA-问", "RA-答")
-    done3, _ctx, _ev, cap_rf = await ask(plugin, "700000003", "RF-问", "RF-答")
-    out["single_on_releases_only_that"] = done is True and cap_ra == 1 and cap_rf == 0
+    out["single_on_cmd_head"] = on_text[:80]
+
+    async def ask_detail(obj, group, question, answer) -> dict:
+        """AA1：RA/RF 分项诊断——命令返回、done/captured/model_calls/
+        stopped、身份/事件键、同 event_key 此前是否已有终态。"""
+        ev = FakeEvent(sender_id="10001", group_id=group,
+                       message_str=question)
+        provider = FakeProvider([answer])
+        key = obj._bridge.event_key_for(ev)
+        db_path = (
+            instance_root / "data" / "plugin_data" / PLUGIN_DIR_NAME
+            / "uctx_ledger.db"
+        )
+        prior: list = []
+        with sqlite3.connect(db_path) as c:
+            prior = [r[0] for r in c.execute(
+                "SELECT status FROM turns WHERE event_key=?",
+                (key,)).fetchall()]
+        cap0 = obj._bridge.stats.captured
+        completed = await drive(ev, provider, question)
+        captured = obj._bridge.stats.captured - cap0
+        return {
+            "done": completed,
+            "captured": captured,
+            "model_calls": len(provider.call_log),
+            "stopped": ev.is_stopped(),
+            "event_key": key,
+            "prior_terminal_same_key": prior,
+        }
+
+    ra = await ask_detail(plugin, "700000001", "RA-问", "RA-答")
+    rf = await ask_detail(plugin, "700000003", "RF-问", "RF-答")
+    out["single_on_RA"] = ra
+    out["single_on_RF"] = rf
+    out["single_on_releases_only_that"] = (
+        ra["done"] is True and ra["captured"] == 1 and rf["captured"] == 0
+    )
 
     # -- Phase 7：配置变化时挂起 A + 排队 B（同基础身份，B 真实排队） --------
     from astrbot.core.utils.active_event_registry import active_event_registry

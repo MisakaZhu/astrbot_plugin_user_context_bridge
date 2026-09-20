@@ -184,6 +184,50 @@ IntegrityError、失败 on 解除退出、登记失败后直接切模式 0→0�
 到最终模型""另一人格 follower"此前声称超出证据。全量回归与 Y 轮 814
 计数本身准确，予以保留。
 
+### AA 轮增补（2026-09-20，测试稳定性与留证；实现/包仍为 acabbf7）
+
+夹具缺陷与修复（AA1）：
+
+- `tests/fakes.py` 的消息 ID 原为 `id(abm)`（对象地址，释放后可复用）。
+  Codex 探针 1,000 条仅 10 个唯一键（`fake_id_426/428.json`）。修复后
+  新消息使用进程内单调序号，显式 `message_id=` 覆盖保留给真正的重复
+  投递用例；S1 重复投递用例本就以同一事件对象复用原 ID，语义未变。
+- 新增 `tests/aa1_event_key_check.py`：修复前双版基线同窗 199/200、
+  跨窗 197/200 重复（`local_evidence/aa_logs/aa1_baseline_426|428_oldfakes.log`）；
+  修复后双版 5/5 PASS（`aa1_fixed_426|428.log`）。
+- W 单人格 on 场景（Phase 6）新增 RA/RF 分项诊断：命令返回、各自
+  done/captured/model_calls/stopped、事件键、同 event_key 此前终态。
+- 因果边界保持诚实：本次全量 W 失败的原始 RA/RF 分项未留存，**原
+  失败的确切原因未能证实**；本轮证实并消除的是夹具 ID 复用缺陷本身。
+
+诊断与留证（AA2）：
+
+- `t1_persona_worker` 的 `_model_view` 空调用不再二次 KeyError；每窗
+  机器可读诊断 `n04_window_diagnostics`（model_calls/hook_stopped/
+  event_stopped/outcome/pipeline_error/final_text_head），请求钩子真实
+  异常记 `hook_error`（完整栈）。受控停止如实记 `hook-stopped`，不虚构
+  pipeline_error；无调用仍由 `all-model-called` 等正式断言判 FAIL。
+- 负例经正式父入口验证（`aa2_n04_diag_observer.py`）：真实请求钩子
+  停止 USER-MODE-2/3（model_calls [1,0,0]）与 provider 真实抛错两种
+  负例均被正式 t1_t5_t6_workers 判 FAIL（AA2.*-negative-detected），
+  诊断字段完整（AA2.*-diagnostics-preserved），完整输出留存
+  `local_evidence/aa_logs/aa2_<mode>_<tag>.log/.json`。
+- 五个 worker 入口失败时自动留证 stdout/stderr/解析 JSON 到
+  `local_evidence/worker_failures/`（路径并入 __error__）。
+
+稳定性与全量（实现/包仍为 acabbf7，ZIP 原字节保持，SHA 复核一致）：
+
+- 固定次数稳定性（事先声明，全结果保留于
+  `local_evidence/aa_logs/stability/`）：T1 worker 与 W 套件各双版 3 次
+  独立目录运行，**12/12 全部正常**（T1 每次 rc=0、n04_model_calls
+  [1,1,1]、RESULT 行在；W 每次 78 PASS / 0 FAIL）。
+- 正式全量：**20 套 × 双版各 863 PASS / 0 FAIL**（40 次 rc=0；新增
+  aa1_event_key_check 5 项/版；w_lifecycle 双版 78/78——上一轮 426 的
+  W 失败未再现；分套其余同 v5 表：p0–p6 17/36/27/19/22/16/8 +
+  r/s/t 38/84/143 + n0–n3 10/30/14/59 + w_rework/w_zip 37/78 +
+  x 64 + y2 74）。N22 以显式路径+SHA 指定 acabbf7 包复跑
+  （s 84/0、w_zip 78/0）。
+
 全量回归（实现提交 **acabbf7**；候选包
 `astrbot_plugin_user_context_bridge-acabbf7.zip`，SHA-256
 `c21956febfda41e3baeb0b611734c9b907ea060fc8583aeb1ad3491e18aad728`；

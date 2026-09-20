@@ -17,6 +17,33 @@
 
 ### 版本与包
 
+- **AA 轮（2026-09-20）**：测试稳定性与留证收尾。HEAD 见 git log；
+  **运行实现/包仍为 acabbf7**（ZIP 原字节保持，SHA-256
+  `c21956febfda41e3baeb0b611734c9b907ea060fc8583aeb1ad3491e18aad728`
+  复核一致；tests/ 不在打包白名单内，故测试/文档提交不换包）。
+  N22 以显式路径+SHA 指定 acabbf7 包复跑：s 84/0、w_zip 78/0。
+- AA1：修复 `tests/fakes.py` 消息 ID 用 `id(abm)` 的地址复用缺陷——
+  新消息改用进程内单调序号，`message_id=` 显式覆盖保留给真正重复投递
+  用例（S1 同对象复用语义未变）。基线双版固化：同窗 199/200、跨窗
+  197/200 重复（`local_evidence/aa_logs/aa1_baseline_*_oldfakes.log`）；
+  修复后 `tests/aa1_event_key_check.py` 双版 5/5。**因果边界**：上一轮
+  426 W 套件 `single-on-releases-only-that` 失败的原始分项未留存，其
+  确切原因未证实；本轮证实并消除的是夹具缺陷本身。该场景现带 RA/RF
+  分项诊断（命令返回/done/captured/model_calls/stopped/事件键/同键
+  先前终态），若再失败可据实归因。
+- AA2：t1 `_model_view` 空调用不再二次 KeyError；新增
+  `n04_window_diagnostics`（model_calls/hook_stopped/event_stopped/
+  outcome/pipeline_error/final_text_head）与 `hook_error`（完整栈）；
+  受控停止如实记 hook-stopped 不虚构 pipeline_error；无调用仍判 FAIL。
+  负例经正式父入口（真实请求钩子停止 + provider 真实抛错）双版验证
+  检出且诊断字段完整。五入口失败自动留证 stdout/stderr/JSON 至
+  `local_evidence/worker_failures/`。
+- 稳定性（事先固定次数，全结果保留
+  `local_evidence/aa_logs/stability/`）：T1 worker 与 W 套件各双版 3 次
+  独立目录，12/12 正常（T1 n04_model_calls 均 [1,1,1]；W 均 78/0）。
+- 正式全量：20 套 × 双版各 **863** PASS / 0 FAIL（40 次 rc=0；新增
+  aa1_event_key_check 5 项/版），日志 local_evidence/y_logs/。
+
 - **本轮（Z1–Z3）交付提交 acabbf7**；候选包
   `astrbot_plugin_user_context_bridge-acabbf7.zip`（13 文件），
   SHA-256 `c21956febfda41e3baeb0b611734c9b907ea060fc8583aeb1ad3491e18aad728`；

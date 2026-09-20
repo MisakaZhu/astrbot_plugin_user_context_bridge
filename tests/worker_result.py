@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 RESULT_MARKER = "@@RESULT@@"
 
@@ -92,3 +93,32 @@ def read_worker_result(completed) -> dict:
             f"（{type(parsed).__name__}）: {payload[:200]}"
         }
     return parsed
+
+
+def persist_failure(where: str, completed, parsed) -> str:
+    """AA2：失败 worker 留证——把原始 stdout/stderr、返回码与解析后的
+    结果 JSON 写入 local_evidence/worker_failures/（临时目录清理后仍可
+    追溯），返回证据文件路径。调用方把路径并入 __error__ 信息。"""
+
+    from datetime import datetime
+
+    out_dir = Path(__file__).resolve().parent.parent / "local_evidence" / (
+        "worker_failures")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%H%M%S%f")
+    base = out_dir / f"{stamp}_{Path(where).stem}"
+    stdout = getattr(completed, "stdout", "") or ""
+    stderr = getattr(completed, "stderr", "") or ""
+    rc = getattr(completed, "returncode", None)
+    log_path = base.with_suffix(".log")
+    log_path.write_text(
+        f"returncode={rc}\n===STDOUT===\n{stdout}\n===STDERR===\n{stderr}\n",
+        encoding="utf-8",
+        errors="replace",
+    )
+    json_path = base.with_suffix(".json")
+    json_path.write_text(
+        json.dumps(parsed, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    return str(json_path.name)

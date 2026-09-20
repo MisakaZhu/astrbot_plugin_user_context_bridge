@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +38,7 @@ def make_message_obj(
     group_id: str = "",
     message_str: str = "你好",
     self_id: str = "bot_001",
+    message_id: str | None = None,
 ) -> AstrBotMessage:
     abm = AstrBotMessage()
     abm.type = (
@@ -45,11 +48,21 @@ def make_message_obj(
     abm.sender = MessageMember(user_id=sender_id, nickname=f"测试用户{sender_id[-2:]}")
     abm.group = Group(group_id=group_id) if group_id else None
     abm.message_str = message_str
-    abm.message_id = f"mock-msg-{sender_id}-{id(abm)}"
+    # 显式 message_id：供真正的重复投递测试复用同一 ID；默认分配见下。
+    abm.message_id = message_id or _next_mock_message_id(sender_id)
     abm.session_id = group_id or sender_id
     abm.raw_message = None
     abm.message = []
     return abm
+
+
+# AA1 修复：新合成消息使用进程内单调序号——不随对象释放而复用；
+# 真正的重复投递测试用 message_id= 显式覆盖复用同一 ID。
+_MOCK_MESSAGE_ID_SEQ = itertools.count(1)
+
+
+def _next_mock_message_id(sender_id: str) -> str:
+    return f"mock-msg-{sender_id}-{next(_MOCK_MESSAGE_ID_SEQ)}"
 
 
 class FakeEvent(AstrMessageEvent):
@@ -64,6 +77,7 @@ class FakeEvent(AstrMessageEvent):
         platform_id: str = "aiocqhttp",
         self_id: str = "bot_001",
         role: str = "member",
+        message_id: str | None = None,
     ) -> None:
         self.message_str = message_str
         self.message_obj = make_message_obj(
@@ -71,6 +85,7 @@ class FakeEvent(AstrMessageEvent):
             group_id=group_id,
             message_str=message_str,
             self_id=self_id,
+            message_id=message_id,
         )
         self.platform_meta = make_platform_meta(platform_id)
         message_type = (

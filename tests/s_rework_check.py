@@ -676,7 +676,11 @@ def _run_s6_worker(venv, td, *, observer=None, fault="none", zip_arg=None):
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONPATH"] = str(repo)
     r = worker_result.safe_run(cmd, env=env, cwd=str(repo), timeout=240)
-    return worker_result.read_worker_result(r)
+    out = worker_result.read_worker_result(r)
+    if "__error__" in out:
+        out["__error__"] += "（失败留证：" + worker_result.persist_failure(
+            "s6_plugin_lifecycle_worker", r, out) + "）"
+    return out
 
 
 def assert_s6_fields(tag: str, out: dict, *, check=check) -> None:
