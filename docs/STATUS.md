@@ -1,5 +1,16 @@
-## 当前：0.7.0 Z1–Z3 + AA + AB + AC + AD + AE 收尾完成（待 Codex 复验 MIS-170）
+## 当前：0.7.0 Z1–Z3 + AA + AB + AC + AD + AE + AF 收尾完成（待 Codex 复验 MIS-170）
 
+- **AF 轮（2026-09-21）**：AF1 完整对账——正式 writer
+  `persist_observation` 从本次 CompletedProcess 登记原始 AUDIT 行/
+  traceback 段数/stdout+stderr sha 与采集绑定；快照改完整核心
+  payload（含目标布尔）；provider 要求 raw traceback>=3 段。AF1.4
+  schema 合成观测经正式 writer 生成新一致证据（injected 标记）。
+  AF2.A 期望 tag/mode/capture_key 显式消费，全对象互换/错 tag/
+  mode=normal 绑定维度拒绝；AF2.B `manifest_closing_checks` 实际
+  解析 manifest 文件三方核对并沿引用正式读回，注入 {}/错元信息/
+  串路径收尾 FAIL、撤破坏通过。仅改 `tests/t_rework_check.py`。
+  正式全量 20 套 × 双版各 **915** PASS / 0 FAIL。实现/包仍为
+  acabbf7。
 - **AE 轮（2026-09-21）**：AE1 证据关联——`verify_run_evidence`
   正式共用读回（引用==写侧绑定、rc 行、log↔JSON 自洽、诊断/调用/
   AUDIT==本次调用侧快照、AUDIT mode 绑定、provider 真实
@@ -9,6 +20,11 @@
   rejected 三方留存；AE2.B AD1 循环按场景传正确 mode（provider
   场景不再错传 stop）。仅改 `tests/t_rework_check.py`。正式全量
   20 套 × 双版各 **1003** PASS / 0 FAIL。运行实现/包仍为 acabbf7。
+  **AF 轮更正**：AE 的 provider"真实栈"当时仅校验 final_text_head
+  摘要与保存 JSON，未对账 raw traceback；AUDIT 未与 raw 行对账；
+  schema 合成观测当时借用真实负例路径（证据不一致仍通过）；manifest
+  当时仅存在检查、字段取内存——四项均由 AF 轮修复。AE2 交换/撤交换
+  敏感性事实保留。
 - **AD 轮（2026-09-20）**：AD1 指定目标判定（stop→all-model-called、
   provider-raise→all-completed；仅翻假 schema 反例 rejected）+ AD2
   证据重开验证（实际读回文件核对内容；三种损坏/缺失/错引用 rejected）。

@@ -184,6 +184,68 @@ IntegrityError、失败 on 解除退出、登记失败后直接切模式 0→0�
 到最终模型""另一人格 follower"此前声称超出证据。全量回归与 Y 轮 814
 计数本身准确，予以保留。
 
+### AF 轮增补（2026-09-21，完整观测/原始日志对账与 manifest 读回；实现/包仍为 acabbf7）
+
+AF1–AF2 均为测试代码变更（仅 `tests/t_rework_check.py`），产品代码
+零改动。全量 20 套 × 双版各 **915** PASS / 0 FAIL（40 次 rc=0；
+t 185 + w 92 + s 84 + w_zip 78 + y2 74 + x 64 + n3 59 + r 38 +
+w_rework 37 + p1 36 + n1 30 + p2 27 + p4 22 + p3 19 + p0 17 + p5 16
++ n2 14 + n0 10 + p6 8 + aa1 5）。安装包 SHA-256 复核仍为
+`c21956fe…`（acabbf7 原字节）。
+
+**对 AE 文档的更正**（Codex 41 号报告复核结论）：provider 真实异常
+链并非 `final_text_head`（那只是一行转写错误摘要，真实 3 段
+traceback 在 raw 日志）；AE 的 AUDIT 校验只比 JSON 内字段、未与
+raw `@@AUDIT@@` 行对账；AE 的 schema 合成观测仍借用真实负例路径与
+绑定（证据不一致却 evidence_ok=true）；AE 的 manifest"读回"当时只
+做 is_file 存在检查、字段对比取自内存 saved_entries。AE2 真正通过
+的交换/撤交换敏感性事实保留。
+
+AF1 完整对账（`verify_run_evidence` 正式共用读回）：
+
+- 正式 writer `persist_observation` 从**本次 CompletedProcess** 登记
+  raw 摘要（stdout/stderr 段 sha256、原始 AUDIT 行、traceback 段数）
+  与采集绑定（tag/mode/capture_id/启动命令/injected 标记）入
+  `_run_binding`；预期来自调用侧，不从被检文件反推。
+- 快照改为**完整核心 payload**（去除路径/运行元信息，含全部目标布尔
+  值）；保存 JSON、raw RESULT、本次输入三方一致。
+- 原始 `@@AUDIT@@` 行必须存在、与写侧捕获行一致、可解析且 mode 绑定
+  本次场景（正常 T1 无 observer AUDIT 属正常形态）；rc 行继续核对。
+- provider-raise 要求本次 raw traceback >= 3 段且与捕获一致（摘要
+  不替代完整栈）；stdout/stderr 段 sha256 与本次捕获一致兜底。
+- 只改文件反例（功能输入不变、目标/诊断仍合格，拒绝全部来自证据
+  维度，note 指认具体键）：
+
+| 反例 | 拒绝理由（实测） |
+| --- | --- |
+| 删除原始 `@@AUDIT@@` 行 | 原始 AUDIT 行缺失或与本次捕获不一致 |
+| AUDIT 改 mode=normal/stops=0 | 同上（期望行 vs 实际行） |
+| 只删 raw traceback（保留 RESULT/AUDIT） | 原始 traceback 段数不符（本次 3，文件 0） |
+| 磁盘 JSON+RESULT 一起反转 stop `n04_all_model_called` | 完整 payload 不一致 diff_keys=['n04_all_model_called'] |
+| 磁盘 JSON+RESULT 一起反转 provider `n04_all_completed` | 完整 payload 不一致 diff_keys=['n04_all_completed'] |
+| AE 的诊断变空/空/缺文件反例 | 保留拒绝（AE1 已通过部分） |
+
+AF1.4 schema 合成观测：`schema_only_runner_factory` 改经正式 writer
+生成**新的、与该观测一致**的 JSON/log/AUDIT 与绑定（injected=True、
+独立 capture_id、provider 含 3 段标记栈），不再借用真实负例路径；
+保留正确 mode、entry_ok=true、diag_ok=true、evidence_ok=true、
+specific_target_hit=false，拒绝原因仍是指定目标缺失。
+
+AF2.A 版本/采集绑定：期望 tag/mode/capture_key 由调用侧显式传入并
+消费校验 `_run_binding`；一次真实捕获登记唯一 capture_id（注册表
+按 key 归档，绑定含启动命令），多个注入场景复用同次采集、各有唯一
+verdict/manifest ID。实测拒绝：两版整个结果对象互换（含绑定与文件，
+两版均"写侧 tag 与预期不符"）；单版错 tag `unrelated-host`；stop
+写侧 mode=normal——均绑定维度拒绝，未改版本保持证据合格。
+
+AF2.B manifest 实际读回：`manifest_closing_checks` 正式收尾打开并
+解析 manifest_path 文件内容，与调用侧预期及 verdict 文件三方核对
+run/scenario/tag/mode、JSON/log 双引用、payload sha；valid_evidence
+条目沿 manifest 引用调用同一 `verify_run_evidence` 读回（不再另写
+"数组长度=3"宽松判定）。manifest 写入边界注入实测：内容 `{}`、错误
+版本/模式、引用串到另一版本路径，正式收尾均 FAIL；撤掉破坏后对照
+收尾干净通过。唯一命名保留，无 glob/mtime/目录计数兜底。
+
 ### AE 轮增补（2026-09-21，证据关联与反向自检收尾；实现/包仍为 acabbf7）
 
 AE1–AE2 均为测试代码变更（仅 `tests/t_rework_check.py`），产品代码

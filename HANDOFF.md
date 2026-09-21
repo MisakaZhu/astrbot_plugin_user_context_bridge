@@ -17,6 +17,31 @@
 
 ### 版本与包
 
+- **AF 轮（2026-09-21）**：AF1 完整对账——正式 writer
+  `persist_observation` 从本次 CompletedProcess 登记原始 AUDIT 行/
+  traceback 段数/stdout+stderr 段 sha256 与采集绑定
+  （tag/mode/capture_id/启动命令/injected）入 `_run_binding`；快照
+  改为完整核心 payload（含目标布尔值）；provider-raise 要求 raw
+  traceback>=3 段且与捕获一致；rc 行继续核对。只改文件反例（删
+  AUDIT/AUDIT 错值/只删 raw 栈/磁盘 JSON+RESULT 反转 stop
+  n04_all_model_called 与 provider n04_all_completed）均按证据维度
+  拒绝、note 指认具体键，改后恢复原字节。AF1.4 schema 合成观测经
+  正式 writer 生成新一致证据（injected=True、独立 capture_id），
+  不再借用真实负例路径。AF2.A 期望 tag/mode/capture_key 由调用侧
+  显式消费；全对象互换（两版均拒）、单版错 tag、stop 写侧
+  mode=normal 绑定维度拒绝，未改版本保持合格。AF2.B
+  `manifest_closing_checks` 实际打开并解析 manifest 文件，三方核对
+  元信息/双引用/payload sha 并沿引用正式读回；写入边界注入
+  {}/错误元信息/串路径收尾 FAIL、撤破坏对照干净通过。仅改
+  `tests/t_rework_check.py`。全量 20 套 × 双版各 **915** PASS /
+  0 FAIL（t 185 + w 92 + s 84 + w_zip 78 + y2 74 + x 64 + n3 59 +
+  r 38 + w_rework 37 + p1 36 + n1 30 + p2 27 + p4 22 + p3 19 +
+  p0 17 + p5 16 + n2 14 + n0 10 + p6 8 + aa1 5）。实现/包仍为
+  acabbf7（SHA 复核一致）。HEAD 见 git log；
+  **对 AE 的更正**：provider 真实栈并非 final_text_head（摘要≠栈）；
+  AE 的 AUDIT 未与 raw 行对账；schema 合成观测当时借用不一致旧文件；
+  manifest 当时仅存在检查、字段取内存——均由 AF 修复；AE2 交换/
+  撤交换事实保留。
 - **AE 轮（2026-09-21）**：AE1 证据关联——`verify_run_evidence`
   正式共用读回（引用==写侧绑定关联校验、rc 行、log↔JSON 自洽、
   诊断/调用/AUDIT==本次调用侧快照、AUDIT mode 绑定、provider 真实
