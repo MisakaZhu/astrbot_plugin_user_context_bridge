@@ -1,10 +1,23 @@
-## 当前：0.7.0 Z1–Z3 + AA + AB + AC + AD 收尾完成（待 Codex 复验 MIS-170）
+## 当前：0.7.0 Z1–Z3 + AA + AB + AC + AD + AE 收尾完成（待 Codex 复验 MIS-170）
 
+- **AE 轮（2026-09-21）**：AE1 证据关联——`verify_run_evidence`
+  正式共用读回（引用==写侧绑定、rc 行、log↔JSON 自洽、诊断/调用/
+  AUDIT==本次调用侧快照、AUDIT mode 绑定、provider 真实
+  RuntimeError 栈）；`run_aa2_negative` 唯一 run ID/目录 + 唯一
+  manifest，删 glob/mtime/计数兜底。AE2.A 错引用改为从本次捕获映射
+  显式替换（跨版/跨模式/正常T1），无注入对照 accepted + 注入后
+  rejected 三方留存；AE2.B AD1 循环按场景传正确 mode（provider
+  场景不再错传 stop）。仅改 `tests/t_rework_check.py`。正式全量
+  20 套 × 双版各 **1003** PASS / 0 FAIL。运行实现/包仍为 acabbf7。
 - **AD 轮（2026-09-20）**：AD1 指定目标判定（stop→all-model-called、
   provider-raise→all-completed；仅翻假 schema 反例 rejected）+ AD2
   证据重开验证（实际读回文件核对内容；三种损坏/缺失/错引用 rejected）。
   产品代码零改动。正式全量 20 套 × 双版各 **900** PASS / 0 FAIL。
   运行实现/包仍为 acabbf7。
+  **AE 轮更正**：AD 仓库自检 provider 场景当时错传 stop mode；"错引用
+  rejected"当时实因引用为空（未证明关联校验）；"读回核对内容"当时仅
+  结构/子串检查——三项均由 AE 轮修复，空/缺文件拒绝与原始自动保存
+  事实保留。
 ## 当前：0.7.0 Z1–Z3 + AA + AB + AC 收尾完成（待 Codex 复验 MIS-170）
 
 - **AC 轮（2026-09-20）**：AC1 T 自检改用 T 正式断言（W 断言误用

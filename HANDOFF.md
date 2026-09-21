@@ -17,11 +17,30 @@
 
 ### 版本与包
 
+- **AE 轮（2026-09-21）**：AE1 证据关联——`verify_run_evidence`
+  正式共用读回（引用==写侧绑定关联校验、rc 行、log↔JSON 自洽、
+  诊断/调用/AUDIT==本次调用侧快照、AUDIT mode 绑定、provider 真实
+  RuntimeError 栈）；`run_aa2_negative` 唯一 run ID/专属目录
+  `local_evidence/aa2_runs/<run_id>/` + 唯一命名 manifest（run/
+  scenario/tag/mode 与 JSON/log 双引用），删 glob/mtime/目录计数
+  兜底与固定 verdict 文件名覆盖。AE2.A 错引用改为从本次捕获映射
+  显式替换（跨版/跨模式/正常T1 三例），无注入对照 accepted、注入
+  后 rejected、撤注入自检 FAIL 三方留存（`ae2a_wrong_reference_
+  three_way.json`）；AE2.B AD1 循环按场景显式传 mode（provider
+  场景不再错传 stop），仅 schema 反例 specific_target_hit=false/
+  diag_ok/evidence_ok 且 rejected。仅改 `tests/t_rework_check.py`。
+  正式全量 20 套 × 双版各 **1003** PASS / 0 FAIL（t 273 + w 92 +
+  s 84 + w_zip 78 + y2 74 + x 64 + n3 59 + r 38 + w_rework 37 +
+  p1 36 + n1 30 + p2 27 + p4 22 + p3 19 + p0 17 + p5 16 + n2 14 +
+  n0 10 + p6 8 + aa1 5）。运行实现/包仍为 acabbf7（SHA 复核一致）。
+  HEAD 见 git log；
 - **AD 轮（2026-09-20）**：AD1 指定目标判定（stop→all-model-called、
   provider-raise→all-completed-zero-watchdog-zero-pending；仅翻假
   schema 反例 stop/provider 两模式均 rejected）+ AD2 证据重开验证
   （实际读回文件核对内容；三种证据损坏/缺失/错引用反向检验均 rejected）。
   正式全量 20 套 × 双版各 **900** PASS / 0 FAIL（t 170 + w 92 + aa1 5）。
+  **AE 轮更正**：provider 仓库自检当时错传 stop mode；"错引用
+  rejected"当时实因引用为空；"读回核对内容"当时仅结构/子串检查。
   HEAD 见 git log；
 - **AC 轮（2026-09-20）**：AC1 T 自检改用 `_assert_t1_version` 正式
   断言（W 断言误用已更正）+ 正常对照/撤故障反向对照 + 正式 T 失败

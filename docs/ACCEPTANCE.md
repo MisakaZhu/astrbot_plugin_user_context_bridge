@@ -184,7 +184,62 @@ IntegrityError、失败 on 解除退出、登记失败后直接切模式 0→0�
 到最终模型""另一人格 follower"此前声称超出证据。全量回归与 Y 轮 814
 计数本身准确，予以保留。
 
+### AE 轮增补（2026-09-21，证据关联与反向自检收尾；实现/包仍为 acabbf7）
+
+AE1–AE2 均为测试代码变更（仅 `tests/t_rework_check.py`），产品代码
+零改动。全量 20 套 × 双版各 **1003** PASS / 0 FAIL（40 次 rc=0；
+t 273 + w 92 + s 84 + w_zip 78 + y2 74 + x 64 + n3 59 + r 38 +
+w_rework 37 + p1 36 + n1 30 + p2 27 + p4 22 + p3 19 + p0 17 + p5 16
++ n2 14 + n0 10 + p6 8 + aa1 5）。安装包 SHA-256 复核仍为
+`c21956fe…`（acabbf7 原字节）。
+
+AE1 证据关联（`verify_run_evidence` 正式共用读回函数，正常流程与负例
+均调用）：
+
+- 每次 `run_aa2_negative` 生成唯一 run ID 与专属输出目录
+  `local_evidence/aa2_runs/<run_id>/`，写入唯一命名 manifest
+  （run/scenario/tag/mode 与 JSON/log 双引用）；不再有固定
+  `ac2_<scenario>.json` 覆盖，删除 glob/mtime/目录计数兜底。
+- 写侧绑定 `_run_binding`（json/log/rc/where/tag/mode）由保存方生成；
+  读回时核对：引用==写侧绑定（关联校验）→ 文件存在 → rc 行==本次
+  rc → log RESULT 行与保存 JSON 自洽 → 诊断/调用/异常/AUDIT 与本次
+  调用侧快照一致 → AUDIT mode 绑定本次 mode；provider-raise 必须见
+  本次真实 `RuntimeError: aa2 注入模型调用真实异常`（逐窗
+  final_text_head/pipeline_errors），不再认 JSON 键名或 aa2 子串。
+- 判定维度：五行情景对照表（verdict 留存
+  `local_evidence/ac_logs/ac2_<场景>-<run_id>.json`）：
+
+| 场景 | 目标/诊断 | 证据 | 最终 |
+| --- | --- | --- | --- |
+| 本次真实 stop / provider-raise | 两版 entry/target/diag 全合格 | 引用==绑定、内容==本次快照 | accepted |
+| 仅 schema 失败（两种 mode 各自正确传入） | specific_target_hit=false，diag/evidence 合格 | 与反例一致 | rejected，原因=指定目标缺失 |
+| 显式跨版/跨模式/正常T1 错引用（AE2.A，从捕获映射实际替换，无 glob） | 目标/诊断均合格 | 引用≠本次绑定（关联校验） | rejected，原因=证据关联 |
+| 撤掉引用交换对照 | 目标/诊断均合格 | 恢复本次文件 | accepted；"应拒绝错引用"自检此时 FAIL（三方结果留存 `ae2a_wrong_reference_three_way.json`） |
+| 空 JSON/缺文件/窗口诊断改 `[{}, {}, {}]`/真实异常栈移除 | 目标/诊断仍合格 | 读回失败，note 指认具体键 | rejected，原因=证据 |
+
+AE2 反向自检真实性：
+
+- **A 错引用**：旧实现 glob 按文件名猜候选、`with_suffix` 落盘后无
+  版本片段导致 0 命中，"错引用 rejected"实际理由是缺引用——已改为
+  从本次捕获映射（stop/provider/normal × 双版）显式取真实路径替换，
+  找不到路径直接抛错；无注入对照 accepted + 注入后 rejected 三方
+  留存，撤注入时自检本身 FAIL 可复现。
+- **B provider 指定目标**：AD1 循环此前两个场景都传 `"stop"`（
+  provider-schema-only 保存的 mode 也是 stop）——已改为场景条目显式
+  携带 mode，provider 场景传 provider-raise；仅 schema 反例两版
+  entry_ok=true、specific_target_hit=false、diag_ok=true、
+  evidence_ok=true、最终 rejected，判定复用 AD1 核心。
+
 ### AD 轮增补（2026-09-20，指定目标判定与证据重开；实现/包仍为 acabbf7）
+
+**AE 轮对 AD 文档的更正**（Codex 39 号报告复核结论）：AD1 指定目标
+核心判定当时即已修复且经 Codex 以正确 mode 独立证实，但**仓库自检的
+provider 场景当时错传 `stop` mode**，该自检未验证 provider 目标规则
+（AE2.B 已修）；AD2"错引用 rejected"当时实际因 glob 找不到候选、
+引用为空，**未证明关联校验**（AE2.A 已修）；AD2"实际读回文件核对
+内容"当时仅存在性/字段数/数组长度/子串检查，**未绑定本次运行/版本/
+模式，也未核对真实异常栈**（AE1 已修）。AD2 空/缺文件拒绝与观察器
+原始自动保存事实继续保留。
 
 AD1–AD2 均为测试代码变更，产品代码零改动。全量 20 套 × 双版各
 **900** PASS / 0 FAIL（40 次 rc=0；t 170 + w 92 + aa1 5，其余分套同

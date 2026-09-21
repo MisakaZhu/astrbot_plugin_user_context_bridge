@@ -36,6 +36,9 @@ from tests.w_lifecycle_check import (
 PASS: list[str] = []
 FAIL: list[str] = []
 
+# AE1：正式负例流程唯一 run ID 序号（跨调用不重复；跨进程由时间戳区分）
+_AA2_RUN_SEQ = __import__("itertools").count(1)
+
 
 def check(name: str, cond: bool, detail: str = "") -> None:
     if cond:
@@ -444,6 +447,13 @@ def _run_worker(script: str, extra_args: list[str] | None = None):
                 Path(script).stem, tag, r, parsed)
             parsed["_evidence_log"] = ev["log"]
             parsed["_evidence_json"] = ev["json"]
+            # AE1：写侧运行绑定——预期引用由本次保存产生，读回时不从
+            # 被替换文件重新推导
+            parsed["_run_binding"] = {
+                "json": ev["json"], "log": ev["log"],
+                "rc": r.returncode, "where": Path(script).stem,
+                "tag": tag,
+            }
             if "__error__" in parsed:
                 parsed["__error__"] += "（留证：" + ev["json"] + "）"
             results[tag] = parsed
@@ -740,17 +750,132 @@ def _validate_n04_negative_diag(out: dict, mode: str) -> tuple:
     return False, f"未知 mode {mode!r}"
 
 
-def run_aa2_negative(mode: str, runner) -> dict:
-    """AD1/AD2：正式 AA2 负例判定——逐版本独立验证 + 指定目标 + 证据重开。
+def verify_run_evidence(out, mode: str, snap) -> tuple:
+    """AE1：正式证据读回校验（正常流程与负例共用）。
+
+    实际重开 `_run_binding` 绑定的 JSON/log，逐项核对与**本次调用侧**
+    快照一致：引用==写侧绑定、文件存在、rc 行、RESULT 行与保存 JSON
+    一致、诊断/调用/异常/AUDIT 与本次输入一致、AUDIT 模式绑定本次
+    mode；provider-raise 必须见到本次真实 RuntimeError 注入（类型+消
+    息），不能以 JSON 键名或任意 aa2 子串代替。snap 为空或 out 非
+    dict 一律拒绝。
+    """
+
+    if not isinstance(out, dict):
+        return False, "结果不是对象，无证据可验"
+    binding = out.get("_run_binding")
+    if not isinstance(binding, dict):
+        return False, "缺少本次运行绑定（_run_binding）"
+    ref_json = out.get("_evidence_json")
+    ref_log = out.get("_evidence_log")
+    if not ref_json or not ref_log:
+        return False, "缺少 _evidence_json/_evidence_log 引用"
+    exp_json = binding.get("json")
+    exp_log = binding.get("log")
+    if ref_json != exp_json or ref_log != exp_log:
+        return False, (
+            "证据引用与本次运行绑定不符（关联校验）："
+            f"期望json={exp_json} 期望log={exp_log} "
+            f"实际json={ref_json} 实际log={ref_log}")
+    pj, pl = Path(ref_json), Path(ref_log)
+    if not pj.is_file():
+        return False, f"证据 JSON 不存在：{ref_json}"
+    if not pl.is_file():
+        return False, f"证据 log 不存在：{ref_log}"
+    try:
+        reopened = json.loads(pj.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"证据 JSON 解析失败：{exc}"
+    if not isinstance(reopened, dict) or not reopened:
+        return False, "证据 JSON 为空/非对象"
+    raw = pl.read_text(encoding="utf-8", errors="replace")
+    lines = raw.splitlines()
+    first = lines[0] if lines else ""
+    if first != f"returncode={binding.get('rc')}":
+        return False, (f"证据 log rc 行不符：{first!r} "
+                       f"vs 本次写侧 rc={binding.get('rc')!r}")
+    result_line = next(
+        (l for l in lines if l.startswith("@@RESULT@@")), None)
+    if result_line is None:
+        return False, "证据 log 缺 @@RESULT@@ 原文"
+    try:
+        from_log = json.loads(result_line[len("@@RESULT@@"):])
+    except Exception as exc:
+        return False, f"证据 log RESULT 行解析失败：{exc}"
+    # 保存 JSON = RESULT 原文 + 观察器后补的 _aa2_audit；二者必须一致
+    reopened_core = {k: v for k, v in reopened.items()
+                     if k != "_aa2_audit"}
+    if from_log != reopened_core:
+        return False, "证据 log RESULT 行与保存 JSON 内容不一致"
+    if not isinstance(snap, dict):
+        return False, "缺少本次调用侧内容快照"
+    for key in ("n04_window_diagnostics", "n04_model_calls",
+                "n04_pipeline_errors", "_aa2_audit"):
+        if reopened.get(key) != snap.get(key):
+            return False, (
+                f"证据内容与本次输入不一致：{key} "
+                f"保存={str(reopened.get(key))[:160]} "
+                f"本次={str(snap.get(key))[:160]}")
+    audit = reopened.get("_aa2_audit")
+    if mode != "normal":
+        if not isinstance(audit, dict) or audit.get("mode") != mode:
+            return False, (f"证据 AUDIT 模式绑定不符：audit={audit!r} "
+                           f"期望mode={mode}")
+    if mode == "provider-raise":
+        # AE1：本次真实 RuntimeError 注入——宿主把 provider 异常转为
+        # 错误响应时栈记在逐窗 final_text_head，边界异常记在
+        # pipeline_errors；必须见到真实类型+消息，不能以 JSON 键名或
+        # 任意 aa2 子串代替
+        marker = "RuntimeError: aa2 注入模型调用真实异常"
+        diag = reopened.get("n04_window_diagnostics")
+        ok_stack = (isinstance(diag, list) and len(diag) == 3
+                    and all(
+                        isinstance(d, dict)
+                        and marker in (str(d.get("final_text_head") or "")
+                                       + str(d.get("pipeline_error") or ""))
+                        for d in diag))
+        if not ok_stack:
+            errs = reopened.get("n04_pipeline_errors")
+            ok_stack = (isinstance(errs, list) and any(
+                isinstance(e, str)
+                and e.startswith("RuntimeError: ")
+                and "aa2 注入模型调用真实异常" in e
+                for e in errs))
+        if not ok_stack:
+            return False, (
+                "provider-raise 证据缺本次真实 RuntimeError 注入"
+                f"（逐窗 final_text_head/pipeline_errors="
+                f"{str(diag)[:240]}）")
+    return True, "ok"
+
+
+def run_aa2_negative(mode: str, runner, *, scenario: str = "") -> dict:
+    """AD1/AD2/AE1：正式 AA2 负例判定——逐版本独立验证 + 指定目标 +
+    证据关联读回。
 
     每个版本必须独立满足四项（不能靠另一版本补足）：
     1. 入口有效（无 __error__）；
     2. 指定目标命中：stop→all-model-called、provider-raise→
        all-completed-zero-watchdog-zero-pending（不能由任意 N04.* 替代）；
     3. 诊断有意义（_validate_n04_negative_diag）；
-    4. 证据重开验证通过（实际读回 JSON/log 核对诊断与原始输出）。
+    4. 证据读回验证通过（verify_run_evidence：引用与本次写侧绑定一致，
+       实际重开 JSON/log 核对本次诊断/调用/AUDIT/异常栈）。
     两个版本都合格才可整体通过。
+
+    AE1：每次调用生成唯一 run ID 与专属输出目录 local_evidence/
+    aa2_runs/<run_id>/，写入唯一命名 manifest（run/scenario/tag/mode
+    与 JSON/log 引用），不覆盖上一调用，也无目录计数/mtime 兜底。
     """
+
+    from datetime import datetime as _dt
+
+    # AE1：唯一 run ID / 输出目录（进程内序号 + 时间戳，跨进程不重名）
+    run_id = "aa2run-{}-{:04d}".format(
+        _dt.now().strftime("%H%M%S%f"), next(_AA2_RUN_SEQ))
+    run_dir = (Path(__file__).resolve().parent.parent
+               / "local_evidence" / "aa2_runs" / run_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    scen = scenario or mode
 
     # AD1：逐模式指定必须命中的正式目标断言名
     required_target = {
@@ -791,42 +916,17 @@ def run_aa2_negative(mode: str, runner) -> dict:
     del PASS[before_pass:]
     del FAIL[before_fail:]
 
-    # AD2：证据重开验证函数（实际读回文件核对内容）
-    def _verify_evidence(out: dict, mode: str) -> tuple:
-        """实际读回 _evidence_json/_evidence_log 并核对内容。"""
-        ev_json_path = out.get("_evidence_json")
-        ev_log_path = out.get("_evidence_log")
-        if not ev_json_path or not ev_log_path:
-            return False, "缺少 _evidence_json/_evidence_log 引用"
-        if not Path(ev_json_path).is_file():
-            return False, f"证据 JSON 不存在：{ev_json_path}"
-        if not Path(ev_log_path).is_file():
-            return False, f"证据 log 不存在：{ev_log_path}"
-        try:
-            reopened = json.loads(
-                Path(ev_json_path).read_text(encoding="utf-8"))
-        except Exception as exc:
-            return False, f"证据 JSON 解析失败：{exc}"
-        if not isinstance(reopened, dict) or len(reopened) < 5:
-            return False, (f"证据 JSON 内容过少 "
-                           f"({len(reopened)} keys)，疑似空/损坏")
-        raw = Path(ev_log_path).read_text(encoding="utf-8",
-                                          errors="replace")
-        if "returncode=" not in raw:
-            return False, "证据 log 缺 returncode 行"
-        if "@@RESULT@@" not in raw:
-            return False, "证据 log 缺 @@RESULT@@ 原文"
-        # 模式特定内容核对
-        diag = reopened.get("n04_window_diagnostics")
-        if not isinstance(diag, list) or len(diag) != 3:
-            return False, (f"证据 JSON 窗口诊断异常: "
-                           f"{type(diag).__name__} len={len(diag) if isinstance(diag, list) else 'N/A'}")
-        if mode == "provider-raise":
-            # 宿主转错误响应时 pipeline_error 可为空，但标记须在
-            combined = str(reopened) + raw
-            if "aa2" not in combined:
-                return False, "provider-raise 注入标记不可定位"
-        return True, "ok"
+    # AE1：预期绑定来自**当前调用侧**——对本流程捕获的结果做内容快照，
+    # 证据文件必须与该快照一致；被替换文件的自报内容不构成预期。
+    snapshots = {
+        tag: {
+            "n04_window_diagnostics": out.get("n04_window_diagnostics"),
+            "n04_model_calls": out.get("n04_model_calls"),
+            "n04_pipeline_errors": out.get("n04_pipeline_errors"),
+            "_aa2_audit": out.get("_aa2_audit"),
+        }
+        for tag, out in outs.items() if isinstance(out, dict)
+    }
 
     # AC2.1 + AD1：逐版本独立验证（指定目标 + 证据重开）
     per_version: dict = {}
@@ -854,8 +954,9 @@ def run_aa2_negative(mode: str, runner) -> dict:
         evidence_ok_v = False
         if entry_ok:
             diag_ok_v, diag_note_v = _validate_n04_negative_diag(out, mode)
-            # AD2：证据重开验证
-            evidence_ok_v, evidence_note_v = _verify_evidence(out, mode)
+            # AD2/AE1：证据读回验证（正式共用函数，绑定本次调用侧快照）
+            evidence_ok_v, evidence_note_v = verify_run_evidence(
+                out, mode, snapshots.get(tag))
         else:
             diag_note_v = f"入口错误: {str(out.get('__error__'))[:120]}" \
                 if out else "缺少该版本结果"
@@ -873,6 +974,8 @@ def run_aa2_negative(mode: str, runner) -> dict:
             "evidence_ok": evidence_ok_v,
             "evidence_note": evidence_note_v,
             "evidence_json": out.get("_evidence_json", "") if out else "",
+            "evidence_log": out.get("_evidence_log", "") if out else "",
+            "run_binding": out.get("_run_binding") if out else None,
             "ok": v_ok,
         }
         if not evidence_ok_v:
@@ -883,7 +986,9 @@ def run_aa2_negative(mode: str, runner) -> dict:
 
     diag_notes = {t: per_version[t]["diag_note"] for t in per_version}
 
-    return {
+    verdict = {
+        "run_id": run_id,
+        "scenario": scen,
         "mode": mode,
         "detected": detected,
         "per_version": per_version,
@@ -895,6 +1000,37 @@ def run_aa2_negative(mode: str, runner) -> dict:
         "pass": (detected and per_version_ok and not collateral
                  and evidence_ok),
     }
+
+    # AE1：唯一命名 manifest——run/scenario/tag/mode 与 JSON/log 引用，
+    # 保存错误也留下受控失败信息（evidence_note/入口 note），不覆盖
+    manifest = {
+        "run_id": run_id,
+        "scenario": scen,
+        "mode": mode,
+        "pass": verdict["pass"],
+        "versions": {
+            tag: {
+                "run_id": run_id,
+                "scenario": scen,
+                "tag": tag,
+                "mode": mode,
+                "entry_ok": per_version[tag]["entry_ok"],
+                "diag_ok": per_version[tag]["diag_ok"],
+                "evidence_ok": per_version[tag]["evidence_ok"],
+                "evidence_json": per_version[tag]["evidence_json"],
+                "evidence_log": per_version[tag]["evidence_log"],
+            }
+            for tag in per_version
+        },
+    }
+    manifest_path = run_dir / f"{run_id}_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8")
+    verdict["run_dir"] = str(run_dir)
+    verdict["manifest_path"] = str(manifest_path)
+
+    return verdict
 
 
 def n04_diag_negative_injection() -> None:
@@ -911,18 +1047,41 @@ def n04_diag_negative_injection() -> None:
     evidence_dir = Path(__file__).resolve().parent.parent / (
         "local_evidence") / "ac_logs"
     evidence_dir.mkdir(parents=True, exist_ok=True)
+    # AE1：已保存 verdict 清单（唯一命名），供 AC3 沿 manifest 重开验证
+    saved_entries: list = []
 
-    def save_verdict(name: str, verdict: dict) -> str:
-        path = evidence_dir / f"ac2_{name}.json"
+    def save_verdict(name: str, verdict: dict,
+                     *, valid_evidence: bool = False) -> str:
+        run_id = verdict.get("run_id") or "norun"
+        path = evidence_dir / f"ac2_{name}-{run_id}.json"
         path.write_text(
             json.dumps(verdict, ensure_ascii=False, indent=2,
                        default=str),
             encoding="utf-8")
+        saved_entries.append({
+            "scenario": name,
+            "mode": verdict.get("mode"),
+            "run_id": run_id,
+            "verdict_path": str(path),
+            "manifest_path": verdict.get("manifest_path", ""),
+            "versions": {
+                tag: {
+                    "scenario": name,
+                    "tag": tag,
+                    "mode": verdict.get("mode"),
+                    "run_id": run_id,
+                    "evidence_json": pv.get("evidence_json", ""),
+                    "evidence_log": pv.get("evidence_log", ""),
+                }
+                for tag, pv in verdict.get("per_version", {}).items()
+            },
+            "valid_evidence": valid_evidence,
+        })
         return str(path)
 
     def observer_runner(mode: str):
         """AC3：每次观察器运行都 persist_run 落盘（raw stdout/stderr/rc、
-        完整解析 JSON、AUDIT），返回结果附带证据路径。"""
+        完整解析 JSON、AUDIT），返回结果附带证据路径与 AE1 写侧绑定。"""
         def runner(script: str, extra_args=None):
             if script != "t1_persona_worker.py":
                 return real_run_worker(script, extra_args)
@@ -958,6 +1117,13 @@ def n04_diag_negative_injection() -> None:
                         f"aa2_observer_{mode}", tag, completed, parsed)
                     parsed["_evidence_log"] = ev["log"]
                     parsed["_evidence_json"] = ev["json"]
+                    # AE1：写侧运行绑定（预期引用由本次保存产生）
+                    parsed["_run_binding"] = {
+                        "json": ev["json"], "log": ev["log"],
+                        "rc": completed.returncode,
+                        "where": f"aa2_observer_{mode}", "tag": tag,
+                        "mode": mode,
+                    }
                     results[tag] = parsed
             return results
         return runner
@@ -975,8 +1141,9 @@ def n04_diag_negative_injection() -> None:
 
     # 2) 真实负例：逐版本必须被判定接受
     for mode in ("stop", "provider-raise"):
-        verdict = run_aa2_negative(mode, observer_runner(mode))
-        vp = save_verdict(f"{mode}-good", verdict)
+        verdict = run_aa2_negative(mode, observer_runner(mode),
+                                   scenario=f"{mode}-good")
+        vp = save_verdict(f"{mode}-good", verdict, valid_evidence=True)
         verdict["_verdict_path"] = vp
         check(f"AC2.{mode}-negative-accepted",
               verdict["pass"],
@@ -997,12 +1164,12 @@ def n04_diag_negative_injection() -> None:
 
     with patch.object(sys.modules[__name__], "_run_worker",
                       capture_runner("stop")):
-        run_aa2_negative("stop", capture_runner("stop"))
+        run_aa2_negative("stop", capture_runner("stop"),
+                         scenario="capture-stop")
+    # AE2.A：保留完整引用与写侧绑定（不再摘除）——错引用注入需要从
+    # 本次捕获映射显式取真实路径
     good_neg_428 = dict(neg_capture.get(".venv", {}))
     good_neg_426 = dict(neg_capture.get(".venv426", {}))
-    for d in (good_neg_428, good_neg_426):
-        d.pop("_evidence_log", None)
-        d.pop("_evidence_json", None)
 
     def json_line(d):
         return "@@RESULT@@" + json.dumps(d, ensure_ascii=False) + "\n"
@@ -1022,6 +1189,9 @@ def n04_diag_negative_injection() -> None:
                     "ac2-rc19", tag, fr, parsed)
                 parsed["_evidence_log"] = ev["log"]
                 parsed["_evidence_json"] = ev["json"]
+                parsed["_run_binding"] = {
+                    "json": ev["json"], "log": ev["log"], "rc": 19,
+                    "where": "ac2-rc19", "tag": tag}
                 results[tag] = parsed
             return results
         return real_run_worker(script, extra_args)
@@ -1038,6 +1208,9 @@ def n04_diag_negative_injection() -> None:
                     "ac2-empty-diag", tag, fr, parsed)
                 parsed["_evidence_log"] = ev["log"]
                 parsed["_evidence_json"] = ev["json"]
+                parsed["_run_binding"] = {
+                    "json": ev["json"], "log": ev["log"], "rc": 0,
+                    "where": "ac2-empty-diag", "tag": tag}
                 results[tag] = parsed
             return results
         return real_run_worker(script, extra_args)
@@ -1062,7 +1235,7 @@ def n04_diag_negative_injection() -> None:
         ("old-bad4-unrelated-t5", unrelated_t5_runner),
     )
     for name, runner in old_bad:
-        verdict = run_aa2_negative("stop", runner)
+        verdict = run_aa2_negative("stop", runner, scenario=name)
         vp = save_verdict(name, verdict)
         check(f"AA2.{name}-rejected", not verdict["pass"],
               f"坏观测未被拒绝：verdict_path={vp}")
@@ -1101,7 +1274,7 @@ def n04_diag_negative_injection() -> None:
         ("ac2-bad3-one-version-target", one_version_target_runner),
     )
     for name, runner in ac2_bad:
-        verdict = run_aa2_negative("stop", runner)
+        verdict = run_aa2_negative("stop", runner, scenario=name)
         vp = save_verdict(name, verdict)
         check(f"AC2.{name}-rejected", not verdict["pass"],
               f"AC2 坏观测未被拒绝：verdict_path={vp}")
@@ -1124,7 +1297,9 @@ def n04_diag_negative_injection() -> None:
 
     with patch.object(sys.modules[__name__], "_run_worker",
                       prov_capture_runner):
-        run_aa2_negative("provider-raise", prov_capture_runner)
+        run_aa2_negative("provider-raise", prov_capture_runner,
+                         scenario="capture-provider-raise")
+    # AE2.A：同样保留完整引用与写侧绑定
     good_prov_428 = dict(neg_prov_capture.get(".venv", {}))
     good_prov_426 = dict(neg_prov_capture.get(".venv426", {}))
 
@@ -1143,8 +1318,9 @@ def n04_diag_negative_injection() -> None:
                             combined[k] = neg_by_tag[tag][k]
                     # AD1 反例：仅翻假 schema（指定目标全部通过）
                     combined["n04_final_tool_schema_serializable"] = False
-                    # 证据引用来自负例（有效）
-                    for k in ("_evidence_log", "_evidence_json"):
+                    # 证据引用与写侧绑定来自负例（有效、自洽）
+                    for k in ("_evidence_log", "_evidence_json",
+                              "_run_binding"):
                         if k in neg_by_tag.get(tag, {}):
                             combined[k] = neg_by_tag[tag][k]
                     results[tag] = combined
@@ -1152,42 +1328,66 @@ def n04_diag_negative_injection() -> None:
             return real_run_worker(script, extra_args)
         return runner
 
-    with patch.object(sys.modules[__name__], "_run_worker",
-                      real_run_worker):
-        normal_t1_full = real_run_worker("t1_persona_worker.py")
+    normal_t1_full = real_run_worker("t1_persona_worker.py")
 
+    # AE1：正常流程同样走正式证据读回函数（无观察器 AUDIT 属正常形态）
+    for tag in (".venv", ".venv426"):
+        nout = normal_t1_full.get(tag, {})
+        ok, note = verify_run_evidence(
+            nout, "normal",
+            {k: nout.get(k) for k in (
+                "n04_window_diagnostics", "n04_model_calls",
+                "n04_pipeline_errors", "_aa2_audit")})
+        check(f"AC3.normal-t1.{tag}.evidence-readback", ok, note)
+
+    # AE2.B：场景条目显式携带 mode——provider 场景传 provider-raise，
+    # 复用同一 AD1 核心判定
     ad1_bad = (
         ("ad1-stop-schema-only",
-         schema_only_runner_factory(good_neg_428 and
-                                    {".venv": good_neg_428,
-                                     ".venv426": good_neg_426}, "stop")),
+         schema_only_runner_factory({".venv": good_neg_428,
+                                     ".venv426": good_neg_426}, "stop"),
+         "stop"),
         ("ad1-provider-schema-only",
          schema_only_runner_factory({".venv": good_prov_428,
                                      ".venv426": good_prov_426},
-                                    "provider-raise")),
+                                    "provider-raise"),
+         "provider-raise"),
     )
-    for name, runner in ad1_bad:
-        verdict = run_aa2_negative("stop", runner)
+    for name, runner, sc_mode in ad1_bad:
+        verdict = run_aa2_negative(sc_mode, runner, scenario=name)
         vp = save_verdict(name, verdict)
-        # AD1：指定目标缺失→ rejected；失败理由不应为无关新异常
-        check(f"AD1.{name}-rejected", not verdict["pass"],
-              f"AD1 非指定 N04 失败不应替代指定目标：verdict_path={vp}")
+        # AD1/AE2.B：rejected 且拒绝维度必须精确——正确 mode、两版入口
+        # 有效、指定目标缺失、诊断合格、证据合格
+        req = ("all-model-called" if sc_mode == "stop"
+               else "all-completed-zero-watchdog-zero-pending")
+        pv = verdict["per_version"]
+        dims = {t: (
+            pv[t]["entry_ok"]
+            and pv[t]["specific_target"] == req
+            and not pv[t]["specific_target_hit"]
+            and pv[t]["diag_ok"]
+            and pv[t]["evidence_ok"])
+            for t in (".venv", ".venv426")}
+        check(f"AD1.{name}-rejected",
+              (not verdict["pass"]) and all(dims.values()),
+              f"AD1 非指定 N04 失败不应替代指定目标：dims={dims} "
+              f"verdict_path={vp}")
 
     # -- AD2：证据重开验证 + 证据损坏/缺失/错引用反向检验 -----------------
     # 从上面真实负例捕获的 _evidence_json/_evidence_log 引用带入正式
     # run_aa2_negative，验证实际读回内容而非只数文件数。
 
-    def evidence_bad_runner_factory(evidence_corruptor):
-        """构造一个 runner：功能/诊断观测用真实有效负例（good_neg），
-        但证据文件/引用按 corruption 类型注入。"""
+    def evidence_bad_runner_factory(evidence_corruptor, source=None):
+        """构造一个 runner：功能/诊断观测用真实有效负例（默认 stop
+        good_neg，可指定 provider 捕获），证据按 corruption 类型注入。"""
+        src_by_tag = source or {".venv": good_neg_428,
+                                ".venv426": good_neg_426}
+
         def runner(script, extra_args=None):
             if script == "t1_persona_worker.py":
                 results = {}
                 for tag in (".venv", ".venv426"):
-                    src = (good_neg_428 if tag == ".venv"
-                           else good_neg_426)
-                    combined = dict(src)
-                    results[tag] = combined
+                    results[tag] = dict(src_by_tag.get(tag, {}))
                 # evidence_corruptor 在 results 上修改证据引用/文件
                 evidence_corruptor(results)
                 return results
@@ -1195,87 +1395,291 @@ def n04_diag_negative_injection() -> None:
         return runner
 
     def corrupt_empty_evidence(results):
+        from datetime import datetime as _dtc
+        stamp = _dtc.now().strftime("%H%M%S%f")
         for tag in results:
             results[tag]["_evidence_json"] = str(
-                evidence_dir / f"ad2_empty_{tag}.json")
+                evidence_dir / f"ad2_empty_{stamp}_{tag}.json")
             results[tag]["_evidence_log"] = str(
-                evidence_dir / f"ad2_empty_{tag}.log")
+                evidence_dir / f"ad2_empty_{stamp}_{tag}.log")
             Path(results[tag]["_evidence_json"]).write_text("{}", encoding="utf-8")
             Path(results[tag]["_evidence_log"]).write_text("", encoding="utf-8")
+            # 绑定同步指向空文件——关联合法，拒绝维度落在空内容本身
+            results[tag]["_run_binding"] = {
+                "json": results[tag]["_evidence_json"],
+                "log": results[tag]["_evidence_log"], "rc": 0,
+                "where": f"ad2_empty_{stamp}", "tag": tag}
 
     def corrupt_missing_evidence(results):
-        # 不写文件、指向不存在路径——但目录有旧文件可作占位
+        # 不写文件、指向不存在路径（AE1：无引用兜底，直接按缺文件拒绝）
+        stamp = next(_AA2_RUN_SEQ)
         for tag in results:
             results[tag]["_evidence_json"] = str(
-                evidence_dir / f"ad2_nonexistent_{tag}.json")
+                evidence_dir / f"ad2_nonexistent_{stamp}_{tag}.json")
             results[tag]["_evidence_log"] = str(
-                evidence_dir / f"ad2_nonexistent_{tag}.log")
+                evidence_dir / f"ad2_nonexistent_{stamp}_{tag}.log")
 
-    def corrupt_wrong_reference(results):
-        # 串到另一版本/模式的真实文件（验证引用关联检查）
-        for tag in results:
-            other_tag = ".venv426" if tag == ".venv" else ".venv"
-            other_mode = "provider-raise"
-            src = evidence_dir.parent / (
-                "worker_evidence")
-            candidates = sorted(src.glob(f"*aa2_observer_{other_mode}*{other_tag.replace('.', '')}*"), key=lambda p: p.stat().st_mtime)
-            if candidates:
-                if candidates[0].suffix == ".json":
-                    results[tag]["_evidence_json"] = str(candidates[0])
-                    log_cand = candidates[0].with_suffix(".log")
-                    if log_cand.is_file():
-                        results[tag]["_evidence_log"] = str(log_cand)
-                else:
-                    results[tag]["_evidence_log"] = str(candidates[0])
-
+    # 空文件/缺文件对照保留（AE1 要求逐维度记录，不只看总 pass=false）
     ad2_bad = (
         ("ad2-empty-evidence", corrupt_empty_evidence),
         ("ad2-missing-evidence", corrupt_missing_evidence),
-        ("ad2-wrong-reference", corrupt_wrong_reference),
     )
+
+    def corrupt_wrong_reference_disabled(results):
+        # AE2.A 撤注入对照占位：不做任何事（保留原函数名便于对照阅读）
+        return None
+
+    # AE2.A：错引用从**本次捕获映射**显式取另一版/另一模式/正常 T1 的
+    # 真实路径实际替换；不用 glob/mtime，找不到路径直接抛错（不允许
+    # "找不到就不注入"使自检空转）。
+    ref_map: dict = {}
+
+    def collect_ref(mode_name: str, capture: dict):
+        for tag in (".venv", ".venv426"):
+            d = capture.get(tag, {})
+            if d.get("_evidence_json") and d.get("_evidence_log"):
+                ref_map[(mode_name, tag)] = {
+                    "json": d["_evidence_json"],
+                    "log": d["_evidence_log"],
+                }
+
+    collect_ref("stop", neg_capture)
+    collect_ref("provider-raise", neg_prov_capture)
+    collect_ref("normal", real_t1)
+    check("AD2.wrongref-refmap-complete",
+          all(k in ref_map for k in (
+              ("stop", ".venv"), ("stop", ".venv426"),
+              ("provider-raise", ".venv"),
+              ("provider-raise", ".venv426"),
+              ("normal", ".venv"), ("normal", ".venv426"))),
+          f"ref_map_keys={sorted(str(k) for k in ref_map)}")
+
+    def swap_factory(replacements: dict, record: dict):
+        def corruptor(results):
+            for tag, key in replacements.items():
+                ref = ref_map.get(key)
+                if not ref:
+                    raise AssertionError(
+                        f"AE2.A 注入缺路径：{key}——不允许找不到就不注入")
+                record[tag] = {
+                    "replace_key": list(key),
+                    "before": {
+                        "json": results[tag].get("_evidence_json"),
+                        "log": results[tag].get("_evidence_log")},
+                    "after": {"json": ref["json"], "log": ref["log"]},
+                    "expected_binding": results[tag].get("_run_binding"),
+                }
+                results[tag]["_evidence_json"] = ref["json"]
+                results[tag]["_evidence_log"] = ref["log"]
+        return corruptor
+
+    # 无注入对照：同一 runner、同一正式父判定，必须 accepted 且
+    # evidence_ok=true（撤掉引用交换时"应检出错引用"的自检必须 FAIL）
+    ctrl_verdict = run_aa2_negative(
+        "stop", evidence_bad_runner_factory(
+            corrupt_wrong_reference_disabled),
+        scenario="ad2-wrongref-control-noop")
+    save_verdict("ad2-wrongref-control-noop", ctrl_verdict,
+                 valid_evidence=True)
+    check("AD2.wrongref-control-accepted", ctrl_verdict["pass"],
+          f"无注入对照未被接受：notes={ctrl_verdict['evidence_notes']}")
+
+    wrong_ref_cases = (
+        ("ad2-wrong-reference-swap-version",
+         {".venv": ("stop", ".venv426"),
+          ".venv426": ("stop", ".venv")}),
+        ("ad2-wrong-reference-cross-mode",
+         {".venv": ("provider-raise", ".venv"),
+          ".venv426": ("provider-raise", ".venv426")}),
+        ("ad2-wrong-reference-normal-t1",
+         {".venv": ("normal", ".venv"),
+          ".venv426": ("normal", ".venv426")}),
+    )
+    wrongref_verdicts: dict = {}
+    wrongref_records: dict = {}
+    for name, repl in wrong_ref_cases:
+        rec: dict = {}
+        verdict = run_aa2_negative(
+            "stop",
+            evidence_bad_runner_factory(swap_factory(repl, rec)),
+            scenario=name)
+        vp = save_verdict(name, verdict)
+        wrongref_verdicts[name] = verdict
+        wrongref_records[name] = rec
+        # 拒绝维度必须是证据关联（引用与本次运行绑定不符），不能是
+        # "原本就没有引用"或 JSON 解析失败
+        assoc = {t: (
+            not verdict["per_version"][t]["evidence_ok"]
+            and "关联" in verdict["per_version"][t]["evidence_note"])
+            for t in (".venv", ".venv426")}
+        check(f"AD2.{name}-rejected", (not verdict["pass"])
+              and all(assoc.values()),
+              f"错引用未按关联维度拒绝：assoc={assoc} "
+              f"notes={verdict['evidence_notes']} verdict_path={vp}")
+
+    # AE2.A 三方结果：撤注入对照 accepted + 注入后 rejected + 拒绝维度
+    # 记录为证据关联；三者缺一即自检未真正检验其声称的故障
+    three_way = {
+        name: {
+            "injected_rejected": not wrongref_verdicts[name]["pass"],
+            "evidence_assoc_notes": {
+                t: wrongref_verdicts[name]["per_version"][t][
+                    "evidence_note"]
+                for t in (".venv", ".venv426")},
+            "replacements": wrongref_records[name],
+            "control_noop_accepted": ctrl_verdict["pass"],
+        }
+        for name in wrongref_verdicts
+    }
+    tw_path = evidence_dir / "ae2a_wrong_reference_three_way.json"
+    tw_path.write_text(
+        json.dumps(three_way, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8")
+    check("AD2.wrong-reference-counter-three-way",
+          ctrl_verdict["pass"]
+          and all(not wrongref_verdicts[n]["pass"]
+                  for n in wrongref_verdicts),
+          f"三方结果不齐：control={ctrl_verdict['pass']} path={tw_path}")
+
     for name, corruptor in ad2_bad:
         verdict = run_aa2_negative(
-            "stop", evidence_bad_runner_factory(corruptor))
+            "stop", evidence_bad_runner_factory(corruptor),
+            scenario=name)
         vp = save_verdict(name, verdict)
         # AD2：证据无效→ rejected（功能判定可能仍检出，但证据不合格）
         check(f"AD2.{name}-rejected", not verdict["pass"],
               f"AD2 证据无效不应算成功负例：verdict_path={vp}")
 
-    # -- AC3：从 manifest 实际重开证据验证（非目录计数） -------------------
-    for mode in ("stop", "provider-raise"):
-        vpath = evidence_dir / f"ac2_{mode}-good.json"
-        check(f"AC3.{mode}.verdict-file-exists", vpath.is_file(),
+    # -- AE1：仅改保存证据内容（引用/绑定自洽），本次输入不变 ------------
+    # 写侧引用合法但读回内容与本次调用侧快照不符；功能目标/诊断仍合格，
+    # 拒绝必须来自 evidence 维度而非功能维度。
+    def rewrite_evidence_copy(results, mutate, where: str):
+        from datetime import datetime as _dts
+        stamp = _dts.now().strftime("%H%M%S%f")
+        for tag in results:
+            data = json.loads(Path(
+                results[tag]["_evidence_json"]).read_text(
+                    encoding="utf-8"))
+            mutate(data)
+            new_json = evidence_dir / f"{where}_{stamp}_{tag}.json"
+            new_log = evidence_dir / f"{where}_{stamp}_{tag}.log"
+            new_json.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2,
+                           default=str),
+                encoding="utf-8")
+            # log 与保存 JSON 保持自洽：rc 行 + 重写的 RESULT 行
+            new_log.write_text(
+                "returncode=0\n===STDOUT===\n@@RESULT@@"
+                # RESULT 行与保存 JSON 自洽：不含观察器后补的 _aa2_audit
+                + json.dumps(
+                    {k: v for k, v in data.items() if k != "_aa2_audit"},
+                    ensure_ascii=False)
+                + "\n===STDERR===\n",
+                encoding="utf-8")
+            results[tag]["_evidence_json"] = str(new_json)
+            results[tag]["_evidence_log"] = str(new_log)
+            results[tag]["_run_binding"] = {
+                "json": str(new_json), "log": str(new_log), "rc": 0,
+                "where": where, "tag": tag}
+
+    def empty_window_diag_mutate(data):
+        data["n04_window_diagnostics"] = [{}, {}, {}]
+
+    def strip_provider_stack_mutate(data):
+        # 移除真实异常栈但保留 "aa2" 标记文本——功能诊断仍合格，
+        # 拒绝必须来自证据读回（真实 RuntimeError 栈缺失）
+        def _strip(text):
+            return str(text).replace(
+                "RuntimeError: aa2 注入模型调用真实异常",
+                "aa2（原始异常栈已移除）") if text else text
+        for d in (data.get("n04_window_diagnostics") or []):
+            if isinstance(d, dict):
+                d["final_text_head"] = _strip(d.get("final_text_head"))
+                d["pipeline_error"] = _strip(d.get("pipeline_error"))
+        errs = data.get("n04_pipeline_errors")
+        if isinstance(errs, list):
+            data["n04_pipeline_errors"] = [
+                _strip(e) if isinstance(e, str) else e for e in errs]
+
+    ae1_bad = (
+        ("ae1-saved-empty-window-diagnostics", "stop",
+         empty_window_diag_mutate, None),
+        ("ae1-provider-stack-removed", "provider-raise",
+         strip_provider_stack_mutate,
+         {".venv": good_prov_428, ".venv426": good_prov_426}),
+    )
+    for name, sc_mode, mutate, src in ae1_bad:
+        verdict = run_aa2_negative(
+            sc_mode,
+            evidence_bad_runner_factory(
+                lambda rs, _m=mutate, _w=name: rewrite_evidence_copy(
+                    rs, _m, _w),
+                source=src),
+            scenario=name)
+        vp = save_verdict(name, verdict)
+        pv = verdict["per_version"]
+        # 功能维度仍合格（目标命中+诊断有效），拒绝只来自证据读回，
+        # 且 note 必须指认被改的具体内容键
+        dims = {t: (
+            pv[t]["entry_ok"] and pv[t]["specific_target_hit"]
+            and pv[t]["diag_ok"] and not pv[t]["evidence_ok"]
+            and "证据" in pv[t]["evidence_note"])
+            for t in (".venv", ".venv426")}
+        check(f"AE1.{name}-rejected",
+              (not verdict["pass"]) and all(dims.values()),
+              f"仅改保存内容未按证据维度拒绝：dims={dims} "
+              f"notes={verdict['evidence_notes']} verdict_path={vp}")
+
+    # -- AC3/AE1：沿唯一 manifest 入口实际重开证据验证 -------------------
+    # 无 glob/mtime/目录计数兜底；缺本次引用即失败。verdict 与每版本
+    # 的 run/scenario/tag/mode/JSON/log 引用均取自 saved_entries。
+    check("AC3.saved-entries-unique",
+          len({e["verdict_path"] for e in saved_entries})
+          == len(saved_entries),
+          f"entries={len(saved_entries)}")
+    for entry in saved_entries:
+        scen = entry["scenario"]
+        vpath = Path(entry["verdict_path"])
+        check(f"AC3.{scen}.verdict-file-exists", vpath.is_file(),
               f"path={vpath}")
-        if not vpath.is_file():
-            continue
-        reopened = json.loads(vpath.read_text(encoding="utf-8"))
+        mpath = (Path(entry["manifest_path"])
+                 if entry.get("manifest_path") else None)
+        check(f"AC3.{scen}.manifest-unique-file",
+              bool(mpath and mpath.is_file()), f"path={mpath}")
+        if vpath.is_file():
+            reopened = json.loads(vpath.read_text(encoding="utf-8"))
+            check(f"AC3.{scen}.manifest-entry",
+                  reopened.get("mode") == entry["mode"]
+                  and reopened.get("run_id") == entry["run_id"],
+                  f"mode={reopened.get('mode')} "
+                  f"run={reopened.get('run_id')}")
         for tag in (".venv", ".venv426"):
-            pv = reopened.get("per_version", {}).get(tag, {})
-            ev_json_path = pv.get("evidence_json", "")
+            mv = entry["versions"].get(tag, {})
+            # manifest 必须绑定 run/scenario/tag/mode；证据路径按本次
+            # 实况记录——入口错误/缺版本场景合法为空，不强制非空
+            check(f"AC3.{scen}.{tag}.manifest-fields",
+                  mv.get("scenario") == scen
+                  and mv.get("tag") == tag
+                  and mv.get("mode") == entry["mode"]
+                  and mv.get("run_id") == entry["run_id"],
+                  f"mv={mv}")
+            if not entry.get("valid_evidence"):
+                continue
+            ev_json_path = mv.get("evidence_json", "")
             if not ev_json_path or not Path(ev_json_path).is_file():
-                # 尝试从 observer persist_run 的输出中找
-                ev_candidates = sorted(
-                    evidence_dir.parent.glob(
-                        "worker_evidence/*aa2_observer_*"),
-                    key=lambda p: p.stat().st_mtime)
-                check(f"AC3.{mode}.{tag}.observer-evidence-exists",
-                      len(ev_candidates) >= 2,
-                      f"observer_evidence_count={len(ev_candidates)}")
+                check(f"AC3.{scen}.{tag}.evidence-reopenable", False,
+                      f"path={ev_json_path}")
                 continue
             ev_data = json.loads(
                 Path(ev_json_path).read_text(encoding="utf-8"))
+            audit_mode = (ev_data.get("_aa2_audit") or {}).get("mode")
             check(
-                f"AC3.{mode}.{tag}.evidence-reopened-diag-valid",
+                f"AC3.{scen}.{tag}.evidence-reopened-bound",
                 isinstance(ev_data.get("n04_window_diagnostics"), list)
-                and len(ev_data["n04_window_diagnostics"]) == 3,
-                f"diag={ev_data.get('n04_window_diagnostics')}")
-        check(
-            f"AC3.{mode}.manifest-entry",
-            reopened.get("mode") == mode,
-            f"mode={reopened.get('mode')}")
-
-    _ = good_prov_428  # 防 unused 告警
-    _ = good_prov_426
+                and len(ev_data["n04_window_diagnostics"]) == 3
+                and audit_mode == entry["mode"],
+                f"diag_len={len(ev_data.get('n04_window_diagnostics') or [])} "
+                f"audit_mode={audit_mode} expect={entry['mode']}")
 
 
 def _assert_t1_version(tag: str, out: dict, *, check) -> None:
